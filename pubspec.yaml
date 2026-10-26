@@ -28,6 +28,7 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  crypto: ^3.0.8
   dartssh2: ^4.1.0
   file_picker: ^13.1.0
   flutter:
@@ -39,6 +40,7 @@ dependencies:
   path_provider: ^2.1.6
   shared_preferences: 2.5.6
   web_socket_channel: ^3.0.3
+  window_manager: ^0.5.2
   xterm: 4.0.0
 
 dependency_overrides:

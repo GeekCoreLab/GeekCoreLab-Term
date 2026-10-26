@@ -47,4 +47,6 @@ class SshCredentialStore {
       });
 
   Future<void> delete(String endpointKey) => _platform.delete(endpointKey);
+
+  Future<void> clearAll() => _platform.clearAll();
 }

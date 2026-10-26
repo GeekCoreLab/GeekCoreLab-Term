@@ -181,6 +181,7 @@ class SessionStore {
   static const _sshHostKeysKey = 'geekcore_term.ssh_host_keys.v1';
 
   final SharedPreferencesAsync _preferences;
+  Future<void> _writeQueue = Future<void>.value();
 
   Future<List<SessionRecord>> loadSaved() => _load(_savedKey);
 
@@ -192,6 +193,12 @@ class SessionStore {
   Future<void> saveRecent(List<SessionRecord> records) =>
       _save(_recentKey, records);
 
+  Future<void> clear() => _enqueueWrite(() async {
+    await _preferences.remove(_savedKey);
+    await _preferences.remove(_recentKey);
+    await _preferences.remove(_sshHostKeysKey);
+  });
+
   Future<String?> loadSshHostKey(String endpointKey) async {
     final encoded = await _preferences.getString(_sshHostKeysKey);
     if (encoded == null) return null;
@@ -202,21 +209,22 @@ class SessionStore {
     return decoded[endpointKey] as String?;
   }
 
-  Future<void> saveSshHostKey(String endpointKey, String fingerprint) async {
-    final encoded = await _preferences.getString(_sshHostKeysKey);
-    final Map<String, dynamic> values;
-    if (encoded == null) {
-      values = {};
-    } else {
-      final decoded = jsonDecode(encoded);
-      if (decoded is! Map<String, dynamic>) {
-        throw const FormatException('SSH 主机密钥记录格式无效');
-      }
-      values = decoded;
-    }
-    values[endpointKey] = fingerprint;
-    await _preferences.setString(_sshHostKeysKey, jsonEncode(values));
-  }
+  Future<void> saveSshHostKey(String endpointKey, String fingerprint) =>
+      _enqueueWrite(() async {
+        final encoded = await _preferences.getString(_sshHostKeysKey);
+        final Map<String, dynamic> values;
+        if (encoded == null) {
+          values = {};
+        } else {
+          final decoded = jsonDecode(encoded);
+          if (decoded is! Map<String, dynamic>) {
+            throw const FormatException('SSH 主机密钥记录格式无效');
+          }
+          values = decoded;
+        }
+        values[endpointKey] = fingerprint;
+        await _preferences.setString(_sshHostKeysKey, jsonEncode(values));
+      });
 
   Future<List<SessionRecord>> _load(String key) async {
     final encodedRecords = await _preferences.getStringList(key) ?? const [];
@@ -231,9 +239,16 @@ class SessionStore {
     return records;
   }
 
-  Future<void> _save(String key, List<SessionRecord> records) =>
-      _preferences.setStringList(
-        key,
-        records.map((record) => jsonEncode(record.toJson())).toList(),
-      );
+  Future<void> _save(String key, List<SessionRecord> records) => _enqueueWrite(
+    () => _preferences.setStringList(
+      key,
+      records.map((record) => jsonEncode(record.toJson())).toList(),
+    ),
+  );
+
+  Future<void> _enqueueWrite(Future<void> Function() operation) {
+    final queued = _writeQueue.then((_) => operation());
+    _writeQueue = queued.catchError((Object _) {});
+    return queued;
+  }
 }

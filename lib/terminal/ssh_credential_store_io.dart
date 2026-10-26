@@ -30,28 +30,50 @@ class SshCredentialStorePlatform {
   }
 
   Future<void> write(String endpointKey, Map<String, String> value) {
-    if (Platform.isAndroid) {
-      return _secureStorage.write(
-        key: '$_secureKeyPrefix$endpointKey',
-        value: jsonEncode(value),
-      );
-    }
-
     final operation = _writeQueue.then(
-      (_) => _writeDesktop(endpointKey, value),
+      (_) => Platform.isAndroid
+          ? _secureStorage.write(
+              key: '$_secureKeyPrefix$endpointKey',
+              value: jsonEncode(value),
+            )
+          : _writeDesktop(endpointKey, value),
     );
     _writeQueue = operation.catchError((Object _) {});
     return operation;
   }
 
   Future<void> delete(String endpointKey) {
-    if (Platform.isAndroid) {
-      return _secureStorage.delete(key: '$_secureKeyPrefix$endpointKey');
-    }
-
-    final operation = _writeQueue.then((_) => _deleteDesktop(endpointKey));
+    final operation = _writeQueue.then(
+      (_) => Platform.isAndroid
+          ? _secureStorage.delete(key: '$_secureKeyPrefix$endpointKey')
+          : _deleteDesktop(endpointKey),
+    );
     _writeQueue = operation.catchError((Object _) {});
     return operation;
+  }
+
+  Future<void> clearAll() {
+    final operation = _writeQueue.then((_) async {
+      if (Platform.isAndroid) {
+        await _clearAndroidCredentials();
+        return;
+      }
+      final file = await _credentialsFile();
+      final temporaryFile = File('${file.path}.tmp');
+      if (await file.exists()) await file.delete();
+      if (await temporaryFile.exists()) await temporaryFile.delete();
+    });
+    _writeQueue = operation.catchError((Object _) {});
+    return operation;
+  }
+
+  Future<void> _clearAndroidCredentials() async {
+    final values = await _secureStorage.readAll();
+    for (final key in values.keys.where(
+      (key) => key.startsWith(_secureKeyPrefix),
+    )) {
+      await _secureStorage.delete(key: key);
+    }
   }
 
   Future<void> _deleteDesktop(String endpointKey) async {

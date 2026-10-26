@@ -14,10 +14,15 @@ import 'package:geekcore_term/terminal/port_knock_transport.dart';
 import 'package:geekcore_term/terminal/ssh_credential_store.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
+import 'package:geekcore_term/settings/app_settings.dart';
+import 'package:geekcore_term/settings/settings_page.dart';
+import 'package:geekcore_term/settings/window_state.dart';
 import 'package:xterm/xterm.dart';
 
 class LocalTerminalPage extends StatefulWidget {
-  const LocalTerminalPage({super.key});
+  const LocalTerminalPage({required this.settings, super.key});
+
+  final AppSettingsController settings;
 
   @override
   State<LocalTerminalPage> createState() => _LocalTerminalPageState();
@@ -33,6 +38,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   List<SessionRecord> _savedSessions = [];
   List<SessionRecord> _recentSessions = [];
   String _sessionSearch = '';
+  bool _clearingAppData = false;
   int _nextTabId = 1;
   int? _activeTabId;
 
@@ -60,6 +66,62 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       });
     } catch (error) {
       if (mounted) _showMessage('读取会话记录失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => AppSettingsPage(
+          settings: widget.settings,
+          onClearAppData: _clearAppData,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _clearAppData() async {
+    if (_clearingAppData) return;
+    _clearingAppData = true;
+    try {
+      await _recordsReady;
+      final tabs = List<_TerminalTab>.of(_tabs);
+      for (final tab in tabs) {
+        tab.isClosed = true;
+        tab.inputFlushTimer?.cancel();
+        tab.inputFlushTimer = null;
+        tab.pendingInput.takeBytes();
+        tab.focusNode.unfocus();
+      }
+
+      if (mounted) {
+        setState(() {
+          _tabs.clear();
+          _activeTabId = null;
+        });
+      }
+
+      for (final tab in tabs) {
+        tab.focusNode.dispose();
+        tab.terminalController.dispose();
+        await _disposeTab(tab);
+      }
+
+      WindowStateManager.instance.resetAfterClear();
+      await _sshCredentialStore.clearAll();
+      await _sessionStore.clear();
+      await widget.settings.clearAll();
+
+      if (mounted) {
+        setState(() {
+          _savedSessions = [];
+          _recentSessions = [];
+          _sessionSearch = '';
+          _sessionSearchController.clear();
+        });
+      }
+    } finally {
+      _clearingAppData = false;
     }
   }
 
@@ -164,6 +226,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   Future<void> _recordConnection(_TerminalConnection connection) async {
     if (connection.kind == _ConnectionKind.local) return;
     await _recordsReady;
+    if (!mounted || _clearingAppData) return;
     final now = DateTime.now();
     var sessionName = connection.sessionTitle ?? connection.displayName;
     for (final record in _savedSessions) {
@@ -1244,6 +1307,12 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             icon: const Icon(Icons.bolt_rounded, size: 18),
             label: const Text('快速连接'),
           ),
+          const SizedBox(width: 6),
+          IconButton(
+            tooltip: '设置',
+            onPressed: () => unawaited(_openSettings()),
+            icon: const Icon(Icons.settings_outlined),
+          ),
           const SizedBox(width: 14),
         ],
       ),
@@ -1612,6 +1681,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   Widget _buildTerminalPane(_TerminalTab tab, ColorScheme colors) {
+    final terminalTheme = widget.settings.terminalTheme;
     return SizedBox.expand(
       key: ValueKey(tab.id),
       child: Column(
@@ -1629,7 +1699,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             ),
           Expanded(
             child: ColoredBox(
-              color: const Color(0xFF0B0E0C),
+              color: terminalTheme.background,
               child: TerminalView(
                 tab.terminal,
                 key: ValueKey('terminal-${tab.id}'),
@@ -1645,6 +1715,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                 autoResize: true,
                 backgroundOpacity: 1,
                 padding: const EdgeInsets.all(12),
+                theme: terminalTheme,
                 textStyle: const TerminalStyle(
                   fontSize: 14,
                   fontFamily: 'monospace',

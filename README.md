@@ -69,6 +69,13 @@ flutter build linux --release
 - 浏览器版本目前仅提供 SSH；本地 Shell、串口和 Telnet 依赖浏览器不可用的本机能力。
 - 只有勾选“保存登录凭据”后才会记住密码、私钥和私钥口令。Linux/macOS 凭据文件位于 `getApplicationSupportDirectory()/ssh/credentials.json`，目录权限为 `0700`、文件权限为 `0600`；Windows 使用当前用户的应用支持目录。Android 使用 `flutter_secure_storage` 的 Android 加密存储；Web 使用 Web Crypto，并要求 HTTPS 或 localhost。
 
+## 外观与隐私设置
+
+- 设置页提供翡翠、海洋和石墨三种深色主题，工作区和终端会同步切换配色。
+- 可设置主密码锁定应用启动；主密码用于启动解锁，SSH 凭据继续由各平台的凭据存储单独保护。
+- Linux、Windows 和 macOS 可选择记住窗口位置和大小。
+- “清除应用数据”会关闭活动会话，并删除已保存/最近连接、SSH 主机信任、SSH 登录凭据及主题、窗口和主密码设置。
+
 ## 架构约定
 
 - Flutter 负责界面和终端呈现；Rust 负责本地 PTY、串口、Telnet 和本地规则分析。SSH 使用 Dart `dartssh2` 以复用桌面/Android TCP 与浏览器 WebSocket 传输。

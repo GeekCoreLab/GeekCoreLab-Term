@@ -1,0 +1,508 @@
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+
+import 'app_settings.dart';
+import 'window_state.dart';
+
+class AppSettingsPage extends StatefulWidget {
+  const AppSettingsPage({
+    required this.settings,
+    required this.onClearAppData,
+    super.key,
+  });
+
+  final AppSettingsController settings;
+  final Future<void> Function() onClearAppData;
+
+  @override
+  State<AppSettingsPage> createState() => _AppSettingsPageState();
+}
+
+class _AppSettingsPageState extends State<AppSettingsPage> {
+  bool _clearing = false;
+
+  bool get _supportsWindowBounds =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.linux ||
+          defaultTargetPlatform == TargetPlatform.windows ||
+          defaultTargetPlatform == TargetPlatform.macOS);
+
+  Future<void> _manageMasterPassword() async {
+    final update = await showDialog<_MasterPasswordUpdate>(
+      context: context,
+      builder: (_) => _MasterPasswordDialog(settings: widget.settings),
+    );
+    if (update == null || !mounted) return;
+
+    try {
+      final password = update.password;
+      if (password == null) {
+        await widget.settings.removeMasterPassword();
+        _showMessage('已移除主密码');
+      } else {
+        await widget.settings.setMasterPassword(password);
+        _showMessage('主密码已更新；下次启动时需要输入');
+      }
+    } catch (error) {
+      _showMessage('更新主密码失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _setRememberWindowBounds(bool value) async {
+    try {
+      await widget.settings.setRememberWindowBounds(value);
+      await WindowStateManager.instance.setRemembering(value);
+    } catch (error) {
+      _showMessage('保存窗口设置失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _confirmClearAppData() async {
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: const Icon(Icons.delete_forever_outlined),
+        title: const Text('清除应用数据？'),
+        content: const Text(
+          '这会删除已保存和最近连接、SSH 登录凭据与主机信任、主题和窗口设置、主密码，并关闭当前打开的会话。此操作无法撤销。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(dialogContext).colorScheme.error,
+              foregroundColor: Theme.of(dialogContext).colorScheme.onError,
+            ),
+            icon: const Icon(Icons.delete_outline_rounded),
+            label: const Text('清除数据'),
+          ),
+        ],
+      ),
+    );
+    if (accepted != true || !mounted) return;
+
+    setState(() => _clearing = true);
+    try {
+      await widget.onClearAppData();
+      if (mounted) _showMessage('应用数据已清除');
+    } catch (error) {
+      if (mounted) _showMessage('清除应用数据失败：$error', isError: true);
+    } finally {
+      if (mounted) setState(() => _clearing = false);
+    }
+  }
+
+  void _showMessage(String message, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: isError ? Theme.of(context).colorScheme.error : null,
+        ),
+      );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final settings = widget.settings;
+    final colors = Theme.of(context).colorScheme;
+    final clearButton = OutlinedButton.icon(
+      onPressed: _clearing ? null : _confirmClearAppData,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: colors.error,
+        side: BorderSide(color: colors.error.withValues(alpha: 0.65)),
+      ),
+      icon: _clearing
+          ? const SizedBox.square(
+              dimension: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : const Icon(Icons.delete_outline_rounded),
+      label: Text(_clearing ? '正在清除' : '清除应用数据'),
+    );
+
+    return PopScope(
+      canPop: !_clearing,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('设置'),
+          leading: IconButton(
+            tooltip: '返回',
+            onPressed: _clearing ? null : () => Navigator.maybePop(context),
+            icon: const Icon(Icons.arrow_back_rounded),
+          ),
+        ),
+        body: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 900),
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(24, 20, 24, 40),
+              children: [
+                _SettingsSection(
+                  icon: Icons.palette_outlined,
+                  title: '外观',
+                  subtitle: '更改工作区和终端的配色',
+                  child: Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      for (final style in AppThemeStyle.values)
+                        ChoiceChip(
+                          selected: settings.themeStyle == style,
+                          onSelected: _clearing
+                              ? null
+                              : (_) async {
+                                  try {
+                                    await settings.setThemeStyle(style);
+                                  } catch (error) {
+                                    if (mounted) {
+                                      _showMessage(
+                                        '保存主题失败：$error',
+                                        isError: true,
+                                      );
+                                    }
+                                  }
+                                },
+                          avatar: CircleAvatar(
+                            radius: 8,
+                            backgroundColor: style.seedColor,
+                          ),
+                          label: Text(style.label),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _SettingsSection(
+                  icon: Icons.password_rounded,
+                  title: '主密码',
+                  subtitle: settings.hasMasterPassword
+                      ? '已设置 · 应用启动时需要输入；SSH 凭据仍由系统凭据存储单独保护'
+                      : '用于应用启动解锁；SSH 凭据仍由系统凭据存储单独保护',
+                  child: Wrap(
+                    spacing: 10,
+                    runSpacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      FilledButton.tonalIcon(
+                        onPressed: _clearing ? null : _manageMasterPassword,
+                        icon: Icon(
+                          settings.hasMasterPassword
+                              ? Icons.edit_rounded
+                              : Icons.lock_outline_rounded,
+                        ),
+                        label: Text(
+                          settings.hasMasterPassword ? '修改主密码' : '设置主密码',
+                        ),
+                      ),
+                      if (settings.hasMasterPassword)
+                        const Text(
+                          '留空新密码并验证当前密码即可移除',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                    ],
+                  ),
+                ),
+                if (_supportsWindowBounds) ...[
+                  const SizedBox(height: 16),
+                  _SettingsSection(
+                    icon: Icons.open_in_full_rounded,
+                    title: '窗口',
+                    subtitle: '下次启动时恢复桌面窗口的大小和位置',
+                    child: SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('记住窗口位置和大小'),
+                      value: settings.rememberWindowBounds,
+                      onChanged: _clearing ? null : _setRememberWindowBounds,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 16),
+                _SettingsSection(
+                  icon: Icons.storage_outlined,
+                  title: '本地数据',
+                  subtitle: '删除此设备上保存的连接和设置',
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: colors.errorContainer.withValues(alpha: 0.3),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: colors.error.withValues(alpha: 0.28),
+                      ),
+                    ),
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final description = Row(
+                          children: [
+                            Icon(
+                              Icons.warning_amber_rounded,
+                              color: colors.error,
+                            ),
+                            const SizedBox(width: 12),
+                            const Expanded(
+                              child: Text(
+                                '会一并删除保存的 SSH 凭据与主密码。',
+                                style: TextStyle(fontSize: 13),
+                              ),
+                            ),
+                          ],
+                        );
+                        if (constraints.maxWidth < 560) {
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              description,
+                              const SizedBox(height: 14),
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: clearButton,
+                              ),
+                            ],
+                          );
+                        }
+                        return Row(
+                          children: [
+                            Expanded(child: description),
+                            const SizedBox(width: 16),
+                            clearButton,
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SettingsSection extends StatelessWidget {
+  const _SettingsSection({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.child,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(icon, color: colors.primary),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        subtitle,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: colors.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 18),
+            child,
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MasterPasswordUpdate {
+  const _MasterPasswordUpdate(this.password);
+
+  final String? password;
+}
+
+class _MasterPasswordDialog extends StatefulWidget {
+  const _MasterPasswordDialog({required this.settings});
+
+  final AppSettingsController settings;
+
+  @override
+  State<_MasterPasswordDialog> createState() => _MasterPasswordDialogState();
+}
+
+class _MasterPasswordDialogState extends State<_MasterPasswordDialog> {
+  final _currentPassword = TextEditingController();
+  final _newPassword = TextEditingController();
+  final _confirmPassword = TextEditingController();
+  String? _error;
+  bool _saving = false;
+
+  @override
+  void dispose() {
+    _currentPassword.dispose();
+    _newPassword.dispose();
+    _confirmPassword.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_saving) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+
+    final current = _currentPassword.text;
+    final next = _newPassword.text;
+    final confirmation = _confirmPassword.text;
+    try {
+      if (widget.settings.hasMasterPassword &&
+          !await widget.settings.verifyMasterPassword(current)) {
+        _finishWithError('当前主密码不正确');
+        return;
+      }
+    } catch (error) {
+      _finishWithError('主密码验证失败：$error');
+      return;
+    }
+
+    if (next.isEmpty && confirmation.isEmpty) {
+      if (!widget.settings.hasMasterPassword) {
+        _finishWithError('请输入新主密码');
+        return;
+      }
+      if (mounted) Navigator.pop(context, const _MasterPasswordUpdate(null));
+      return;
+    }
+    if (next.length < 10) {
+      _finishWithError('主密码至少需要 10 个字符');
+      return;
+    }
+    if (next != confirmation) {
+      _finishWithError('两次输入的新主密码不一致');
+      return;
+    }
+    if (mounted) Navigator.pop(context, _MasterPasswordUpdate(next));
+  }
+
+  void _finishWithError(String error) {
+    if (!mounted) return;
+    setState(() {
+      _saving = false;
+      _error = error;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasPassword = widget.settings.hasMasterPassword;
+    return AlertDialog(
+      title: Text(hasPassword ? '修改主密码' : '设置主密码'),
+      content: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (hasPassword) ...[
+              TextField(
+                controller: _currentPassword,
+                autofocus: true,
+                obscureText: true,
+                onSubmitted: (_) => _submit(),
+                decoration: const InputDecoration(
+                  labelText: '当前主密码',
+                  prefixIcon: Icon(Icons.lock_outline_rounded),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+            TextField(
+              controller: _newPassword,
+              autofocus: !hasPassword,
+              obscureText: true,
+              onChanged: (_) => setState(() {}),
+              decoration: InputDecoration(
+                labelText: hasPassword ? '新主密码' : '新主密码（至少 10 个字符）',
+                prefixIcon: const Icon(Icons.password_rounded),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _confirmPassword,
+              obscureText: true,
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => _submit(),
+              decoration: const InputDecoration(
+                labelText: '确认新主密码',
+                prefixIcon: Icon(Icons.check_circle_outline_rounded),
+              ),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  _error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            Text(
+              hasPassword && _newPassword.text.isEmpty
+                  ? '两个新密码框留空可移除主密码。'
+                  : '使用较长的口令更安全。主密码不会上传到网络。',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _saving ? null : () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: _saving ? null : _submit,
+          child: Text(
+            _saving
+                ? '处理中…'
+                : hasPassword &&
+                      _newPassword.text.isEmpty &&
+                      _confirmPassword.text.isEmpty
+                ? '移除主密码'
+                : '保存',
+          ),
+        ),
+      ],
+    );
+  }
+}
