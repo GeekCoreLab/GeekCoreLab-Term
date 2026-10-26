@@ -5,8 +5,15 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:dartssh2/dartssh2.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
+    show PlatformInt64;
 import 'package:geekcore_term/src/rust/api/terminal.dart';
+import 'package:geekcore_term/terminal/port_knock_transport.dart';
+import 'package:geekcore_term/terminal/ssh_credential_store.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
+import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:xterm/xterm.dart';
 
 class LocalTerminalPage extends StatefulWidget {
@@ -19,6 +26,7 @@ class LocalTerminalPage extends StatefulWidget {
 class _LocalTerminalPageState extends State<LocalTerminalPage> {
   final List<_TerminalTab> _tabs = [];
   final SessionStore _sessionStore = SessionStore();
+  final SshCredentialStore _sshCredentialStore = SshCredentialStore();
   final TextEditingController _sessionSearchController =
       TextEditingController();
   late final Future<void> _recordsReady;
@@ -67,6 +75,26 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       );
   }
 
+  void _notifySessionProgress(
+    _TerminalTab tab,
+    String message, {
+    bool isError = false,
+    String? tabStatus,
+  }) {
+    if (!mounted || tab.isClosed) return;
+    final toast = tab.id == _activeTabId ? message : '会话${tab.title}：$message';
+    tab.status = tabStatus ?? message;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(toast),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: isError ? Theme.of(context).colorScheme.error : null,
+      ),
+    );
+    _refresh(tab);
+  }
+
   _TerminalTab _createTabState(_TerminalConnection connection) {
     final id = _nextTabId++;
     final title = switch (connection.kind) {
@@ -74,8 +102,13 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       _ConnectionKind.serial => '串口 ${connection.address}',
       _ConnectionKind.telnet =>
         'Telnet ${connection.address}:${connection.port}',
+      _ConnectionKind.ssh => 'SSH ${connection.address}:${connection.port}',
     };
-    final tab = _TerminalTab(id: id, title: title, connection: connection);
+    final tab = _TerminalTab(
+      id: id,
+      title: connection.sessionTitle ?? title,
+      connection: connection,
+    );
     tab.terminal = Terminal(
       maxLines: 10000,
       onOutput: (value) => _queueInput(tab, value),
@@ -86,8 +119,13 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     return tab;
   }
 
-  void _addLocalShellTab() =>
-      _addConnectionTab(const _TerminalConnection.local());
+  void _addLocalShellTab() {
+    if (kIsWeb) {
+      _showMessage('浏览器版本不支持启动本地 Shell');
+      return;
+    }
+    _addConnectionTab(const _TerminalConnection.local());
+  }
 
   void _addConnectionTab(_TerminalConnection connection) {
     final tab = _createTabState(connection);
@@ -113,13 +151,21 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           record.address,
           record.port,
         ),
+        SessionProtocol.ssh => _TerminalConnection.ssh(
+          record.address,
+          record.port,
+          sessionTitle: record.name,
+          webSocketUrl: record.webSocketUrl,
+          portKnockActions: record.portKnockActions,
+          authenticationMode: record.authenticationMode,
+        ),
       };
 
   Future<void> _recordConnection(_TerminalConnection connection) async {
     if (connection.kind == _ConnectionKind.local) return;
     await _recordsReady;
     final now = DateTime.now();
-    var sessionName = connection.displayName;
+    var sessionName = connection.sessionTitle ?? connection.displayName;
     for (final record in _savedSessions) {
       if (record.endpointKey == connection.endpointKey) {
         sessionName = record.name;
@@ -129,15 +175,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     final recentRecord = SessionRecord(
       id: connection.endpointKey,
       name: sessionName,
-      protocol: connection.kind == _ConnectionKind.serial
-          ? SessionProtocol.serial
-          : SessionProtocol.telnet,
+      protocol: connection.sessionProtocol!,
       address: connection.address,
       port: connection.port,
       dataBits: connection.dataBits,
       parity: connection.parity,
       stopBits: connection.stopBits,
       flowControl: connection.flowControl,
+      webSocketUrl: connection.webSocketUrl,
+      portKnockActions: connection.portKnockActions,
+      authenticationMode: connection.authenticationMode,
       lastConnectedAt: now,
     );
     final updated = [
@@ -179,15 +226,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     final savedRecord = SessionRecord(
       id: existing?.id ?? DateTime.now().microsecondsSinceEpoch.toString(),
       name: name,
-      protocol: connection.kind == _ConnectionKind.serial
-          ? SessionProtocol.serial
-          : SessionProtocol.telnet,
+      protocol: connection.sessionProtocol!,
       address: connection.address,
       port: connection.port,
       dataBits: connection.dataBits,
       parity: connection.parity,
       stopBits: connection.stopBits,
       flowControl: connection.flowControl,
+      webSocketUrl: connection.webSocketUrl,
+      portKnockActions: connection.portKnockActions,
+      authenticationMode: connection.authenticationMode,
       lastConnectedAt: existing?.lastConnectedAt ?? DateTime.now(),
     );
     final updated = [..._savedSessions];
@@ -245,6 +293,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           if (mounted) setState(() => _savedSessions = updated);
         } catch (error) {
           _showMessage('删除会话失败：$error', isError: true);
+          return;
+        }
+        if (record.protocol == SessionProtocol.ssh) {
+          try {
+            await _sshCredentialStore.delete(
+              'ssh:${record.address.trim().toLowerCase()}:${record.port}',
+            );
+          } catch (error) {
+            _showMessage('会话已删除，但凭据清理失败：$error', isError: true);
+          }
         }
         return;
       case _RecordAction.removeRecent:
@@ -267,26 +325,44 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         _addLocalShellTab();
         return;
       case _NewSessionAction.serial:
+        if (kIsWeb) {
+          _showMessage('浏览器版本不支持串口连接');
+          return;
+        }
         await _showConnectionDialog(
           initialProtocol: _ConnectionKind.serial,
           mode: _ConnectionDialogMode.addSession,
         );
         return;
       case _NewSessionAction.telnet:
+        if (kIsWeb) {
+          _showMessage('浏览器版本不支持 Telnet 直连');
+          return;
+        }
         await _showConnectionDialog(
           initialProtocol: _ConnectionKind.telnet,
           mode: _ConnectionDialogMode.addSession,
         );
         return;
+      case _NewSessionAction.ssh:
+        await _showConnectionDialog(
+          initialProtocol: _ConnectionKind.ssh,
+          mode: _ConnectionDialogMode.addSession,
+        );
+        return;
       case _NewSessionAction.quickConnect:
         await _showConnectionDialog(
-          initialProtocol: _ConnectionKind.telnet,
+          initialProtocol: kIsWeb
+              ? _ConnectionKind.ssh
+              : _ConnectionKind.telnet,
           mode: _ConnectionDialogMode.quickConnect,
         );
         return;
       case _NewSessionAction.addSession:
         await _showConnectionDialog(
-          initialProtocol: _ConnectionKind.telnet,
+          initialProtocol: kIsWeb
+              ? _ConnectionKind.ssh
+              : _ConnectionKind.telnet,
           mode: _ConnectionDialogMode.addSession,
         );
         return;
@@ -372,6 +448,23 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
     try {
       final connection = tab.connection;
+      if (kIsWeb && connection.kind != _ConnectionKind.ssh) {
+        throw UnsupportedError('浏览器版本仅支持通过 WebSocket 网关连接 SSH');
+      }
+      if (connection.kind == _ConnectionKind.ssh) {
+        await _openSshSession(tab, connection);
+        if (tab.isClosed) return;
+        tab.starting = false;
+        tab.status = connection.connectedStatus;
+        _refresh(tab);
+        _notifySessionProgress(
+          tab,
+          'SSH 登录成功',
+          tabStatus: connection.connectedStatus,
+        );
+        return;
+      }
+
       final sessionId = switch (connection.kind) {
         _ConnectionKind.local => await startLocalShell(
           cols: tab.columns,
@@ -391,6 +484,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           cols: tab.columns,
           rows: tab.rows,
         ),
+        _ConnectionKind.ssh => throw StateError('SSH 会话应使用 SSH 客户端启动'),
       };
       if (tab.isClosed) {
         unawaited(closeTerminalSession(sessionId: sessionId));
@@ -419,8 +513,458 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.status = '${tab.connection.displayName}连接失败';
       tab.errorMessage = error.toString();
       tab.terminal.write('\r\n[启动失败] $error\r\n');
-      _refresh(tab);
+      if (tab.connection.kind == _ConnectionKind.ssh) {
+        _notifySessionProgress(
+          tab,
+          'SSH 登录失败：$error',
+          isError: true,
+          tabStatus: 'SSH 登录失败',
+        );
+      } else {
+        _refresh(tab);
+      }
     }
+  }
+
+  Future<void> _openSshSession(
+    _TerminalTab tab,
+    _TerminalConnection connection,
+  ) async {
+    await _runPortKnockSequence(tab, connection);
+    if (tab.isClosed) return;
+
+    final savedCredentials = await _sshCredentialStore.read(
+      connection.credentialKey,
+    );
+    if (!mounted || tab.isClosed) return;
+    var username = connection.username.trim();
+    var password = connection.password;
+    var privateKeyPem = connection.privateKeyPem;
+    var privateKeyPassphrase = connection.privateKeyPassphrase;
+    final authenticationMode = connection.authenticationMode;
+    var rememberCredentials = connection.rememberCredentials;
+    if (username.isEmpty && savedCredentials != null) {
+      username = savedCredentials.username;
+    }
+    if ((password == null || password.isEmpty) && savedCredentials != null) {
+      password = savedCredentials.password;
+    }
+    if ((privateKeyPem == null || privateKeyPem.trim().isEmpty) &&
+        savedCredentials != null) {
+      privateKeyPem = savedCredentials.privateKeyPem;
+    }
+    if ((privateKeyPassphrase == null || privateKeyPassphrase.isEmpty) &&
+        savedCredentials != null) {
+      privateKeyPassphrase = savedCredentials.privateKeyPassphrase;
+    }
+
+    final hasPrivateKey =
+        privateKeyPem != null && privateKeyPem.trim().isNotEmpty;
+    var privateKeyPassphraseMissing = false;
+    if (hasPrivateKey &&
+        (privateKeyPassphrase == null || privateKeyPassphrase.isEmpty)) {
+      try {
+        privateKeyPassphraseMissing = SSHKeyPair.isEncryptedPem(privateKeyPem);
+      } on Object {
+        // Let the regular PEM parser report unsupported or malformed formats.
+      }
+    }
+    if (username.isEmpty ||
+        ((password == null || password.isEmpty) && !hasPrivateKey) ||
+        privateKeyPassphraseMissing) {
+      final credentials = await showDialog<_SshCredentialPromptResult>(
+        context: context,
+        builder: (_) => _SshCredentialPrompt(
+          initialUsername: username,
+          initialPassword: password ?? '',
+          initialPrivateKeyPem: privateKeyPem ?? '',
+          initialPrivateKeyPassphrase: privateKeyPassphrase ?? '',
+          rememberByDefault: rememberCredentials || savedCredentials != null,
+        ),
+      );
+      if (credentials == null || tab.isClosed) {
+        throw StateError('SSH 登录已取消');
+      }
+      username = credentials.username;
+      password = credentials.password;
+      privateKeyPem = credentials.privateKeyPem;
+      privateKeyPassphrase = credentials.privateKeyPassphrase;
+      rememberCredentials = credentials.rememberCredentials;
+    }
+    if (tab.isClosed) return;
+
+    List<SSHKeyPair> identities = const [];
+    final trimmedPrivateKey = privateKeyPem?.trim() ?? '';
+    if (trimmedPrivateKey.isNotEmpty) {
+      try {
+        identities = SSHKeyPair.fromPem(
+          trimmedPrivateKey,
+          privateKeyPassphrase?.isEmpty ?? true ? null : privateKeyPassphrase,
+        );
+      } catch (error) {
+        identities = const [];
+        _notifySessionProgress(tab, '私钥无法读取：$error', isError: true);
+        _notifySessionProgress(tab, '密钥登录失败，使用密码重试...');
+      }
+    }
+
+    final hasPassword = password != null && password.isNotEmpty;
+    final orderedAttempts = switch (authenticationMode) {
+      SshAuthenticationMode.passwordFirst => [
+        if (hasPassword || identities.isEmpty) _SshAuthMethod.password,
+        if (identities.isNotEmpty) _SshAuthMethod.key,
+        if (!hasPassword && identities.isNotEmpty) _SshAuthMethod.password,
+      ],
+      SshAuthenticationMode.keyFirst => [
+        if (identities.isNotEmpty) _SshAuthMethod.key,
+        _SshAuthMethod.password,
+      ],
+      SshAuthenticationMode.automatic => [
+        if (identities.isNotEmpty) _SshAuthMethod.key,
+        _SshAuthMethod.password,
+      ],
+    };
+
+    SSHClient? client;
+    var authenticated = false;
+    for (var index = 0; index < orderedAttempts.length; index++) {
+      final method = orderedAttempts[index];
+      final isKeyAttempt = method == _SshAuthMethod.key;
+      _notifySessionProgress(tab, isKeyAttempt ? '正在尝试密钥登录...' : '正在尝试密码登录...');
+      final socket = await _connectSshSocket(connection);
+      if (tab.isClosed) {
+        socket.destroy();
+        return;
+      }
+      client = SSHClient(
+        socket,
+        username: username,
+        identities: isKeyAttempt ? identities : null,
+        onPasswordRequest: isKeyAttempt
+            ? null
+            : () => hasPassword ? password : null,
+        onUserInfoRequest: isKeyAttempt
+            ? null
+            : (request) => _requestSshUserInfo(tab, request),
+        onVerifyHostKey: (type, fingerprint) =>
+            _verifySshHostKey(tab, connection, type, fingerprint),
+        handshakeTimeout: const Duration(seconds: 15),
+        authTimeout: const Duration(minutes: 5),
+      );
+      tab.sshClient = client;
+
+      try {
+        await client.authenticated;
+        authenticated = true;
+        if (tab.isClosed) {
+          await client.close();
+          return;
+        }
+        break;
+      } catch (error, stackTrace) {
+        if (identical(tab.sshClient, client)) tab.sshClient = null;
+        try {
+          await client.close();
+        } catch (_) {
+          // Preserve the authentication failure when closing a failed attempt.
+        }
+        final hasFallback = index + 1 < orderedAttempts.length;
+        if (!hasFallback) Error.throwWithStackTrace(error, stackTrace);
+        final nextIsKey = orderedAttempts[index + 1] == _SshAuthMethod.key;
+        _notifySessionProgress(
+          tab,
+          isKeyAttempt ? '密钥登录失败，使用密码重试...' : '密码登录失败，使用密钥重试...',
+        );
+        if (!nextIsKey && privateKeyPem != null && identities.isEmpty) {
+          _notifySessionProgress(tab, '正在使用密码或交互式质询登录...');
+        }
+      }
+    }
+
+    final authenticatedClient = client;
+    if (authenticatedClient == null || !authenticated) {
+      throw StateError('SSH 认证未完成');
+    }
+    tab.sshClient = authenticatedClient;
+    _notifySessionProgress(tab, '认证成功，正在打开终端...');
+    try {
+      final remoteSession = await authenticatedClient.shell(
+        pty: SSHPtyConfig(width: tab.columns, height: tab.rows),
+      );
+      if (tab.isClosed) {
+        remoteSession.close();
+        await authenticatedClient.close();
+        return;
+      }
+      tab.sshSession = remoteSession;
+
+      if (rememberCredentials) {
+        try {
+          await _sshCredentialStore.write(
+            connection.credentialKey,
+            SshCredentials(
+              username: username,
+              password: password,
+              privateKeyPem: trimmedPrivateKey.isEmpty
+                  ? null
+                  : trimmedPrivateKey,
+              privateKeyPassphrase: privateKeyPassphrase,
+            ),
+          );
+        } catch (error) {
+          _showMessage('SSH 已连接，但凭据保存失败：$error', isError: true);
+        }
+      }
+
+      unawaited(_recordConnection(connection));
+      tab.outputSubscription = _mergeSshOutput(remoteSession)
+          .cast<List<int>>()
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .listen(
+            tab.terminal.write,
+            onError: (Object error, StackTrace stackTrace) {
+              _handleSshSessionError(tab, authenticatedClient, error);
+            },
+            onDone: () => _handleSshSessionExit(tab, authenticatedClient),
+          );
+    } catch (_) {
+      if (identical(tab.sshClient, authenticatedClient)) {
+        tab.sshClient = null;
+        tab.sshSession = null;
+      }
+      await authenticatedClient.close();
+      rethrow;
+    }
+  }
+
+  Future<SSHSocket> _connectSshSocket(_TerminalConnection connection) => kIsWeb
+      ? WebSocketSshSocket.connect(
+          _webSocketUri(
+            connection.webSocketUrl,
+            connection.address,
+            connection.port,
+          ),
+        )
+      : SSHSocket.connect(
+          connection.address,
+          connection.port,
+          timeout: const Duration(seconds: 15),
+        );
+
+  Future<List<String>?> _requestSshUserInfo(
+    _TerminalTab tab,
+    SSHUserInfoRequest request,
+  ) {
+    if (tab.isClosed) return Future.value(null);
+    _notifySessionProgress(tab, '收到交互式质询，请完成后继续');
+    return showDialog<List<String>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) =>
+          _SshUserInfoDialog(request: request, sessionTitle: tab.title),
+    );
+  }
+
+  Future<void> _runPortKnockSequence(
+    _TerminalTab tab,
+    _TerminalConnection connection,
+  ) async {
+    for (final action in connection.portKnockActions) {
+      if (tab.isClosed) return;
+      switch (action.kind) {
+        case PortKnockActionKind.knock:
+          final protocolName = switch (action.protocol) {
+            PortKnockProtocol.tcp => 'TCP',
+            PortKnockProtocol.udp => 'UDP',
+            PortKnockProtocol.icmp => 'ICMP',
+          };
+          final target = action.protocol == PortKnockProtocol.icmp
+              ? connection.address
+              : '${connection.address}:${action.port}';
+          _notifySessionProgress(tab, '$protocolName 敲门：$target');
+          tab.terminal.write('\r\n[端口敲门] $protocolName $target\r\n');
+          await knockOnce(
+            connection.address,
+            action.protocol,
+            action.port,
+            webSocketUri: kIsWeb
+                ? _webSocketUri(
+                    connection.webSocketUrl,
+                    connection.address,
+                    action.protocol == PortKnockProtocol.icmp
+                        ? null
+                        : action.port,
+                    transport: action.protocol == PortKnockProtocol.tcp
+                        ? null
+                        : action.protocol.name,
+                  )
+                : null,
+          );
+        case PortKnockActionKind.delay:
+          _notifySessionProgress(tab, '端口敲门延迟 ${action.delayMs} ms');
+          tab.terminal.write('\r\n[端口敲门] 延迟 ${action.delayMs} ms\r\n');
+          await Future<void>.delayed(Duration(milliseconds: action.delayMs));
+      }
+    }
+  }
+
+  Uri _webSocketUri(
+    String template,
+    String host,
+    int? port, {
+    String? transport,
+  }) {
+    final encodedHost = Uri.encodeComponent(host);
+    final hasHostPlaceholder = template.contains('{host}');
+    final hasPortPlaceholder = template.contains('{port}');
+    final expanded = template
+        .replaceAll('{host}', encodedHost)
+        .replaceAll('{port}', port?.toString() ?? '');
+    var uri = Uri.parse(expanded);
+    if (uri.scheme != 'ws' && uri.scheme != 'wss') {
+      throw const FormatException('Web SSH 网关地址必须使用 ws:// 或 wss://');
+    }
+    if (uri.userInfo.isNotEmpty) {
+      throw const FormatException('WebSocket 地址中不能包含用户名或密码');
+    }
+    if (Uri.base.scheme == 'https' && uri.scheme != 'wss') {
+      throw const FormatException('HTTPS 页面必须通过 wss:// 连接 SSH 网关');
+    }
+    if (!hasHostPlaceholder ||
+        (port != null && !hasPortPlaceholder) ||
+        transport != null) {
+      uri = uri.replace(
+        queryParameters: {
+          ...uri.queryParameters,
+          if (!hasHostPlaceholder) 'host': host,
+          if (port != null && !hasPortPlaceholder) 'port': '$port',
+          ...?(transport == null ? null : {'transport': transport}),
+        },
+      );
+    }
+    return uri;
+  }
+
+  Future<bool> _verifySshHostKey(
+    _TerminalTab tab,
+    _TerminalConnection connection,
+    String type,
+    Uint8List fingerprintBytes,
+  ) async {
+    final fingerprint = utf8.decode(fingerprintBytes, allowMalformed: true);
+    final endpointKey = connection.hostKeyEndpoint;
+    final existingFingerprint = await _sessionStore.loadSshHostKey(endpointKey);
+    if (existingFingerprint == fingerprint) return true;
+    if (!mounted) return false;
+    _notifySessionProgress(
+      tab,
+      existingFingerprint == null
+          ? '请核对并确认 SSH 主机指纹...'
+          : 'SSH 主机指纹变化，请核对后继续...',
+      isError: existingFingerprint != null,
+    );
+
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: Icon(
+          existingFingerprint == null
+              ? Icons.verified_user_outlined
+              : Icons.warning_amber_rounded,
+        ),
+        title: Text(
+          existingFingerprint == null ? '确认 SSH 主机密钥' : 'SSH 主机密钥已变化',
+        ),
+        content: SizedBox(
+          width: 480,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('${connection.address}:${connection.port} · $type'),
+              const SizedBox(height: 12),
+              if (existingFingerprint != null) ...[
+                const Text('此主机之前保存的密钥与当前密钥不同。只有确认服务器已更换密钥时才接受。'),
+                const SizedBox(height: 8),
+                SelectableText('原指纹：$existingFingerprint'),
+              ] else
+                const Text('首次连接前请通过可信渠道核对服务器指纹。'),
+              const SizedBox(height: 8),
+              SelectableText('当前指纹：$fingerprint'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('拒绝连接'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(existingFingerprint == null ? '信任此主机' : '更新并信任'),
+          ),
+        ],
+      ),
+    );
+    if (accepted != true) return false;
+    await _sessionStore.saveSshHostKey(endpointKey, fingerprint);
+    return true;
+  }
+
+  Stream<Uint8List> _mergeSshOutput(SSHSession session) {
+    late StreamSubscription<Uint8List> stdoutSubscription;
+    late StreamSubscription<Uint8List> stderrSubscription;
+    var openStreams = 2;
+    late final StreamController<Uint8List> output;
+    output = StreamController<Uint8List>(
+      onListen: () {
+        void streamClosed() {
+          openStreams -= 1;
+          if (openStreams == 0) unawaited(output.close());
+        }
+
+        stdoutSubscription = session.stdout.listen(
+          output.add,
+          onError: (Object error, StackTrace stackTrace) =>
+              output.addError(error, stackTrace),
+          onDone: streamClosed,
+        );
+        stderrSubscription = session.stderr.listen(
+          output.add,
+          onError: (Object error, StackTrace stackTrace) =>
+              output.addError(error, stackTrace),
+          onDone: streamClosed,
+        );
+      },
+      onCancel: () async {
+        await stdoutSubscription.cancel();
+        await stderrSubscription.cancel();
+      },
+    );
+    return output.stream;
+  }
+
+  void _handleSshSessionError(
+    _TerminalTab tab,
+    SSHClient client,
+    Object error,
+  ) {
+    if (tab.isClosed || !identical(tab.sshClient, client)) return;
+    tab.status = 'SSH 输出错误';
+    tab.errorMessage = error.toString();
+    tab.terminal.write('\r\n[SSH 输出错误] $error\r\n');
+    _refresh(tab);
+  }
+
+  void _handleSshSessionExit(_TerminalTab tab, SSHClient client) {
+    if (!identical(tab.sshClient, client)) return;
+    tab.sshSession = null;
+    tab.sshClient = null;
+    tab.outputSubscription = null;
+    tab.starting = false;
+    tab.status = '${tab.connection.displayName}已断开';
+    _refresh(tab);
+    unawaited(client.close());
   }
 
   Future<void> _restartSession(_TerminalTab tab) async {
@@ -448,6 +992,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
     final sessionId = tab.sessionId;
     tab.sessionId = null;
+    final sshClient = tab.sshClient;
+    tab.sshClient = null;
+    tab.sshSession = null;
     final outputSubscription = tab.outputSubscription;
     tab.outputSubscription = null;
     tab.starting = false;
@@ -459,14 +1006,18 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         // The shell may already have exited.
       }
     }
+    if (sshClient != null) {
+      try {
+        await sshClient.close();
+      } catch (_) {
+        // The SSH transport may already have closed.
+      }
+    }
     await outputSubscription?.cancel();
   }
 
   void _queueInput(_TerminalTab tab, String value) {
-    if (tab.isClosed ||
-        tab.starting ||
-        tab.restarting ||
-        tab.sessionId == null) {
+    if (tab.isClosed || tab.starting || tab.restarting || !tab.isConnected) {
       return;
     }
     tab.pendingInput.add(utf8.encode(value));
@@ -481,11 +1032,21 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     tab.inputFlushTimer = null;
 
     final sessionId = tab.sessionId;
-    if (sessionId == null || tab.pendingInput.isEmpty) return;
+    final sshSession = tab.sshSession;
+    if ((sessionId == null && sshSession == null) || tab.pendingInput.isEmpty) {
+      return;
+    }
 
     final data = tab.pendingInput.takeBytes();
     tab.inputWriteQueue = tab.inputWriteQueue
-        .then((_) => writeTerminalInput(sessionId: sessionId, data: data))
+        .then((_) async {
+          if (sshSession != null) {
+            sshSession.stdin.add(Uint8List.fromList(data));
+            await sshSession.flush();
+          } else if (sessionId != null) {
+            await writeTerminalInput(sessionId: sessionId, data: data);
+          }
+        })
         .catchError((Object error) {
           if (tab.isClosed) return;
           tab.errorMessage = error.toString();
@@ -497,6 +1058,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   void _handleResize(_TerminalTab tab, int columns, int rows) {
     tab.columns = columns.clamp(1, 1000);
     tab.rows = rows.clamp(1, 500);
+    final sshSession = tab.sshSession;
+    if (sshSession != null) {
+      sshSession.resizeTerminal(tab.columns, tab.rows);
+      return;
+    }
     final sessionId = tab.sessionId;
     if (sessionId == null) return;
 
@@ -513,7 +1079,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     );
   }
 
-  void _handleSessionError(_TerminalTab tab, int sessionId, Object error) {
+  void _handleSessionError(
+    _TerminalTab tab,
+    PlatformInt64 sessionId,
+    Object error,
+  ) {
     if (tab.isClosed || tab.sessionId != sessionId) return;
     tab.status = '${tab.connection.displayName}输出错误';
     tab.errorMessage = error.toString();
@@ -521,7 +1091,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     _refresh(tab);
   }
 
-  void _handleSessionExit(_TerminalTab tab, int sessionId) {
+  void _handleSessionExit(_TerminalTab tab, PlatformInt64 sessionId) {
     if (tab.sessionId == sessionId) {
       tab.sessionId = null;
       tab.outputSubscription = null;
@@ -554,16 +1124,26 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     if (tab == null) return colors.onSurfaceVariant;
     if (tab.errorMessage != null) return colors.error;
     if (tab.starting || tab.restarting) return colors.tertiary;
-    return tab.sessionId == null ? colors.onSurfaceVariant : colors.primary;
+    return tab.isConnected ? colors.primary : colors.onSurfaceVariant;
   }
 
   Future<void> _disposeTab(_TerminalTab tab) async {
     await tab.inputWriteQueue;
     final sessionId = tab.sessionId;
     tab.sessionId = null;
+    final sshClient = tab.sshClient;
+    tab.sshClient = null;
+    tab.sshSession = null;
     if (sessionId != null) {
       try {
         await closeTerminalSession(sessionId: sessionId);
+      } catch (_) {
+        // Ignore cleanup errors when a tab is closed.
+      }
+    }
+    if (sshClient != null) {
+      try {
+        await sshClient.close();
       } catch (_) {
         // Ignore cleanup errors when a tab is closed.
       }
@@ -604,22 +1184,30 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           ],
         ),
         actions: [
+          if (!kIsWeb) ...[
+            _ToolbarAction(
+              icon: Icons.terminal_rounded,
+              label: '本地终端',
+              onPressed: _addLocalShellTab,
+            ),
+            _ToolbarAction(
+              icon: Icons.usb_rounded,
+              label: '串口',
+              onPressed: () =>
+                  unawaited(_handleNewSession(_NewSessionAction.serial)),
+            ),
+            _ToolbarAction(
+              icon: Icons.lan_rounded,
+              label: 'Telnet',
+              onPressed: () =>
+                  unawaited(_handleNewSession(_NewSessionAction.telnet)),
+            ),
+          ],
           _ToolbarAction(
-            icon: Icons.terminal_rounded,
-            label: '本地终端',
-            onPressed: _addLocalShellTab,
-          ),
-          _ToolbarAction(
-            icon: Icons.usb_rounded,
-            label: '串口',
+            icon: Icons.lock_open_rounded,
+            label: 'SSH',
             onPressed: () =>
-                unawaited(_handleNewSession(_NewSessionAction.serial)),
-          ),
-          _ToolbarAction(
-            icon: Icons.lan_rounded,
-            label: 'Telnet',
-            onPressed: () =>
-                unawaited(_handleNewSession(_NewSessionAction.telnet)),
+                unawaited(_handleNewSession(_NewSessionAction.ssh)),
           ),
           const SizedBox(width: 8),
           VerticalDivider(
@@ -859,9 +1447,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     required bool saved,
     required ColorScheme colors,
   }) {
-    final protocolIcon = record.protocol == SessionProtocol.serial
-        ? Icons.usb_rounded
-        : Icons.lan_rounded;
+    final protocolIcon = switch (record.protocol) {
+      SessionProtocol.serial => Icons.usb_rounded,
+      SessionProtocol.telnet => Icons.lan_rounded,
+      SessionProtocol.ssh => Icons.lock_open_rounded,
+    };
     return ListTile(
       dense: true,
       visualDensity: const VisualDensity(vertical: -1),
@@ -963,7 +1553,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           borderRadius: BorderRadius.circular(7),
           onTap: () => _selectTab(tab),
           child: SizedBox(
-            width: 158,
+            width: 204,
             child: Padding(
               padding: const EdgeInsets.only(left: 10, right: 4),
               child: Row(
@@ -975,10 +1565,32 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(tab.title, overflow: TextOverflow.ellipsis),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          tab.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          tab.status,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 9,
+                            color: _statusColor(tab, colors),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                  const SizedBox(width: 6),
-                  Icon(Icons.circle, size: 8, color: _statusColor(tab, colors)),
+                  const SizedBox(width: 4),
                   IconButton(
                     tooltip: '关闭 ${tab.title} (Ctrl+W)',
                     onPressed: () => _closeTab(tab),
@@ -1103,7 +1715,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               const SizedBox(height: 6),
               if (recent.isEmpty)
                 Text(
-                  '成功连接过的串口和 Telnet 会显示在这里。',
+                  '成功连接过的串口、Telnet 和 SSH 会显示在这里。',
                   style: TextStyle(color: colors.onSurfaceVariant),
                 )
               else
@@ -1112,12 +1724,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                     margin: const EdgeInsets.only(bottom: 6),
                     color: const Color(0xFF151A17),
                     child: ListTile(
-                      leading: Icon(
-                        record.protocol == SessionProtocol.serial
-                            ? Icons.usb_rounded
-                            : Icons.lan_rounded,
-                        color: colors.primary,
-                      ),
+                      leading: Icon(switch (record.protocol) {
+                        SessionProtocol.serial => Icons.usb_rounded,
+                        SessionProtocol.telnet => Icons.lan_rounded,
+                        SessionProtocol.ssh => Icons.lock_open_rounded,
+                      }, color: colors.primary),
                       title: Text(record.name),
                       subtitle: Text(record.endpointLabel),
                       trailing: const Icon(Icons.arrow_forward_rounded),
@@ -1225,11 +1836,13 @@ class _ToolbarAction extends StatelessWidget {
   );
 }
 
-enum _NewSessionAction { local, serial, telnet, quickConnect, addSession }
+enum _NewSessionAction { local, serial, telnet, ssh, quickConnect, addSession }
 
 enum _RecordAction { save, rename, delete, removeRecent }
 
-enum _ConnectionKind { local, serial, telnet }
+enum _ConnectionKind { local, serial, telnet, ssh }
+
+enum _SshAuthMethod { key, password }
 
 enum _ConnectionDialogMode { quickConnect, addSession }
 
@@ -1241,7 +1854,16 @@ class _TerminalConnection {
       dataBits = 8,
       parity = 'none',
       stopBits = 1,
-      flowControl = 'none';
+      flowControl = 'none',
+      username = '',
+      password = null,
+      rememberCredentials = false,
+      webSocketUrl = '',
+      portKnockActions = const [],
+      authenticationMode = SshAuthenticationMode.automatic,
+      privateKeyPem = null,
+      privateKeyPassphrase = null,
+      sessionTitle = null;
 
   const _TerminalConnection.serial(
     this.address,
@@ -1250,14 +1872,50 @@ class _TerminalConnection {
     this.parity = 'none',
     this.stopBits = 1,
     this.flowControl = 'none',
-  }) : kind = _ConnectionKind.serial;
+  }) : kind = _ConnectionKind.serial,
+       username = '',
+       password = null,
+       rememberCredentials = false,
+       webSocketUrl = '',
+       portKnockActions = const [],
+       authenticationMode = SshAuthenticationMode.automatic,
+       privateKeyPem = null,
+       privateKeyPassphrase = null,
+       sessionTitle = null;
 
   const _TerminalConnection.telnet(this.address, this.port)
     : kind = _ConnectionKind.telnet,
       dataBits = 8,
       parity = 'none',
       stopBits = 1,
-      flowControl = 'none';
+      flowControl = 'none',
+      username = '',
+      password = null,
+      rememberCredentials = false,
+      webSocketUrl = '',
+      portKnockActions = const [],
+      authenticationMode = SshAuthenticationMode.automatic,
+      privateKeyPem = null,
+      privateKeyPassphrase = null,
+      sessionTitle = null;
+
+  const _TerminalConnection.ssh(
+    this.address,
+    this.port, {
+    this.username = '',
+    this.password,
+    this.rememberCredentials = false,
+    this.webSocketUrl = '',
+    this.portKnockActions = const [],
+    this.authenticationMode = SshAuthenticationMode.automatic,
+    this.privateKeyPem,
+    this.privateKeyPassphrase,
+    this.sessionTitle,
+  }) : kind = _ConnectionKind.ssh,
+       dataBits = 8,
+       parity = 'none',
+       stopBits = 1,
+       flowControl = 'none';
 
   final _ConnectionKind kind;
   final String address;
@@ -1267,30 +1925,56 @@ class _TerminalConnection {
   final String parity;
   final int stopBits;
   final String flowControl;
+  final String username;
+  final String? password;
+  final bool rememberCredentials;
+  final String webSocketUrl;
+  final List<PortKnockAction> portKnockActions;
+  final SshAuthenticationMode authenticationMode;
+  final String? privateKeyPem;
+  final String? privateKeyPassphrase;
+  final String? sessionTitle;
 
   String get displayName => switch (kind) {
     _ConnectionKind.local => '本地终端',
     _ConnectionKind.serial => '串口 $address',
     _ConnectionKind.telnet => 'Telnet $address:$port',
+    _ConnectionKind.ssh => 'SSH $address:$port',
   };
 
   String get openingStatus => switch (kind) {
     _ConnectionKind.local => '正在启动本地 shell',
     _ConnectionKind.serial => '正在打开串口 $address',
     _ConnectionKind.telnet => '正在连接 Telnet $address:$port',
+    _ConnectionKind.ssh => '正在连接 SSH $address:$port',
   };
 
   String get connectedStatus => switch (kind) {
     _ConnectionKind.local => '本地终端已连接',
     _ConnectionKind.serial => '串口已连接 · $address',
     _ConnectionKind.telnet => 'Telnet 已连接 · $address:$port',
+    _ConnectionKind.ssh => 'SSH 已连接 · $address:$port',
   };
+
+  SessionProtocol? get sessionProtocol => switch (kind) {
+    _ConnectionKind.local => null,
+    _ConnectionKind.serial => SessionProtocol.serial,
+    _ConnectionKind.telnet => SessionProtocol.telnet,
+    _ConnectionKind.ssh => SessionProtocol.ssh,
+  };
+
+  String get credentialKey => 'ssh:${address.trim().toLowerCase()}:$port';
+
+  String get hostKeyEndpoint =>
+      'ssh-host:${address.trim().toLowerCase()}:$port';
 
   String get endpointKey => switch (kind) {
     _ConnectionKind.serial =>
       '${kind.name}:${address.trim().toLowerCase()}:$port:$dataBits:$parity:$stopBits:$flowControl',
     _ConnectionKind.telnet =>
       '${kind.name}:${address.trim().toLowerCase()}:$port',
+    _ConnectionKind.ssh =>
+      '${kind.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl',
     _ConnectionKind.local => kind.name,
   };
 }
@@ -1343,6 +2027,11 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
   final _formKey = GlobalKey<FormState>();
   final _hostController = TextEditingController();
   final _portController = TextEditingController(text: '23');
+  final _usernameController = TextEditingController();
+  final _passwordController = TextEditingController();
+  final _privateKeyController = TextEditingController();
+  final _privateKeyPassphraseController = TextEditingController();
+  final _webSocketUrlController = TextEditingController();
   final _deviceController = TextEditingController();
   final _baudController = TextEditingController(text: '115200');
   final _profileNameController = TextEditingController();
@@ -1353,18 +2042,31 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
   String _parity = 'none';
   int _stopBits = 1;
   String _flowControl = 'none';
+  bool _rememberCredentials = false;
+  List<PortKnockAction> _portKnockActions = const [];
+  SshAuthenticationMode _authenticationMode = SshAuthenticationMode.automatic;
 
   @override
   void initState() {
     super.initState();
     _selectedProtocol = widget.initialProtocol;
-    _portsFuture = listSerialPorts();
+    _portController.text = _selectedProtocol == _ConnectionKind.ssh
+        ? '22'
+        : '23';
+    _portsFuture = kIsWeb
+        ? Future.value(const <SerialPortEntry>[])
+        : listSerialPorts();
   }
 
   @override
   void dispose() {
     _hostController.dispose();
     _portController.dispose();
+    _usernameController.dispose();
+    _passwordController.dispose();
+    _privateKeyController.dispose();
+    _privateKeyPassphraseController.dispose();
+    _webSocketUrlController.dispose();
     _deviceController.dispose();
     _baudController.dispose();
     _profileNameController.dispose();
@@ -1373,6 +2075,10 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
 
   void _connect() {
     if (!_formKey.currentState!.validate()) return;
+    final enteredName = _profileNameController.text.trim();
+    final sessionTitle = widget.mode == _ConnectionDialogMode.addSession
+        ? (enteredName.isEmpty ? _hostController.text.trim() : enteredName)
+        : null;
     final connection = switch (_selectedProtocol) {
       _ConnectionKind.serial => _TerminalConnection.serial(
         _deviceController.text.trim(),
@@ -1386,9 +2092,23 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
         _hostController.text.trim(),
         int.parse(_portController.text.trim()),
       ),
+      _ConnectionKind.ssh => _TerminalConnection.ssh(
+        _hostController.text.trim(),
+        int.parse(_portController.text.trim()),
+        username: _usernameController.text.trim(),
+        password: _passwordController.text,
+        privateKeyPem: _privateKeyController.text.trim().isEmpty
+            ? null
+            : _privateKeyController.text,
+        privateKeyPassphrase: _privateKeyPassphraseController.text,
+        rememberCredentials: _rememberCredentials,
+        webSocketUrl: _webSocketUrlController.text.trim(),
+        portKnockActions: _portKnockActions,
+        authenticationMode: _authenticationMode,
+        sessionTitle: sessionTitle,
+      ),
       _ConnectionKind.local => const _TerminalConnection.local(),
     };
-    final enteredName = _profileNameController.text.trim();
     Navigator.of(context).pop(
       _ConnectionDialogResult(
         connection: connection,
@@ -1397,6 +2117,15 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
             : null,
       ),
     );
+  }
+
+  Future<void> _configurePortKnock() async {
+    final actions = await showDialog<List<PortKnockAction>>(
+      context: context,
+      builder: (_) => _PortKnockDialog(initialActions: _portKnockActions),
+    );
+    if (!mounted || actions == null) return;
+    setState(() => _portKnockActions = actions);
   }
 
   Widget _buildProtocolItem({
@@ -1416,8 +2145,209 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
         leading: Icon(icon, color: selected ? colors.primary : null),
         title: Text(title),
         subtitle: Text(subtitle),
-        onTap: () => setState(() => _selectedProtocol = protocol),
+        onTap: () {
+          setState(() {
+            if (protocol == _ConnectionKind.ssh &&
+                _portController.text == '23') {
+              _portController.text = '22';
+            } else if (protocol == _ConnectionKind.telnet &&
+                _portController.text == '22') {
+              _portController.text = '23';
+            }
+            _selectedProtocol = protocol;
+          });
+        },
       ),
+    );
+  }
+
+  Widget _buildSshFields() {
+    final colors = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TextFormField(
+          controller: _hostController,
+          autofocus: _selectedProtocol == _ConnectionKind.ssh,
+          decoration: const InputDecoration(
+            labelText: 'SSH 主机名或 IP 地址',
+            hintText: '192.168.1.10',
+            prefixIcon: Icon(Icons.dns_rounded),
+          ),
+          validator: (value) => value == null || value.trim().isEmpty
+              ? '请输入 SSH 主机名或 IP 地址'
+              : null,
+          onFieldSubmitted: (_) => _connect(),
+        ),
+        const SizedBox(height: 16),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 220,
+              child: TextFormField(
+                controller: _portController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'SSH 端口',
+                  hintText: '22',
+                  prefixIcon: Icon(Icons.numbers_rounded),
+                ),
+                validator: (value) {
+                  final port = int.tryParse(value?.trim() ?? '');
+                  return port == null || port < 1 || port > 65535
+                      ? '端口范围为 1 到 65535'
+                      : null;
+                },
+                onFieldSubmitted: (_) => _connect(),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: TextButton.icon(
+                onPressed: _configurePortKnock,
+                icon: Icon(
+                  _portKnockActions.isEmpty
+                      ? Icons.playlist_add_rounded
+                      : Icons.playlist_add_check_rounded,
+                  size: 18,
+                ),
+                label: Text(_portKnockActions.isEmpty ? '配置端口敲门' : '已配置端口敲门'),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        DropdownButtonFormField<SshAuthenticationMode>(
+          initialValue: _authenticationMode,
+          decoration: const InputDecoration(
+            labelText: '认证模式',
+            prefixIcon: Icon(Icons.tune_rounded),
+          ),
+          items: [
+            for (final mode in SshAuthenticationMode.values)
+              DropdownMenuItem(
+                value: mode,
+                child: Text(_authenticationModeLabel(mode)),
+              ),
+          ],
+          onChanged: (value) {
+            if (value != null) setState(() => _authenticationMode = value);
+          },
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '自动模式会先试可用的私钥；优先模式失败后会回退到另一种可用认证。',
+          style: TextStyle(color: colors.onSurfaceVariant),
+        ),
+        const SizedBox(height: 16),
+        TextFormField(
+          controller: _usernameController,
+          textInputAction: TextInputAction.next,
+          autofillHints: const [AutofillHints.username],
+          decoration: const InputDecoration(
+            labelText: '用户名',
+            prefixIcon: Icon(Icons.person_outline_rounded),
+          ),
+          onFieldSubmitted: (_) => _connect(),
+        ),
+        const SizedBox(height: 16),
+        TextFormField(
+          controller: _passwordController,
+          obscureText: true,
+          autofillHints: const [AutofillHints.password],
+          decoration: const InputDecoration(
+            labelText: '密码',
+            prefixIcon: Icon(Icons.password_rounded),
+          ),
+          onFieldSubmitted: (_) => _connect(),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _privateKeyController,
+          minLines: 4,
+          maxLines: 7,
+          keyboardType: TextInputType.multiline,
+          decoration: InputDecoration(
+            labelText: 'SSH 私钥',
+            hintText: '粘贴 OpenSSH 私钥内容，或选择私钥文件',
+            alignLabelWithHint: true,
+            prefixIcon: const Icon(Icons.key_rounded),
+            suffixIcon: IconButton(
+              tooltip: '选择私钥文件',
+              onPressed: () async {
+                final pem = await _pickSshPrivateKey(context);
+                if (pem != null && mounted) {
+                  setState(() => _privateKeyController.text = pem);
+                }
+              },
+              icon: const Icon(Icons.folder_open_rounded),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _privateKeyPassphraseController,
+          obscureText: true,
+          decoration: const InputDecoration(
+            labelText: '私钥口令（如有）',
+            prefixIcon: Icon(Icons.password_rounded),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          '仅支持 OpenSSH、PKCS#1 RSA 和 SEC1 EC 私钥格式。勾选保存登录凭据时，私钥和口令也会一起保存。',
+          style: TextStyle(color: colors.onSurfaceVariant),
+        ),
+        if (kIsWeb) ...[
+          const SizedBox(height: 16),
+          TextFormField(
+            controller: _webSocketUrlController,
+            keyboardType: TextInputType.url,
+            decoration: const InputDecoration(
+              labelText: 'WebSocket SSH 网关',
+              hintText: 'wss://gateway.example/ssh?host={host}&port={port}',
+              prefixIcon: Icon(Icons.swap_horiz_rounded),
+            ),
+            validator: (value) => value == null || value.trim().isEmpty
+                ? '浏览器连接需要配置 WebSocket SSH 网关'
+                : null,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '网关须将二进制 WebSocket 数据帧双向转发到目标 SSH 主机。支持 {host}/{port} 占位符；否则应用会追加 host、port 查询参数。HTTPS 页面需要 wss://。URL 不要包含访问令牌或密码。',
+            style: TextStyle(color: colors.onSurfaceVariant),
+          ),
+          if (_portKnockActions.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Web 端口敲门由网关代发：TCP 使用默认连接方式，UDP 需识别 transport=udp，ICMP 需识别 transport=icmp；host 和适用时的 port 参数用于指定目标。',
+              style: TextStyle(color: colors.onSurfaceVariant),
+            ),
+          ],
+        ],
+        const SizedBox(height: 8),
+        CheckboxListTile(
+          contentPadding: EdgeInsets.zero,
+          value: _rememberCredentials,
+          onChanged: (value) =>
+              setState(() => _rememberCredentials = value ?? false),
+          title: const Text('保存登录凭据'),
+          subtitle: Text(
+            kIsWeb
+                ? '密码、私钥和口令使用浏览器加密存储'
+                : defaultTargetPlatform == TargetPlatform.android
+                ? '密码、私钥和口令使用 Android 系统密钥库加密存储'
+                : '密码、私钥和口令保存到当前用户的凭据文件；勾选后才保存',
+          ),
+          controlAffinity: ListTileControlAffinity.leading,
+        ),
+        Text(
+          '首次连接会显示服务器主机密钥指纹，核对后再信任。',
+          style: TextStyle(color: colors.onSurfaceVariant),
+        ),
+      ],
     );
   }
 
@@ -1773,18 +2703,26 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
                               ),
                             ),
                           ),
+                          if (!kIsWeb)
+                            _buildProtocolItem(
+                              protocol: _ConnectionKind.telnet,
+                              icon: Icons.lan_rounded,
+                              title: 'Telnet',
+                              subtitle: '主机和 TCP 端口',
+                            ),
                           _buildProtocolItem(
-                            protocol: _ConnectionKind.telnet,
-                            icon: Icons.lan_rounded,
-                            title: 'Telnet',
-                            subtitle: '主机和 TCP 端口',
+                            protocol: _ConnectionKind.ssh,
+                            icon: Icons.lock_open_rounded,
+                            title: 'SSH',
+                            subtitle: '加密远程终端',
                           ),
-                          _buildProtocolItem(
-                            protocol: _ConnectionKind.serial,
-                            icon: Icons.usb_rounded,
-                            title: '串口',
-                            subtitle: '设备和串口参数',
-                          ),
+                          if (!kIsWeb)
+                            _buildProtocolItem(
+                              protocol: _ConnectionKind.serial,
+                              icon: Icons.usb_rounded,
+                              title: '串口',
+                              subtitle: '设备和串口参数',
+                            ),
                         ],
                       ),
                     ),
@@ -1799,17 +2737,20 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                              Text(
-                                _selectedProtocol == _ConnectionKind.serial
-                                    ? '串口连接'
-                                    : 'Telnet 连接',
-                                style: Theme.of(context).textTheme.titleLarge,
-                              ),
+                              Text(switch (_selectedProtocol) {
+                                _ConnectionKind.serial => '串口连接',
+                                _ConnectionKind.telnet => 'Telnet 连接',
+                                _ConnectionKind.ssh => 'SSH 连接',
+                                _ConnectionKind.local => '本地终端',
+                              }, style: Theme.of(context).textTheme.titleLarge),
                               const SizedBox(height: 20),
                               if (_selectedProtocol == _ConnectionKind.serial)
                                 _buildSerialFields()
-                              else
+                              else if (_selectedProtocol ==
+                                  _ConnectionKind.telnet)
                                 _buildTelnetFields(),
+                              if (_selectedProtocol == _ConnectionKind.ssh)
+                                _buildSshFields(),
                             ],
                           ),
                         ),
@@ -1865,6 +2806,651 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
     );
   }
 }
+
+class _PortKnockDialog extends StatefulWidget {
+  const _PortKnockDialog({required this.initialActions});
+
+  final List<PortKnockAction> initialActions;
+
+  @override
+  State<_PortKnockDialog> createState() => _PortKnockDialogState();
+}
+
+class _PortKnockDialogState extends State<_PortKnockDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final List<_PortKnockDraft> _actions;
+
+  @override
+  void initState() {
+    super.initState();
+    _actions = widget.initialActions.map(_PortKnockDraft.fromAction).toList();
+  }
+
+  void _addKnock() {
+    setState(() => _actions.add(_PortKnockDraft.knock()));
+  }
+
+  void _addDelay() {
+    setState(() => _actions.add(_PortKnockDraft.delay()));
+  }
+
+  void _reorder(int oldIndex, int newIndex) {
+    setState(() {
+      final action = _actions.removeAt(oldIndex);
+      _actions.insert(newIndex, action);
+    });
+  }
+
+  void _save() {
+    if (!_formKey.currentState!.validate()) return;
+    final actions = _actions.map((draft) => draft.toAction()).toList();
+    Navigator.of(context).pop(actions);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Dialog(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: 580,
+          maxHeight: MediaQuery.sizeOf(context).height * 0.86,
+        ),
+        child: SizedBox(
+          width: 580,
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 12, 12),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.playlist_add_check_rounded,
+                      color: colors.primary,
+                    ),
+                    const SizedBox(width: 10),
+                    const Expanded(
+                      child: Text(
+                        '配置端口敲门',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '关闭',
+                      onPressed: () => Navigator.of(context).pop(),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    '操作按列表顺序执行。TCP 会连接一次后关闭，UDP 会发送一个空数据报，ICMP 会发送一次 Echo Request。',
+                    style: TextStyle(color: colors.onSurfaceVariant),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: Form(
+                  key: _formKey,
+                  child: _actions.isEmpty
+                      ? Center(
+                          child: Text(
+                            '还没有操作，请添加敲门或延迟。',
+                            style: TextStyle(color: colors.onSurfaceVariant),
+                          ),
+                        )
+                      : ReorderableListView.builder(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 4,
+                          ),
+                          buildDefaultDragHandles: false,
+                          itemCount: _actions.length,
+                          onReorderItem: _reorder,
+                          itemBuilder: (context, index) {
+                            final action = _actions[index];
+                            final isKnock =
+                                action.kind == PortKnockActionKind.knock;
+                            return Card(
+                              key: ValueKey(action.key),
+                              margin: const EdgeInsets.symmetric(vertical: 5),
+                              child: Padding(
+                                padding: const EdgeInsets.fromLTRB(8, 8, 8, 10),
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        ReorderableDragStartListener(
+                                          index: index,
+                                          child: const Padding(
+                                            padding: EdgeInsets.all(8),
+                                            child: Icon(
+                                              Icons.drag_indicator_rounded,
+                                            ),
+                                          ),
+                                        ),
+                                        Icon(
+                                          isKnock
+                                              ? Icons.lan_rounded
+                                              : Icons.timer_outlined,
+                                          size: 19,
+                                          color: colors.primary,
+                                        ),
+                                        const SizedBox(width: 9),
+                                        Expanded(
+                                          child: Text(
+                                            '${index + 1}. ${isKnock ? '敲门' : '延迟'}',
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ),
+                                        IconButton(
+                                          tooltip: '删除操作',
+                                          onPressed: () => setState(
+                                            () => _actions.removeAt(index),
+                                          ),
+                                          icon: const Icon(
+                                            Icons.delete_outline_rounded,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    Padding(
+                                      padding: const EdgeInsets.only(
+                                        left: 48,
+                                        right: 8,
+                                      ),
+                                      child: isKnock
+                                          ? Row(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Expanded(
+                                                  flex: 2,
+                                                  child:
+                                                      DropdownButtonFormField<
+                                                        PortKnockProtocol
+                                                      >(
+                                                        initialValue:
+                                                            action.protocol,
+                                                        decoration:
+                                                            const InputDecoration(
+                                                              isDense: true,
+                                                              labelText: '敲门协议',
+                                                            ),
+                                                        items: const [
+                                                          DropdownMenuItem(
+                                                            value:
+                                                                PortKnockProtocol
+                                                                    .tcp,
+                                                            child: Text('TCP'),
+                                                          ),
+                                                          DropdownMenuItem(
+                                                            value:
+                                                                PortKnockProtocol
+                                                                    .udp,
+                                                            child: Text('UDP'),
+                                                          ),
+                                                          DropdownMenuItem(
+                                                            value:
+                                                                PortKnockProtocol
+                                                                    .icmp,
+                                                            child: Text('ICMP'),
+                                                          ),
+                                                        ],
+                                                        onChanged: (value) {
+                                                          if (value == null) {
+                                                            return;
+                                                          }
+                                                          setState(() {
+                                                            action.protocol =
+                                                                value;
+                                                          });
+                                                        },
+                                                      ),
+                                                ),
+                                                if (action.protocol !=
+                                                    PortKnockProtocol.icmp) ...[
+                                                  const SizedBox(width: 10),
+                                                  Expanded(
+                                                    flex: 3,
+                                                    child: _portKnockValueField(
+                                                      action,
+                                                      isKnock: true,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ],
+                                            )
+                                          : _portKnockValueField(
+                                              action,
+                                              isKnock: false,
+                                            ),
+                                    ),
+                                    if (isKnock &&
+                                        action.protocol ==
+                                            PortKnockProtocol.icmp)
+                                      Padding(
+                                        padding: const EdgeInsets.only(
+                                          left: 48,
+                                          right: 8,
+                                          top: 4,
+                                        ),
+                                        child: Text(
+                                          '向目标主机发送一次 ICMP Echo Request。',
+                                          style: TextStyle(
+                                            color: colors.onSurfaceVariant,
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ),
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+                child: Wrap(
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: _addKnock,
+                      icon: const Icon(Icons.add_rounded),
+                      label: const Text('添加敲门'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _addDelay,
+                      icon: const Icon(Icons.add_rounded),
+                      label: const Text('添加延迟'),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: const Text('取消'),
+                    ),
+                    FilledButton(onPressed: _save, child: const Text('完成')),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _portKnockValueField(
+    _PortKnockDraft action, {
+    required bool isKnock,
+  }) => TextFormField(
+    key: ValueKey('${action.key}-field'),
+    initialValue: action.value,
+    keyboardType: TextInputType.number,
+    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+    decoration: InputDecoration(
+      isDense: true,
+      labelText: isKnock ? '敲门端口' : '延迟毫秒数',
+      suffixText: isKnock ? null : 'ms',
+    ),
+    validator: (value) {
+      final number = int.tryParse(value?.trim() ?? '');
+      if (number == null) {
+        return isKnock ? '请输入敲门端口' : '请输入延迟毫秒数';
+      }
+      if (isKnock && (number < 1 || number > 65535)) {
+        return '端口范围为 1 到 65535';
+      }
+      if (!isKnock && number < 0) return '延迟不能小于 0';
+      return null;
+    },
+    onChanged: (value) => action.value = value,
+  );
+}
+
+class _PortKnockDraft {
+  _PortKnockDraft.knock()
+    : kind = PortKnockActionKind.knock,
+      value = '',
+      protocol = PortKnockProtocol.tcp;
+
+  _PortKnockDraft.delay()
+    : kind = PortKnockActionKind.delay,
+      value = '1000',
+      protocol = PortKnockProtocol.tcp;
+
+  _PortKnockDraft.fromAction(PortKnockAction action)
+    : kind = action.kind,
+      protocol = action.protocol,
+      value = switch (action.kind) {
+        PortKnockActionKind.knock => '${action.port}',
+        PortKnockActionKind.delay => '${action.delayMs}',
+      };
+
+  final Object key = Object();
+  final PortKnockActionKind kind;
+  PortKnockProtocol protocol;
+  String value;
+
+  PortKnockAction toAction() => switch (kind) {
+    PortKnockActionKind.knock => PortKnockAction.knock(
+      protocol == PortKnockProtocol.icmp ? 0 : int.parse(value),
+      protocol: protocol,
+    ),
+    PortKnockActionKind.delay => PortKnockAction.delay(int.parse(value)),
+  };
+}
+
+class _SshCredentialPromptResult {
+  const _SshCredentialPromptResult({
+    required this.username,
+    required this.password,
+    required this.privateKeyPem,
+    required this.privateKeyPassphrase,
+    required this.rememberCredentials,
+  });
+
+  final String username;
+  final String password;
+  final String privateKeyPem;
+  final String privateKeyPassphrase;
+  final bool rememberCredentials;
+}
+
+class _SshCredentialPrompt extends StatefulWidget {
+  const _SshCredentialPrompt({
+    required this.initialUsername,
+    required this.initialPassword,
+    required this.initialPrivateKeyPem,
+    required this.initialPrivateKeyPassphrase,
+    required this.rememberByDefault,
+  });
+
+  final String initialUsername;
+  final String initialPassword;
+  final String initialPrivateKeyPem;
+  final String initialPrivateKeyPassphrase;
+  final bool rememberByDefault;
+
+  @override
+  State<_SshCredentialPrompt> createState() => _SshCredentialPromptState();
+}
+
+class _SshCredentialPromptState extends State<_SshCredentialPrompt> {
+  late final TextEditingController _usernameController;
+  final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _privateKeyController = TextEditingController();
+  final TextEditingController _privateKeyPassphraseController =
+      TextEditingController();
+  late bool _rememberCredentials;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _usernameController = TextEditingController(text: widget.initialUsername);
+    _passwordController.text = widget.initialPassword;
+    _privateKeyController.text = widget.initialPrivateKeyPem;
+    _privateKeyPassphraseController.text = widget.initialPrivateKeyPassphrase;
+    _rememberCredentials = widget.rememberByDefault;
+  }
+
+  @override
+  void dispose() {
+    _usernameController.dispose();
+    _passwordController.dispose();
+    _privateKeyController.dispose();
+    _privateKeyPassphraseController.dispose();
+    super.dispose();
+  }
+
+  void _connect() {
+    final username = _usernameController.text.trim();
+    if (username.isEmpty) {
+      setState(() => _error = '请输入用户名');
+      return;
+    }
+    Navigator.of(context).pop(
+      _SshCredentialPromptResult(
+        username: username,
+        password: _passwordController.text,
+        privateKeyPem: _privateKeyController.text,
+        privateKeyPassphrase: _privateKeyPassphraseController.text,
+        rememberCredentials: _rememberCredentials,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return AlertDialog(
+      title: const Text('SSH 登录凭据'),
+      content: SizedBox(
+        width: 440,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                TextField(
+                  controller: _usernameController,
+                  autofocus: true,
+                  autofillHints: const [AutofillHints.username],
+                  decoration: const InputDecoration(
+                    labelText: '用户名',
+                    prefixIcon: Icon(Icons.person_outline_rounded),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: _passwordController,
+                  obscureText: true,
+                  autofillHints: const [AutofillHints.password],
+                  decoration: const InputDecoration(
+                    labelText: '密码（可选）',
+                    prefixIcon: Icon(Icons.password_rounded),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: _privateKeyController,
+                  minLines: 4,
+                  maxLines: 6,
+                  decoration: InputDecoration(
+                    labelText: 'SSH 私钥（可选）',
+                    hintText: '粘贴 OpenSSH 私钥或选择文件',
+                    alignLabelWithHint: true,
+                    prefixIcon: const Icon(Icons.key_rounded),
+                    suffixIcon: IconButton(
+                      tooltip: '选择私钥文件',
+                      onPressed: () async {
+                        final pem = await _pickSshPrivateKey(context);
+                        if (pem != null && mounted) {
+                          setState(() => _privateKeyController.text = pem);
+                        }
+                      },
+                      icon: const Icon(Icons.folder_open_rounded),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: _privateKeyPassphraseController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: '私钥口令（如有）',
+                    prefixIcon: Icon(Icons.password_rounded),
+                  ),
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 8),
+                  Text(_error!, style: TextStyle(color: colors.error)),
+                ],
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _rememberCredentials,
+                  onChanged: (value) =>
+                      setState(() => _rememberCredentials = value ?? false),
+                  title: const Text('保存登录凭据'),
+                  subtitle: const Text('包含密码、私钥和私钥口令'),
+                  controlAffinity: ListTileControlAffinity.leading,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton.icon(
+          onPressed: _connect,
+          icon: const Icon(Icons.lock_open_rounded),
+          label: const Text('登录'),
+        ),
+      ],
+    );
+  }
+}
+
+class _SshUserInfoDialog extends StatefulWidget {
+  const _SshUserInfoDialog({required this.request, required this.sessionTitle});
+
+  final SSHUserInfoRequest request;
+  final String sessionTitle;
+
+  @override
+  State<_SshUserInfoDialog> createState() => _SshUserInfoDialogState();
+}
+
+class _SshUserInfoDialogState extends State<_SshUserInfoDialog> {
+  late final List<TextEditingController> _controllers;
+
+  @override
+  void initState() {
+    super.initState();
+    _controllers = List.generate(
+      widget.request.prompts.length,
+      (_) => TextEditingController(),
+    );
+  }
+
+  @override
+  void dispose() {
+    for (final controller in _controllers) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  void _continue() => Navigator.of(
+    context,
+  ).pop(_controllers.map((controller) => controller.text).toList());
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(
+      widget.request.name.isEmpty ? 'SSH 交互式质询' : widget.request.name,
+    ),
+    content: SizedBox(
+      width: 440,
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('会话：${widget.sessionTitle}'),
+            const SizedBox(height: 10),
+            if (widget.request.instruction.isNotEmpty) ...[
+              Text(widget.request.instruction),
+              const SizedBox(height: 12),
+            ],
+            for (
+              var index = 0;
+              index < widget.request.prompts.length;
+              index++
+            ) ...[
+              if (index > 0) const SizedBox(height: 12),
+              TextField(
+                controller: _controllers[index],
+                autofocus: index == 0,
+                obscureText: !widget.request.prompts[index].echo,
+                decoration: InputDecoration(
+                  labelText: widget.request.prompts[index].promptText.trim(),
+                ),
+                onSubmitted: index == widget.request.prompts.length - 1
+                    ? (_) => _continue()
+                    : null,
+              ),
+            ],
+          ],
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.of(context).pop(),
+        child: const Text('取消'),
+      ),
+      FilledButton(onPressed: _continue, child: const Text('继续')),
+    ],
+  );
+}
+
+Future<String?> _pickSshPrivateKey(BuildContext context) async {
+  try {
+    final file = await FilePicker.pickFile(dialogTitle: '选择 SSH 私钥');
+    if (file == null) return null;
+    final length = await file.length();
+    if (length != null && length > 1024 * 1024) {
+      throw const FormatException('私钥文件不能大于 1 MiB');
+    }
+    final pem = utf8.decode(await file.readAsBytes());
+    if (utf8.encode(pem).length > 1024 * 1024) {
+      throw const FormatException('私钥文件不能大于 1 MiB');
+    }
+    if (!pem.contains('PRIVATE KEY')) {
+      throw const FormatException('文件中未找到受支持的私钥内容');
+    }
+    return pem;
+  } catch (error) {
+    if (context.mounted) {
+      ScaffoldMessenger.maybeOf(
+        context,
+      )?.showSnackBar(SnackBar(content: Text('读取私钥失败：$error')));
+    }
+    return null;
+  }
+}
+
+String _authenticationModeLabel(SshAuthenticationMode mode) => switch (mode) {
+  SshAuthenticationMode.passwordFirst => '优先密码',
+  SshAuthenticationMode.keyFirst => '优先密钥',
+  SshAuthenticationMode.automatic => '自动',
+};
 
 class _SessionNameDialog extends StatefulWidget {
   const _SessionNameDialog({required this.initialName});
@@ -1942,7 +3528,9 @@ class _TerminalTab {
   Future<void> inputWriteQueue = Future<void>.value();
   StreamSubscription<String>? outputSubscription;
   Timer? inputFlushTimer;
-  int? sessionId;
+  PlatformInt64? sessionId;
+  SSHClient? sshClient;
+  SSHSession? sshSession;
   int columns = 100;
   int rows = 30;
   bool starting = false;
@@ -1950,4 +3538,6 @@ class _TerminalTab {
   bool isClosed = false;
   String status = '正在连接';
   String? errorMessage;
+
+  bool get isConnected => sessionId != null || sshSession != null;
 }

@@ -1,10 +1,11 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:geekcore_term/terminal/terminal_page.dart';
 import 'package:geekcore_term/src/rust/frb_generated.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await RustLib.init();
+  if (!kIsWeb) await RustLib.init();
   runApp(const GeekcoreTermApp());
 }
 

@@ -28,12 +28,17 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  dartssh2: ^4.1.0
+  file_picker: ^13.1.0
   flutter:
     sdk: flutter
 
   flutter_rust_bridge: 2.13.0
   flutter_rust_bridge_hooks: 2.13.0
+  flutter_secure_storage: ^11.2.0
+  path_provider: ^2.1.6
   shared_preferences: 2.5.6
+  web_socket_channel: ^3.0.3
   xterm: 4.0.0
 
 dependency_overrides:
