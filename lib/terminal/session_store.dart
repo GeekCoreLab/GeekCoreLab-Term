@@ -73,6 +73,9 @@ class SessionRecord {
     this.webSocketUrl = '',
     this.portKnockActions = const [],
     this.authenticationMode = SshAuthenticationMode.automatic,
+    this.username = '',
+    this.identityFile,
+    this.sshConfigAlias,
     required this.lastConnectedAt,
   });
 
@@ -89,6 +92,9 @@ class SessionRecord {
   final String webSocketUrl;
   final List<PortKnockAction> portKnockActions;
   final SshAuthenticationMode authenticationMode;
+  final String username;
+  final String? identityFile;
+  final String? sshConfigAlias;
   final DateTime lastConnectedAt;
 
   String get endpointKey => switch (protocol) {
@@ -97,7 +103,7 @@ class SessionRecord {
     SessionProtocol.serial =>
       '${protocol.name}:${address.trim().toLowerCase()}:$port:$dataBits:$parity:$stopBits:$flowControl',
     SessionProtocol.ssh =>
-      '${protocol.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl',
+      '${protocol.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}',
   };
 
   String get endpointLabel => switch (protocol) {
@@ -105,6 +111,10 @@ class SessionRecord {
     SessionProtocol.telnet => '$address:$port',
     SessionProtocol.ssh => '$address:$port',
   };
+
+  String get credentialKey => protocol == SessionProtocol.ssh
+      ? 'ssh:${address.trim().toLowerCase()}:$port${sshConfigAlias == null ? '' : ':config:${sshConfigAlias!.toLowerCase()}'}'
+      : endpointKey;
 
   SessionRecord copyWith({String? name, DateTime? lastConnectedAt}) =>
       SessionRecord(
@@ -120,6 +130,9 @@ class SessionRecord {
         webSocketUrl: webSocketUrl,
         portKnockActions: portKnockActions,
         authenticationMode: authenticationMode,
+        username: username,
+        identityFile: identityFile,
+        sshConfigAlias: sshConfigAlias,
         lastConnectedAt: lastConnectedAt ?? this.lastConnectedAt,
       );
 
@@ -138,6 +151,9 @@ class SessionRecord {
         .map((action) => action.toJson())
         .toList(),
     'authenticationMode': authenticationMode.name,
+    if (username.isNotEmpty) 'username': username,
+    'identityFile': ?identityFile,
+    'sshConfigAlias': ?sshConfigAlias,
     'lastConnectedAt': lastConnectedAt.toIso8601String(),
   };
 
@@ -168,6 +184,9 @@ class SessionRecord {
         (item) => item.name == value['authenticationMode'],
         orElse: () => SshAuthenticationMode.automatic,
       ),
+      username: value['username'] as String? ?? '',
+      identityFile: value['identityFile'] as String?,
+      sshConfigAlias: value['sshConfigAlias'] as String?,
       lastConnectedAt: DateTime.parse(value['lastConnectedAt'] as String),
     );
   }
