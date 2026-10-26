@@ -6,8 +6,9 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `get_session`, `sessions`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LocalShell`
+// These functions are ignored because they are not marked as `pub`: `get_session`, `register_session`, `sessions`, `write_session_bytes`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `SerialReader`, `SerialWriter`, `SessionBackend`, `TerminalSession`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `flush`, `fmt`, `read`, `write`
 
 Future<PlatformInt64> startLocalShell({required int cols, required int rows}) =>
     RustLib.instance.api.crateApiTerminalStartLocalShell(
@@ -15,28 +16,79 @@ Future<PlatformInt64> startLocalShell({required int cols, required int rows}) =>
       rows: rows,
     );
 
-Stream<Uint8List> readLocalShellOutput({required PlatformInt64 sessionId}) =>
-    RustLib.instance.api.crateApiTerminalReadLocalShellOutput(
+Future<List<SerialPortEntry>> listSerialPorts() =>
+    RustLib.instance.api.crateApiTerminalListSerialPorts();
+
+Future<PlatformInt64> startSerialSession({
+  required String portName,
+  required int baudRate,
+  required int dataBits,
+  required String parity,
+  required int stopBits,
+  required String flowControl,
+}) => RustLib.instance.api.crateApiTerminalStartSerialSession(
+  portName: portName,
+  baudRate: baudRate,
+  dataBits: dataBits,
+  parity: parity,
+  stopBits: stopBits,
+  flowControl: flowControl,
+);
+
+Future<PlatformInt64> startTelnetSession({
+  required String host,
+  required int port,
+  required int cols,
+  required int rows,
+}) => RustLib.instance.api.crateApiTerminalStartTelnetSession(
+  host: host,
+  port: port,
+  cols: cols,
+  rows: rows,
+);
+
+Stream<Uint8List> readTerminalOutput({required PlatformInt64 sessionId}) =>
+    RustLib.instance.api.crateApiTerminalReadTerminalOutput(
       sessionId: sessionId,
     );
 
-Future<void> writeLocalShellInput({
+Future<void> writeTerminalInput({
   required PlatformInt64 sessionId,
   required List<int> data,
-}) => RustLib.instance.api.crateApiTerminalWriteLocalShellInput(
+}) => RustLib.instance.api.crateApiTerminalWriteTerminalInput(
   sessionId: sessionId,
   data: data,
 );
 
-Future<void> resizeLocalShell({
+Future<void> resizeTerminalSession({
   required PlatformInt64 sessionId,
   required int cols,
   required int rows,
-}) => RustLib.instance.api.crateApiTerminalResizeLocalShell(
+}) => RustLib.instance.api.crateApiTerminalResizeTerminalSession(
   sessionId: sessionId,
   cols: cols,
   rows: rows,
 );
 
-Future<void> closeLocalShell({required PlatformInt64 sessionId}) =>
-    RustLib.instance.api.crateApiTerminalCloseLocalShell(sessionId: sessionId);
+Future<void> closeTerminalSession({required PlatformInt64 sessionId}) => RustLib
+    .instance
+    .api
+    .crateApiTerminalCloseTerminalSession(sessionId: sessionId);
+
+class SerialPortEntry {
+  final String portName;
+  final String deviceName;
+
+  const SerialPortEntry({required this.portName, required this.deviceName});
+
+  @override
+  int get hashCode => portName.hashCode ^ deviceName.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SerialPortEntry &&
+          runtimeType == other.runtimeType &&
+          portName == other.portName &&
+          deviceName == other.deviceName;
+}

@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1595613196;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1130191700;
 
 // Section: executor
 
@@ -47,7 +47,7 @@ flutter_rust_bridge::frb_generated_default_handler!();
 
 // Section: wire_funcs
 
-fn wire__crate__api__terminal__close_local_shell_impl(
+fn wire__crate__api__terminal__close_terminal_session_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -55,7 +55,7 @@ fn wire__crate__api__terminal__close_local_shell_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "close_local_shell",
+            debug_name: "close_terminal_session",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -73,7 +73,7 @@ fn wire__crate__api__terminal__close_local_shell_impl(
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, String>((move || {
-                    let output_ok = crate::api::terminal::close_local_shell(api_session_id)?;
+                    let output_ok = crate::api::terminal::close_terminal_session(api_session_id)?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -143,7 +143,7 @@ fn wire__crate__api__app__init_app_impl(
         },
     )
 }
-fn wire__crate__api__terminal__read_local_shell_output_impl(
+fn wire__crate__api__terminal__list_serial_ports_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -151,7 +151,39 @@ fn wire__crate__api__terminal__read_local_shell_output_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "read_local_shell_output",
+            debug_name: "list_serial_ports",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::terminal::list_serial_ports()?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__terminal__read_terminal_output_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "read_terminal_output",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -174,7 +206,7 @@ fn wire__crate__api__terminal__read_local_shell_output_impl(
             move |context| {
                 transform_result_sse::<_, ()>((move || {
                     let output_ok = Ok::<_, ()>({
-                        crate::api::terminal::read_local_shell_output(api_session_id, api_sink);
+                        crate::api::terminal::read_terminal_output(api_session_id, api_sink);
                     })?;
                     std::result::Result::Ok(output_ok)
                 })())
@@ -182,7 +214,7 @@ fn wire__crate__api__terminal__read_local_shell_output_impl(
         },
     )
 }
-fn wire__crate__api__terminal__resize_local_shell_impl(
+fn wire__crate__api__terminal__resize_terminal_session_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -190,7 +222,7 @@ fn wire__crate__api__terminal__resize_local_shell_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "resize_local_shell",
+            debug_name: "resize_terminal_session",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -210,7 +242,7 @@ fn wire__crate__api__terminal__resize_local_shell_impl(
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, String>((move || {
-                    let output_ok = crate::api::terminal::resize_local_shell(
+                    let output_ok = crate::api::terminal::resize_terminal_session(
                         api_session_id,
                         api_cols,
                         api_rows,
@@ -255,7 +287,7 @@ fn wire__crate__api__terminal__start_local_shell_impl(
         },
     )
 }
-fn wire__crate__api__terminal__write_local_shell_input_impl(
+fn wire__crate__api__terminal__start_serial_session_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -263,7 +295,90 @@ fn wire__crate__api__terminal__write_local_shell_input_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "write_local_shell_input",
+            debug_name: "start_serial_session",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_port_name = <String>::sse_decode(&mut deserializer);
+            let api_baud_rate = <u32>::sse_decode(&mut deserializer);
+            let api_data_bits = <u8>::sse_decode(&mut deserializer);
+            let api_parity = <String>::sse_decode(&mut deserializer);
+            let api_stop_bits = <u8>::sse_decode(&mut deserializer);
+            let api_flow_control = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::terminal::start_serial_session(
+                        api_port_name,
+                        api_baud_rate,
+                        api_data_bits,
+                        api_parity,
+                        api_stop_bits,
+                        api_flow_control,
+                    )?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__terminal__start_telnet_session_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "start_telnet_session",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_host = <String>::sse_decode(&mut deserializer);
+            let api_port = <u16>::sse_decode(&mut deserializer);
+            let api_cols = <i32>::sse_decode(&mut deserializer);
+            let api_rows = <i32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::terminal::start_telnet_session(
+                        api_host, api_port, api_cols, api_rows,
+                    )?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__terminal__write_terminal_input_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "write_terminal_input",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -283,7 +398,7 @@ fn wire__crate__api__terminal__write_local_shell_input_impl(
             move |context| {
                 transform_result_sse::<_, String>((move || {
                     let output_ok =
-                        crate::api::terminal::write_local_shell_input(api_session_id, api_data)?;
+                        crate::api::terminal::write_terminal_input(api_session_id, api_data)?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -371,6 +486,46 @@ impl SseDecode for Vec<u8> {
     }
 }
 
+impl SseDecode for Vec<crate::api::terminal::SerialPortEntry> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::terminal::SerialPortEntry>::sse_decode(
+                deserializer,
+            ));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for crate::api::terminal::SerialPortEntry {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_portName = <String>::sse_decode(deserializer);
+        let mut var_deviceName = <String>::sse_decode(deserializer);
+        return crate::api::terminal::SerialPortEntry {
+            port_name: var_portName,
+            device_name: var_deviceName,
+        };
+    }
+}
+
+impl SseDecode for u16 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u16::<NativeEndian>().unwrap()
+    }
+}
+
+impl SseDecode for u32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u32::<NativeEndian>().unwrap()
+    }
+}
+
 impl SseDecode for u8 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -399,22 +554,33 @@ fn pde_ffi_dispatcher_primary_impl(
 ) {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        1 => wire__crate__api__terminal__close_local_shell_impl(port, ptr, rust_vec_len, data_len),
+        1 => wire__crate__api__terminal__close_terminal_session_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
         3 => wire__crate__api__app__init_app_impl(port, ptr, rust_vec_len, data_len),
-        4 => wire__crate__api__terminal__read_local_shell_output_impl(
+        4 => wire__crate__api__terminal__list_serial_ports_impl(port, ptr, rust_vec_len, data_len),
+        5 => {
+            wire__crate__api__terminal__read_terminal_output_impl(port, ptr, rust_vec_len, data_len)
+        }
+        6 => wire__crate__api__terminal__resize_terminal_session_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        5 => wire__crate__api__terminal__resize_local_shell_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__terminal__start_local_shell_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__terminal__write_local_shell_input_impl(
-            port,
-            ptr,
-            rust_vec_len,
-            data_len,
-        ),
+        7 => wire__crate__api__terminal__start_local_shell_impl(port, ptr, rust_vec_len, data_len),
+        8 => {
+            wire__crate__api__terminal__start_serial_session_impl(port, ptr, rust_vec_len, data_len)
+        }
+        9 => {
+            wire__crate__api__terminal__start_telnet_session_impl(port, ptr, rust_vec_len, data_len)
+        }
+        10 => {
+            wire__crate__api__terminal__write_terminal_input_impl(port, ptr, rust_vec_len, data_len)
+        }
         _ => unreachable!(),
     }
 }
@@ -449,6 +615,27 @@ impl flutter_rust_bridge::IntoDart for crate::api::app::CoreInfo {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::app::CoreInfo {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::app::CoreInfo> for crate::api::app::CoreInfo {
     fn into_into_dart(self) -> crate::api::app::CoreInfo {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::terminal::SerialPortEntry {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.port_name.into_into_dart().into_dart(),
+            self.device_name.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::terminal::SerialPortEntry
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::terminal::SerialPortEntry>
+    for crate::api::terminal::SerialPortEntry
+{
+    fn into_into_dart(self) -> crate::api::terminal::SerialPortEntry {
         self
     }
 }
@@ -515,6 +702,38 @@ impl SseEncode for Vec<u8> {
         for item in self {
             <u8>::sse_encode(item, serializer);
         }
+    }
+}
+
+impl SseEncode for Vec<crate::api::terminal::SerialPortEntry> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::terminal::SerialPortEntry>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for crate::api::terminal::SerialPortEntry {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.port_name, serializer);
+        <String>::sse_encode(self.device_name, serializer);
+    }
+}
+
+impl SseEncode for u16 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u16::<NativeEndian>(self).unwrap();
+    }
+}
+
+impl SseEncode for u32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u32::<NativeEndian>(self).unwrap();
     }
 }
 
