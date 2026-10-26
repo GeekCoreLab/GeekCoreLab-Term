@@ -52,7 +52,9 @@ flutter build linux --release
 - Linux 启动 `$SHELL` 指定的 bash/zsh 等 shell；Windows 启动 `ComSpec` 指定的系统 shell，通常是 `cmd.exe`。如果 PowerShell 或其他 shell 已安装并在 PATH 中，可以直接从终端内启动。
 - 支持 ANSI 颜色、滚动缓冲、键盘输入、窗口尺寸同步；中文输入走 Flutter 文本输入连接，Linux IBus/Fcitx 候选框跟随终端光标，已组合文本只提交一次；右键可复制选区或粘贴剪贴板文本。
 - `packages/xterm` 保留了 xterm 4.0.0 的本地源码补丁，用于向桌面输入法报告正确的终端光标区域和视图变换。
-- 当前提供一个本地 shell 会话，不包含标签、多会话管理或 SSH 连接。
+- 支持同时打开多个本地 shell 标签；每个标签独立维护 PTY 进程、终端缓冲和输入状态，可新增、切换、关闭或重启会话。
+- 快捷键：`Ctrl+Shift+T` 新建终端，`Ctrl+W` 关闭当前终端，`Ctrl+Tab` / `Ctrl+Shift+Tab` 切换标签；macOS 使用 `Command` 替代 `Ctrl`。
+- 当前仅支持本地 shell 会话；SSH、SFTP 等远程连接尚未实现。
 
 ## 架构约定
 
