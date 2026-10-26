@@ -20,6 +20,7 @@ class TerminalController with ChangeNotifier {
 
   CellAnchor? _selectionBase;
   CellAnchor? _selectionExtent;
+  SelectionMode? _activeSelectionMode;
 
   SelectionMode get selectionMode => _selectionMode;
   SelectionMode _selectionMode;
@@ -47,28 +48,51 @@ class TerminalController with ChangeNotifier {
       return null;
     }
 
-    return _createRange(base.offset, extent.offset);
+    return _createRange(
+      base.offset,
+      extent.offset,
+      _activeSelectionMode ?? _selectionMode,
+    );
   }
 
   /// Set selection on the terminal from [base] to [extent]. This method takes
   /// the ownership of [base] and [extent] and will dispose them when the
   /// selection is cleared or changed.
   void setSelection(CellAnchor base, CellAnchor extent, {SelectionMode? mode}) {
+    if (mode != null) {
+      _selectionMode = mode;
+    }
+    setSelectionWithMode(
+      base,
+      extent,
+      mode: _selectionMode,
+    );
+  }
+
+  /// Sets the shape of this selection without changing the configured default.
+  @internal
+  void setSelectionWithMode(
+    CellAnchor base,
+    CellAnchor extent, {
+    required SelectionMode mode,
+  }) {
     _selectionBase?.dispose();
     _selectionBase = base;
 
     _selectionExtent?.dispose();
     _selectionExtent = extent;
 
-    if (mode != null) {
-      _selectionMode = mode;
-    }
+    _activeSelectionMode = mode;
 
     notifyListeners();
   }
 
-  BufferRange _createRange(CellOffset begin, CellOffset end) {
-    switch (selectionMode) {
+  BufferRange _createRange(
+    CellOffset begin,
+    CellOffset end,
+    SelectionMode mode,
+  ) {
+    switch (mode) {
       case SelectionMode.line:
         return BufferRangeLine(begin, end);
       case SelectionMode.block:
@@ -81,12 +105,17 @@ class TerminalController with ChangeNotifier {
   /// enables block selection mode.
   void setSelectionMode(SelectionMode newSelectionMode) {
     // If the new mode is the same as the old mode,
-    // nothing has to be changed.
-    if (_selectionMode == newSelectionMode) {
+    // and it already matches the active selection, nothing has to be changed.
+    if (_selectionMode == newSelectionMode &&
+        (_activeSelectionMode == null ||
+            _activeSelectionMode == newSelectionMode)) {
       return;
     }
     // Set the new mode.
     _selectionMode = newSelectionMode;
+    if (_selectionBase != null && _selectionExtent != null) {
+      _activeSelectionMode = newSelectionMode;
+    }
     notifyListeners();
   }
 
@@ -96,6 +125,7 @@ class TerminalController with ChangeNotifier {
     _selectionBase = null;
     _selectionExtent?.dispose();
     _selectionExtent = null;
+    _activeSelectionMode = null;
     notifyListeners();
   }
 

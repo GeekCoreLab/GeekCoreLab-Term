@@ -285,21 +285,29 @@ class RenderTerminal extends RenderBox with RelayoutWhenSystemFontsChangeMixin {
 
   /// Selects characters in the terminal that starts from [from] to [to]. At
   /// least one cell is selected even if [from] and [to] are same.
-  void selectCharacters(Offset from, [Offset? to]) {
+  void selectCharacters(
+    Offset from, {
+    Offset? to,
+    SelectionMode? mode,
+  }) {
+    final selectionMode = mode ?? _controller.selectionMode;
     final fromPosition = getCellOffset(from);
     if (to == null) {
-      _controller.setSelection(
+      _controller.setSelectionWithMode(
         _terminal.buffer.createAnchorFromOffset(fromPosition),
         _terminal.buffer.createAnchorFromOffset(fromPosition),
+        mode: selectionMode,
       );
     } else {
       var toPosition = getCellOffset(to);
-      if (toPosition.x >= fromPosition.x) {
+      if (selectionMode == SelectionMode.line &&
+          toPosition.x >= fromPosition.x) {
         toPosition = CellOffset(toPosition.x + 1, toPosition.y);
       }
-      _controller.setSelection(
+      _controller.setSelectionWithMode(
         _terminal.buffer.createAnchorFromOffset(fromPosition),
         _terminal.buffer.createAnchorFromOffset(toPosition),
+        mode: selectionMode,
       );
     }
   }

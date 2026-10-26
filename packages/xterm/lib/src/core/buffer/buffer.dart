@@ -2,6 +2,7 @@ import 'dart:math' show max, min;
 
 import 'package:xterm/src/core/buffer/cell_offset.dart';
 import 'package:xterm/src/core/buffer/line.dart';
+import 'package:xterm/src/core/buffer/range_block.dart';
 import 'package:xterm/src/core/buffer/range_line.dart';
 import 'package:xterm/src/core/buffer/range.dart';
 import 'package:xterm/src/core/charset.dart';
@@ -562,6 +563,7 @@ class Buffer {
     );
 
     range = range.normalized;
+    final isBlockSelection = range is BufferRangeBlock;
 
     final builder = StringBuffer();
 
@@ -570,9 +572,11 @@ class Buffer {
         continue;
       }
       final line = lines[segment.line];
-      if (!(segment.line == range.begin.y ||
-          segment.line == 0 ||
-          line.isWrapped)) {
+      if (isBlockSelection
+          ? segment.line != range.begin.y
+          : !(segment.line == range.begin.y ||
+              segment.line == 0 ||
+              line.isWrapped)) {
         builder.write("\n");
       }
       builder.write(line.getText(segment.start, segment.end));
