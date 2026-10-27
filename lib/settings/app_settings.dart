@@ -7,42 +7,65 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xterm/xterm.dart';
 
-enum AppThemeStyle { emerald, ocean, graphite }
+enum AppThemeStyle { light, emerald, ocean, graphite }
+
+enum TerminalFontFamily {
+  system('monospace', '系统默认等宽'),
+  jetBrainsMono('JetBrains Mono', 'JetBrains Mono'),
+  cascadianMono('Cascadia Mono', 'Cascadia Mono'),
+  firaCode('Fira Code', 'Fira Code'),
+  notoSansMonoCjk('Noto Sans Mono CJK SC', 'Noto Sans Mono CJK SC');
+
+  const TerminalFontFamily(this.familyName, this.label);
+
+  final String familyName;
+  final String label;
+
+  static TerminalFontFamily fromName(String? name) =>
+      values.where((family) => family.familyName == name).firstOrNull ?? system;
+}
 
 extension AppThemeStylePresentation on AppThemeStyle {
   String get label => switch (this) {
+    AppThemeStyle.light => 'HexHub 浅色',
     AppThemeStyle.emerald => '翡翠深色',
     AppThemeStyle.ocean => '海洋深色',
     AppThemeStyle.graphite => '石墨深色',
   };
 
   Color get seedColor => switch (this) {
+    AppThemeStyle.light => const Color(0xFF3578D4),
     AppThemeStyle.emerald => const Color(0xFF31C48D),
     AppThemeStyle.ocean => const Color(0xFF55A9E8),
     AppThemeStyle.graphite => const Color(0xFF9AA8B4),
   };
 
   Color get scaffoldColor => switch (this) {
+    AppThemeStyle.light => const Color(0xFFF5F7FA),
     AppThemeStyle.emerald => const Color(0xFF101512),
     AppThemeStyle.ocean => const Color(0xFF10151B),
     AppThemeStyle.graphite => const Color(0xFF141619),
   };
 
   Color get terminalBackground => switch (this) {
+    AppThemeStyle.light => const Color(0xFFFFFFFF),
     AppThemeStyle.emerald => const Color(0xFF0B0E0C),
     AppThemeStyle.ocean => const Color(0xFF0A1017),
     AppThemeStyle.graphite => const Color(0xFF101214),
   };
 
   Color get terminalForeground => switch (this) {
+    AppThemeStyle.light => const Color(0xFF252A31),
     AppThemeStyle.emerald => const Color(0xFFCCCCCC),
     AppThemeStyle.ocean => const Color(0xFFD0DAE4),
     AppThemeStyle.graphite => const Color(0xFFD0D3D6),
   };
 
+  bool get isLight => this == AppThemeStyle.light;
+
   static AppThemeStyle fromName(String? name) =>
       AppThemeStyle.values.where((style) => style.name == name).firstOrNull ??
-      AppThemeStyle.emerald;
+      AppThemeStyle.light;
 }
 
 class WindowBounds {
@@ -71,15 +94,31 @@ class AppSettingsController extends ChangeNotifier {
   AppSettingsController._({
     required this._preferences,
     required this._themeStyle,
+    required double terminalFontSize,
+    required TerminalFontFamily terminalFontFamily,
+    required int sshKeepAliveSeconds,
     required this._rememberWindowBounds,
     required this._windowBounds,
     required String? passwordSalt,
     required String? passwordVerifier,
-  }) : _passwordSalt = passwordSalt,
+  }) : // The constructor uses a public named parameter for the private field.
+       // ignore: prefer_initializing_formals
+       _terminalFontSize = terminalFontSize,
+       // ignore: prefer_initializing_formals
+       _terminalFontFamily = terminalFontFamily,
+       // ignore: prefer_initializing_formals
+       _sshKeepAliveSeconds = sshKeepAliveSeconds,
+       _passwordSalt = passwordSalt,
        _passwordVerifier = passwordVerifier,
        _isLocked = passwordSalt != null && passwordVerifier != null;
 
   static const _themeKey = 'geekcore_term.settings.theme.v1';
+  static const _terminalFontSizeKey =
+      'geekcore_term.settings.terminal_font_size.v1';
+  static const _terminalFontFamilyKey =
+      'geekcore_term.settings.terminal_font_family.v1';
+  static const _sshKeepAliveSecondsKey =
+      'geekcore_term.settings.ssh_keep_alive_seconds.v1';
   static const _rememberWindowKey = 'geekcore_term.settings.remember_window.v1';
   static const _windowLeftKey = 'geekcore_term.settings.window_left.v1';
   static const _windowTopKey = 'geekcore_term.settings.window_top.v1';
@@ -90,9 +129,13 @@ class AppSettingsController extends ChangeNotifier {
       'geekcore_term.settings.password_verifier.v1';
 
   static const passwordIterations = 210000;
+  static const sshKeepAliveOptions = [0, 10, 30, 60];
 
   final SharedPreferencesAsync _preferences;
   AppThemeStyle _themeStyle;
+  double _terminalFontSize;
+  TerminalFontFamily _terminalFontFamily;
+  int _sshKeepAliveSeconds;
   bool _rememberWindowBounds;
   WindowBounds? _windowBounds;
   String? _passwordSalt;
@@ -107,6 +150,13 @@ class AppSettingsController extends ChangeNotifier {
     final top = await preferences.getDouble(_windowTopKey);
     final width = await preferences.getDouble(_windowWidthKey);
     final height = await preferences.getDouble(_windowHeightKey);
+    final terminalFontSize = await preferences.getDouble(_terminalFontSizeKey);
+    final terminalFontFamily = await preferences.getString(
+      _terminalFontFamilyKey,
+    );
+    final sshKeepAliveSeconds = await preferences.getInt(
+      _sshKeepAliveSecondsKey,
+    );
     final bounds =
         left == null || top == null || width == null || height == null
         ? null
@@ -117,6 +167,11 @@ class AppSettingsController extends ChangeNotifier {
       themeStyle: AppThemeStylePresentation.fromName(
         await preferences.getString(_themeKey),
       ),
+      terminalFontSize: (terminalFontSize ?? 14).clamp(10, 24).toDouble(),
+      terminalFontFamily: TerminalFontFamily.fromName(terminalFontFamily),
+      sshKeepAliveSeconds: sshKeepAliveOptions.contains(sshKeepAliveSeconds)
+          ? sshKeepAliveSeconds!
+          : 10,
       rememberWindowBounds:
           await preferences.getBool(_rememberWindowKey) ?? true,
       windowBounds: bounds?.isUsable == true ? bounds : null,
@@ -126,6 +181,9 @@ class AppSettingsController extends ChangeNotifier {
   }
 
   AppThemeStyle get themeStyle => _themeStyle;
+  double get terminalFontSize => _terminalFontSize;
+  TerminalFontFamily get terminalFontFamily => _terminalFontFamily;
+  int get sshKeepAliveSeconds => _sshKeepAliveSeconds;
   bool get rememberWindowBounds => _rememberWindowBounds;
   WindowBounds? get windowBounds => _windowBounds;
   bool get hasMasterPassword =>
@@ -135,15 +193,36 @@ class AppSettingsController extends ChangeNotifier {
   ThemeData get themeData {
     final scheme = ColorScheme.fromSeed(
       seedColor: _themeStyle.seedColor,
-      brightness: Brightness.dark,
+      brightness: _themeStyle.isLight ? Brightness.light : Brightness.dark,
     );
     return ThemeData(
       colorScheme: scheme,
       useMaterial3: true,
       scaffoldBackgroundColor: _themeStyle.scaffoldColor,
+      dividerColor: scheme.outlineVariant,
+      cardTheme: CardThemeData(
+        color: scheme.surfaceContainerLow,
+        elevation: 0,
+        margin: EdgeInsets.zero,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(9),
+          borderSide: BorderSide(color: scheme.outlineVariant),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(9),
+          borderSide: BorderSide(color: scheme.outlineVariant),
+        ),
+      ),
       appBarTheme: AppBarTheme(
-        backgroundColor: _themeStyle.scaffoldColor,
+        backgroundColor: scheme.surface,
+        foregroundColor: scheme.onSurface,
         surfaceTintColor: Colors.transparent,
+        elevation: 0,
       ),
     );
   }
@@ -181,6 +260,35 @@ class AppSettingsController extends ChangeNotifier {
     if (_themeStyle == style) return;
     await _preferences.setString(_themeKey, style.name);
     _themeStyle = style;
+    notifyListeners();
+  }
+
+  Future<void> setTerminalFontSize(double size) async {
+    final normalized = size.clamp(10, 24).toDouble();
+    if (_terminalFontSize == normalized) return;
+    await _preferences.setDouble(_terminalFontSizeKey, normalized);
+    _terminalFontSize = normalized;
+    notifyListeners();
+  }
+
+  Future<void> setTerminalFontFamily(TerminalFontFamily family) async {
+    if (_terminalFontFamily == family) return;
+    await _preferences.setString(_terminalFontFamilyKey, family.familyName);
+    _terminalFontFamily = family;
+    notifyListeners();
+  }
+
+  Future<void> setSshKeepAliveSeconds(int seconds) async {
+    if (!sshKeepAliveOptions.contains(seconds)) {
+      throw ArgumentError.value(
+        seconds,
+        'seconds',
+        'Unsupported SSH keep-alive interval',
+      );
+    }
+    if (_sshKeepAliveSeconds == seconds) return;
+    await _preferences.setInt(_sshKeepAliveSecondsKey, seconds);
+    _sshKeepAliveSeconds = seconds;
     notifyListeners();
   }
 
@@ -251,7 +359,10 @@ class AppSettingsController extends ChangeNotifier {
 
   Future<void> clearAll() async {
     await _preferences.clear();
-    _themeStyle = AppThemeStyle.emerald;
+    _themeStyle = AppThemeStyle.light;
+    _terminalFontSize = 14;
+    _terminalFontFamily = TerminalFontFamily.system;
+    _sshKeepAliveSeconds = 10;
     _rememberWindowBounds = true;
     _windowBounds = null;
     _passwordSalt = null;

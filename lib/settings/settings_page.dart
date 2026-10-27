@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
@@ -20,6 +22,8 @@ class AppSettingsPage extends StatefulWidget {
 
 class _AppSettingsPageState extends State<AppSettingsPage> {
   bool _clearing = false;
+  double? _terminalFontSizeDraft;
+  TerminalFontFamily? _terminalFontFamilyDraft;
 
   bool get _supportsWindowBounds =>
       !kIsWeb &&
@@ -54,6 +58,42 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
       await WindowStateManager.instance.setRemembering(value);
     } catch (error) {
       _showMessage('保存窗口设置失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _saveTerminalFontSize(double value) async {
+    try {
+      await widget.settings.setTerminalFontSize(value);
+      if (mounted) setState(() => _terminalFontSizeDraft = value);
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _terminalFontSizeDraft = widget.settings.terminalFontSize,
+        );
+        _showMessage('保存终端字号失败：$error', isError: true);
+      }
+    }
+  }
+
+  Future<void> _saveTerminalFontFamily(TerminalFontFamily family) async {
+    try {
+      await widget.settings.setTerminalFontFamily(family);
+      if (mounted) setState(() => _terminalFontFamilyDraft = family);
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _terminalFontFamilyDraft = widget.settings.terminalFontFamily,
+        );
+        _showMessage('保存终端字体失败：$error', isError: true);
+      }
+    }
+  }
+
+  Future<void> _saveSshKeepAliveSeconds(int seconds) async {
+    try {
+      await widget.settings.setSshKeepAliveSeconds(seconds);
+    } catch (error) {
+      if (mounted) _showMessage('保存 SSH 保活设置失败：$error', isError: true);
     }
   }
 
@@ -112,6 +152,8 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
   Widget build(BuildContext context) {
     final settings = widget.settings;
     final colors = Theme.of(context).colorScheme;
+    final fontSize = _terminalFontSizeDraft ?? settings.terminalFontSize;
+    final fontFamily = _terminalFontFamilyDraft ?? settings.terminalFontFamily;
     final clearButton = OutlinedButton.icon(
       onPressed: _clearing ? null : _confirmClearAppData,
       style: OutlinedButton.styleFrom(
@@ -147,7 +189,7 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
                 _SettingsSection(
                   icon: Icons.palette_outlined,
                   title: '外观',
-                  subtitle: '更改工作区和终端的配色',
+                  subtitle: '更改工作区和终端的配色；浅色方案参考 HexHub 工作台',
                   child: Wrap(
                     spacing: 10,
                     runSpacing: 10,
@@ -176,6 +218,114 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
                           label: Text(style.label),
                         ),
                     ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _SettingsSection(
+                  icon: Icons.text_fields_rounded,
+                  title: '终端字号',
+                  subtitle: '调整所有终端标签的等宽字体大小',
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          const Expanded(child: Text('字号')),
+                          Text('${fontSize.round()} px'),
+                        ],
+                      ),
+                      Slider(
+                        value: fontSize,
+                        min: 10,
+                        max: 24,
+                        divisions: 14,
+                        label: '${fontSize.round()} px',
+                        onChanged: _clearing
+                            ? null
+                            : (value) => setState(
+                                () => _terminalFontSizeDraft = value,
+                              ),
+                        onChangeEnd: _clearing
+                            ? null
+                            : (value) =>
+                                  unawaited(_saveTerminalFontSize(value)),
+                      ),
+                      const SizedBox(height: 10),
+                      DropdownButtonFormField<TerminalFontFamily>(
+                        key: ValueKey(fontFamily),
+                        initialValue: fontFamily,
+                        decoration: const InputDecoration(
+                          labelText: '等宽字体',
+                          border: OutlineInputBorder(),
+                        ),
+                        items: [
+                          for (final family in TerminalFontFamily.values)
+                            DropdownMenuItem(
+                              value: family,
+                              child: Text(family.label),
+                            ),
+                        ],
+                        onChanged: _clearing
+                            ? null
+                            : (family) {
+                                if (family != null) {
+                                  unawaited(_saveTerminalFontFamily(family));
+                                }
+                              },
+                      ),
+                      const SizedBox(height: 8),
+                      const SizedBox(height: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 12,
+                        ),
+                        decoration: BoxDecoration(
+                          color: settings.terminalTheme.background,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          'ssh admin@router.local  # 中文显示预览',
+                          style: TextStyle(
+                            color: settings.terminalTheme.foreground,
+                            fontFamily: fontFamily.familyName,
+                            fontSize: fontSize,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.fade,
+                          softWrap: false,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _SettingsSection(
+                  icon: Icons.timer_outlined,
+                  title: 'SSH 连接保活',
+                  subtitle: '定期发送 SSH 保活请求，帮助维持空闲连接',
+                  child: DropdownButtonFormField<int>(
+                    key: ValueKey(settings.sshKeepAliveSeconds),
+                    initialValue: settings.sshKeepAliveSeconds,
+                    decoration: const InputDecoration(
+                      labelText: '保活间隔',
+                      border: OutlineInputBorder(),
+                    ),
+                    items: [
+                      for (final seconds
+                          in AppSettingsController.sshKeepAliveOptions)
+                        DropdownMenuItem(
+                          value: seconds,
+                          child: Text(seconds == 0 ? '关闭' : '$seconds 秒'),
+                        ),
+                    ],
+                    onChanged: _clearing
+                        ? null
+                        : (seconds) {
+                            if (seconds != null) {
+                              unawaited(_saveSshKeepAliveSeconds(seconds));
+                            }
+                          },
                   ),
                 ),
                 const SizedBox(height: 16),

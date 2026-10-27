@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
@@ -24,17 +25,11 @@ Future<void> uploadRemoteFile({
   required RemoteFileSource source,
   required RemoteTransferProtocol protocol,
   SftpClient? sftpClient,
+  bool overwriteConfirmed = false,
   void Function(int bytesSent)? onProgress,
 }) async {
   final name = source.name;
-  if (name.isEmpty || name.contains('/')) {
-    throw ArgumentError.value(name, 'source.name', '无效的文件名');
-  }
-  if (name.contains('\u0000') ||
-      (protocol == RemoteTransferProtocol.scp &&
-          (name.contains('\n') || name.contains('\r')))) {
-    throw ArgumentError.value(name, 'source.name', '文件名包含传输协议不支持的控制字符');
-  }
+  validateRemoteFileName(name, protocol);
 
   final destination = _joinRemotePath(remoteDirectory, name);
   switch (protocol) {
@@ -42,27 +37,175 @@ Future<void> uploadRemoteFile({
       final sftp = sftpClient ?? await client.sftp();
       final ownsClient = sftpClient == null;
       try {
-        final remoteFile = await sftp.open(
-          destination,
-          mode:
-              SftpFileOpenMode.create |
-              SftpFileOpenMode.truncate |
-              SftpFileOpenMode.write,
+        await _uploadSftpFile(
+          sftp: sftp,
+          destination: destination,
+          remoteDirectory: remoteDirectory,
+          source: source,
+          overwriteConfirmed: overwriteConfirmed,
+          onProgress: onProgress,
         );
-        try {
-          await remoteFile
-              .write(source.openRead(), onProgress: onProgress)
-              .done;
-        } finally {
-          await remoteFile.close();
-        }
       } finally {
         if (ownsClient) await sftp.close();
       }
       return;
     case RemoteTransferProtocol.scp:
+      final sftp = sftpClient ?? await client.sftp();
+      final ownsClient = sftpClient == null;
+      try {
+        final target = await _statRemoteFile(sftp, destination);
+        if (target != null && !target.isFile) {
+          throw StateError('远端同名目标不是普通文件，已取消上传');
+        }
+        if (target != null && !overwriteConfirmed) {
+          throw StateError('远端已存在同名文件，请确认覆盖后重试');
+        }
+      } finally {
+        if (ownsClient) await sftp.close();
+      }
       await _scpUpload(client, remoteDirectory, source, onProgress: onProgress);
       return;
+  }
+}
+
+Future<void> _uploadSftpFile({
+  required SftpClient sftp,
+  required String destination,
+  required String remoteDirectory,
+  required RemoteFileSource source,
+  required bool overwriteConfirmed,
+  void Function(int bytesSent)? onProgress,
+}) async {
+  final initialTarget = await _statRemoteFile(sftp, destination);
+  if (initialTarget != null) {
+    if (!overwriteConfirmed) {
+      throw StateError('远端已存在同名文件，请确认覆盖后重试');
+    }
+    if (!initialTarget.isFile) {
+      throw StateError('远端同名目标不是普通文件，已取消上传');
+    }
+    if (!await _supportsAtomicReplace(sftp)) {
+      throw StateError('远端 SFTP 服务不支持安全覆盖，原文件未修改');
+    }
+  }
+
+  final length = await source.length();
+  final temporaryPath = _joinRemotePath(
+    remoteDirectory,
+    '.geekcore-upload-${_randomTransferToken()}.tmp',
+  );
+  var temporaryExists = false;
+  var committed = false;
+  try {
+    final remoteFile = await sftp.open(
+      temporaryPath,
+      mode:
+          SftpFileOpenMode.create |
+          SftpFileOpenMode.exclusive |
+          SftpFileOpenMode.write,
+    );
+    temporaryExists = true;
+    try {
+      var bytesRead = 0;
+      Stream<Uint8List> validatedSource() async* {
+        await for (final chunk in source.openRead()) {
+          bytesRead += chunk.length;
+          if (bytesRead > length) {
+            throw StateError('本地文件大小在传输期间发生变化');
+          }
+          yield chunk;
+        }
+        if (bytesRead != length) {
+          throw StateError('本地文件大小在传输期间发生变化');
+        }
+      }
+
+      await remoteFile.write(validatedSource(), onProgress: onProgress).done;
+      final originalMode = initialTarget?.mode;
+      if (originalMode != null) {
+        // Preserve the ordinary rwx permissions while keeping special bits
+        // from being carried across to a newly owned inode.
+        await remoteFile.setStat(
+          SftpFileAttrs(mode: SftpFileMode.value(originalMode.value & 0x1ff)),
+        );
+      }
+    } finally {
+      await remoteFile.close();
+    }
+
+    final currentTarget = await _statRemoteFile(sftp, destination);
+    if (currentTarget != null && !currentTarget.isFile) {
+      throw StateError('传输期间远端目标类型发生变化，已取消替换');
+    }
+    if (initialTarget == null && currentTarget != null) {
+      throw StateError('传输期间远端出现了同名文件，已保留原文件');
+    }
+    if (initialTarget != null &&
+        currentTarget != null &&
+        !_sameRemoteVersion(initialTarget, currentTarget)) {
+      throw StateError('传输期间远端文件已变化，已保留新版本');
+    }
+    if (currentTarget != null && !await _supportsAtomicReplace(sftp)) {
+      throw StateError('远端 SFTP 服务不支持安全覆盖，原文件未修改');
+    }
+
+    await sftp.rename(temporaryPath, destination);
+    committed = true;
+  } finally {
+    if (temporaryExists && !committed) {
+      try {
+        await sftp.remove(temporaryPath);
+      } on Object {
+        // Keep the original transfer error; a disconnected server may leave
+        // an orphaned sibling temporary file for manual cleanup.
+      }
+    }
+  }
+}
+
+Future<SftpFileAttrs?> _statRemoteFile(SftpClient sftp, String path) async {
+  try {
+    return await sftp.stat(path, followLink: false);
+  } on SftpStatusError catch (error) {
+    if (error.code == SftpStatusCode.noSuchFile) return null;
+    rethrow;
+  }
+}
+
+Future<bool> _supportsAtomicReplace(SftpClient sftp) async {
+  final handshake = await sftp.handshake;
+  return handshake.extensions['posix-rename@openssh.com'] == '1';
+}
+
+bool _sameRemoteVersion(SftpFileAttrs original, SftpFileAttrs current) {
+  var compared = false;
+  if (original.size != current.size) return false;
+  if (original.size != null) {
+    compared = true;
+  }
+  if (original.modifyTime != current.modifyTime) return false;
+  if (original.modifyTime != null) {
+    compared = true;
+  }
+  return compared;
+}
+
+String _randomTransferToken() {
+  final random = Random.secure();
+  return List.generate(
+    3,
+    (_) => random.nextInt(0x7fffffff).toRadixString(16).padLeft(8, '0'),
+  ).join();
+}
+
+void validateRemoteFileName(String name, RemoteTransferProtocol protocol) {
+  if (name.isEmpty || name == '.' || name == '..' || name.contains('/')) {
+    throw ArgumentError.value(name, 'name', '无效的文件名');
+  }
+  if (name.contains('\u0000') ||
+      (protocol == RemoteTransferProtocol.scp &&
+          (name.contains('\n') || name.contains('\r')))) {
+    throw ArgumentError.value(name, 'name', '文件名包含传输协议不支持的控制字符');
   }
 }
 

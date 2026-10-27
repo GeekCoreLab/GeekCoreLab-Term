@@ -18,12 +18,18 @@ import 'package:geekcore_term/terminal/ssh_credential_store.dart';
 import 'package:geekcore_term/terminal/ssh_config.dart';
 import 'package:geekcore_term/terminal/ssh_config_file.dart';
 import 'package:geekcore_term/terminal/ssh_config_import_dialog.dart';
+import 'package:geekcore_term/terminal/ssh_agent.dart';
 import 'package:geekcore_term/terminal/ssh_identity_file.dart';
+import 'package:geekcore_term/terminal/ssh_tunnel.dart';
 import 'package:geekcore_term/terminal/ssh_terminal_environment.dart';
 import 'package:geekcore_term/terminal/ssh_remote_monitor_dialog.dart';
 import 'package:geekcore_term/terminal/ssh_remote_monitor_bar.dart';
 import 'package:geekcore_term/terminal/ssh_remote_monitor_cache.dart';
+import 'package:geekcore_term/terminal/network_diagnostics_dialog.dart';
+import 'package:geekcore_term/terminal/command_snippet_dialog.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
+import 'package:geekcore_term/terminal/terminal_search_dialog.dart';
+import 'package:geekcore_term/terminal/terminal_transcript.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
 import 'package:geekcore_term/settings/settings_page.dart';
@@ -48,11 +54,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   late final Future<void> _recordsReady;
   List<SessionRecord> _savedSessions = [];
   List<SessionRecord> _recentSessions = [];
+  List<String> _sessionGroups = [];
   String _sessionSearch = '';
+  String? _sessionGroupFilter;
   _SidebarSection _sidebarSection = _SidebarSection.sessions;
   bool _clearingAppData = false;
   int _nextTabId = 1;
   int? _activeTabId;
+  _TerminalSplitMode _splitMode = _TerminalSplitMode.none;
+  final List<int> _splitTabIds = [];
+  bool _broadcastSplitInput = false;
 
   _TerminalTab? get _activeTab {
     for (final tab in _tabs) {
@@ -71,10 +82,17 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     try {
       final saved = await _sessionStore.loadSaved();
       final recent = await _sessionStore.loadRecent();
+      final groups = await _sessionStore.loadGroups();
       if (!mounted) return;
       setState(() {
         _savedSessions = saved;
         _recentSessions = recent;
+        _sessionGroups = {
+          ...groups,
+          ...saved
+              .map((record) => record.group)
+              .where((group) => group.isNotEmpty),
+        }.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
       });
     } catch (error) {
       if (mounted) _showMessage('读取会话记录失败：$error', isError: true);
@@ -92,6 +110,27 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     );
   }
 
+  Future<void> _openSshTunnelManager(_TerminalTab tab) async {
+    final client = tab.sshClient;
+    if (kIsWeb) {
+      _showMessage('浏览器版本不支持本机 SSH 隧道监听');
+      return;
+    }
+    if (client == null || tab.sshSession == null) {
+      _showMessage('先连接 SSH 会话，再管理隧道');
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (_) => _SshTunnelManagerDialog(
+        client: client,
+        sessionTitle: tab.title,
+        tunnels: tab.tunnels,
+      ),
+    );
+    if (mounted) _refresh(tab);
+  }
+
   Future<void> _openSshRemoteMonitor(_TerminalTab tab) async {
     final client = tab.sshClient;
     if (client == null || tab.isClosed) {
@@ -105,6 +144,189 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         sessionTitle: tab.title,
       ),
     );
+    if (mounted && !tab.isClosed) _refresh(tab);
+  }
+
+  Future<void> _openNetworkDiagnostics() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => const NetworkDiagnosticsDialog(),
+    );
+  }
+
+  Future<void> _openTerminalSearch([_TerminalTab? requestedTab]) async {
+    final tab = requestedTab ?? _activeTab;
+    if (tab == null) {
+      _showMessage('先打开一个终端标签，再搜索输出');
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (_) => TerminalSearchDialog(
+        terminal: tab.terminal,
+        terminalController: tab.terminalController,
+        scrollController: tab.scrollController,
+      ),
+    );
+  }
+
+  Future<void> _openCommandSnippetManager() async {
+    try {
+      await _recordsReady;
+      final snippets = await _sessionStore.loadCommandSnippets();
+      if (!mounted) return;
+      final tab = _activeTab;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => CommandSnippetManagerDialog(
+          initialSnippets: snippets,
+          sessionTitle: tab?.title,
+          canInsert: tab?.isConnected == true,
+          isBroadcasting:
+              _broadcastSplitInput && _splitMode != _TerminalSplitMode.none,
+          onSave: _sessionStore.saveCommandSnippets,
+          onInsert: (snippet) async {
+            if (tab == null || tab.isClosed || !tab.isConnected) return false;
+            if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
+              final confirmed = await _confirmSplitBroadcastPaste(
+                '命令片段“${snippet.name}”会粘贴到所有可见且已连接的终端；片段为单行，不会自动按 Enter 执行。',
+                confirmLabel: '粘贴到分屏',
+              );
+              if (!mounted || tab.isClosed || confirmed != true) return false;
+            }
+            tab.focusNode.requestFocus();
+            tab.terminal.paste(snippet.command);
+            _showMessage('已将“${snippet.name}”粘贴到终端；未发送 Enter');
+            return true;
+          },
+        ),
+      );
+    } catch (error) {
+      _showMessage('读取命令片段失败：$error', isError: true);
+    }
+  }
+
+  Future<bool> _confirmSplitBroadcastPaste(
+    String description, {
+    String confirmLabel = '广播粘贴',
+  }) async {
+    if (!_broadcastSplitInput || _splitMode == _TerminalSplitMode.none) {
+      return true;
+    }
+    return await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('向分屏会话广播粘贴？'),
+            content: Text(description),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: Text(confirmLabel),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  Future<void> _toggleTranscriptLog(_TerminalTab tab) async {
+    if (tab.transcript.hasData || tab.transcript.isRecording) {
+      await _saveTranscriptLog(tab);
+      return;
+    }
+    tab.transcript.start(
+      'Geekcore Term output transcript\n'
+      'Session: ${tab.title}\n'
+      'Started: ${DateTime.now().toIso8601String()}\n\n',
+    );
+    _refresh(tab);
+    _showMessage('开始记录 ${tab.title} 的终端显示输出');
+  }
+
+  Future<bool> _saveTranscriptLog(_TerminalTab tab) async {
+    tab.transcript.stop();
+    final bytes = tab.transcript.snapshot();
+    if (bytes.isEmpty) {
+      tab.transcript.clear();
+      _refresh(tab);
+      _showMessage('终端记录为空');
+      return true;
+    }
+    final fileName =
+        'geekcore-term-${DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-')}.log';
+    try {
+      final path = await FilePicker.saveFile(
+        dialogTitle: '保存终端输出记录',
+        fileName: fileName,
+        bytes: bytes,
+      );
+      if (!mounted || path == null) return false;
+      tab.transcript.clear();
+      _refresh(tab);
+      _showMessage('已保存终端输出记录');
+      return true;
+    } catch (error) {
+      _showMessage('保存终端记录失败：$error', isError: true);
+      return false;
+    }
+  }
+
+  Future<bool> _confirmTranscriptClose(_TerminalTab tab) async {
+    if (!tab.transcript.hasData && !tab.transcript.isRecording) return true;
+    if (!tab.transcript.hasData) {
+      tab.transcript.clear();
+      return true;
+    }
+    final action = await showDialog<_TranscriptCloseAction>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('保存终端记录？'),
+        content: const Text(
+          '此标签有未保存的终端输出记录。记录仅捕获显示内容，可能包含 shell 回显的命令；请检查后再分享。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(context, _TranscriptCloseAction.cancel),
+            child: const Text('取消关闭'),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(context, _TranscriptCloseAction.discard),
+            child: const Text('丢弃记录'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(context, _TranscriptCloseAction.save),
+            child: const Text('保存并关闭'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return false;
+    switch (action) {
+      case _TranscriptCloseAction.save:
+        return _saveTranscriptLog(tab);
+      case _TranscriptCloseAction.discard:
+        tab.transcript.clear();
+        return true;
+      case _TranscriptCloseAction.cancel:
+      case null:
+        return false;
+    }
+  }
+
+  void _writeTerminalOutput(_TerminalTab tab, String value) {
+    tab.terminal.write(value);
+    final result = tab.transcript.append(value);
+    if (result == TranscriptAppendResult.limitReached && !tab.isClosed) {
+      _showMessage('终端记录达到 10 MiB 上限，已停止记录', isError: true);
+      _refresh(tab);
+    }
   }
 
   Future<void> _clearAppData() async {
@@ -115,6 +337,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       final tabs = List<_TerminalTab>.of(_tabs);
       for (final tab in tabs) {
         tab.isClosed = true;
+        tab.transcript.clear();
         tab.inputFlushTimer?.cancel();
         tab.inputFlushTimer = null;
         tab.pendingInput.takeBytes();
@@ -131,6 +354,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       for (final tab in tabs) {
         tab.focusNode.dispose();
         tab.terminalController.dispose();
+        tab.scrollController.dispose();
+        tab.remoteMonitorCache.dispose();
         await _disposeTab(tab);
       }
 
@@ -143,6 +368,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         setState(() {
           _savedSessions = [];
           _recentSessions = [];
+          _sessionGroups = [];
           _sessionSearch = '';
           _sessionSearchController.clear();
         });
@@ -235,6 +461,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         _handleResize(tab, columns, rows);
       },
     );
+    tab.focusNode.addListener(() => _handleTabFocusChange(tab));
     return tab;
   }
 
@@ -249,7 +476,18 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   void _addConnectionTab(_TerminalConnection connection) {
     final tab = _createTabState(connection);
     setState(() {
+      final activeId = _activeTabId;
       _tabs.add(tab);
+      if (_splitMode != _TerminalSplitMode.none) {
+        final slot = activeId == null ? -1 : _splitTabIds.indexOf(activeId);
+        if (slot >= 0) {
+          _splitTabIds[slot] = tab.id;
+        } else if (_splitTabIds.length < _splitMode.capacity) {
+          _splitTabIds.add(tab.id);
+        } else if (_splitTabIds.isNotEmpty) {
+          _splitTabIds[0] = tab.id;
+        }
+      }
       _activeTabId = tab.id;
     });
     _focusTab(tab);
@@ -277,6 +515,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           username: record.username,
           identityFile: record.identityFile,
           sshConfigAlias: record.sshConfigAlias,
+          jumpHost: record.jumpHost,
           webSocketUrl: record.webSocketUrl,
           portKnockActions: record.portKnockActions,
           authenticationMode: record.authenticationMode,
@@ -311,6 +550,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       username: connection.username,
       identityFile: connection.identityFile,
       sshConfigAlias: connection.sshConfigAlias,
+      jumpHost: connection.jumpHost,
       lastConnectedAt: now,
     );
     final updated = [
@@ -365,6 +605,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       username: connection.username,
       identityFile: connection.identityFile,
       sshConfigAlias: connection.sshConfigAlias,
+      jumpHost: connection.jumpHost,
+      group: existing?.group ?? '',
       lastConnectedAt: existing?.lastConnectedAt ?? DateTime.now(),
     );
     final updated = [..._savedSessions];
@@ -375,8 +617,15 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
     try {
       await _sessionStore.saveSaved(updated);
+      final groups = _sessionGroups.toSet();
+      if (savedRecord.group.isNotEmpty) groups.add(savedRecord.group);
+      await _sessionStore.saveGroups(groups.toList());
       if (!mounted) return;
-      setState(() => _savedSessions = updated);
+      setState(() {
+        _savedSessions = updated;
+        _sessionGroups = groups.toList()
+          ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      });
       _showMessage('已保存会话“$name”');
     } catch (error) {
       _showMessage('保存会话失败：$error', isError: true);
@@ -398,7 +647,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       case _RecordAction.rename:
         final name = await showDialog<String>(
           context: context,
-          builder: (_) => _SessionNameDialog(initialName: record.name),
+          builder: (_) =>
+              _SessionNameDialog(title: '重命名会话', initialName: record.name),
         );
         if (!mounted || name == null) return;
         final updated = _savedSessions
@@ -441,6 +691,43 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           if (mounted) setState(() => _recentSessions = updated);
         } catch (error) {
           _showMessage('删除最近连接失败：$error', isError: true);
+        }
+        return;
+      case _RecordAction.moveGroup:
+        final groups =
+            _savedSessions
+                .map((item) => item.group)
+                .where((group) => group.isNotEmpty)
+                .toSet()
+                .toList()
+              ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+        final group = await showDialog<String>(
+          context: context,
+          builder: (_) =>
+              _SessionGroupDialog(groups: groups, initialGroup: record.group),
+        );
+        if (!mounted || group == null || group == record.group) return;
+        final allGroups = {
+          ..._sessionGroups,
+          if (group.isNotEmpty) group,
+        }.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+        final updated = _savedSessions
+            .map(
+              (item) =>
+                  item.id == record.id ? item.copyWith(group: group) : item,
+            )
+            .toList();
+        try {
+          await _sessionStore.saveSaved(updated);
+          await _sessionStore.saveGroups(allGroups);
+          if (mounted) {
+            setState(() {
+              _savedSessions = updated;
+              _sessionGroups = allGroups;
+            });
+          }
+        } catch (error) {
+          _showMessage('移动会话失败：$error', isError: true);
         }
         return;
     }
@@ -502,8 +789,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }) async {
     final result = await showDialog<_ConnectionDialogResult>(
       context: context,
-      builder: (_) =>
-          _ConnectionDialog(initialProtocol: initialProtocol, mode: mode),
+      builder: (_) => _ConnectionDialog(
+        initialProtocol: initialProtocol,
+        mode: mode,
+        savedSshSessions: [
+          for (final record in _savedSessions)
+            if (record.protocol == SessionProtocol.ssh &&
+                record.jumpHost == null)
+              record,
+        ],
+      ),
     );
     if (result == null || !mounted) return;
     final saveAsName = result.saveAsName;
@@ -519,12 +814,37 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     });
   }
 
+  void _handleTabFocusChange(_TerminalTab tab) {
+    if (!tab.focusNode.hasFocus || tab.isClosed || !mounted) return;
+    _activateTab(tab);
+  }
+
+  void _activateTab(_TerminalTab tab) {
+    if (tab.isClosed || !mounted) return;
+    final isVisible =
+        _splitMode == _TerminalSplitMode.none || _splitTabIds.contains(tab.id);
+    if (_activeTabId == tab.id && isVisible) return;
+
+    setState(() {
+      if (_splitMode != _TerminalSplitMode.none &&
+          !_splitTabIds.contains(tab.id)) {
+        final slot = _activeTabId == null
+            ? -1
+            : _splitTabIds.indexOf(_activeTabId!);
+        if (slot >= 0) {
+          _splitTabIds[slot] = tab.id;
+        } else if (_splitTabIds.length < _splitMode.capacity) {
+          _splitTabIds.add(tab.id);
+        } else if (_splitTabIds.isNotEmpty) {
+          _splitTabIds[0] = tab.id;
+        }
+      }
+      _activeTabId = tab.id;
+    });
+  }
+
   void _selectTab(_TerminalTab tab) {
-    if (_activeTabId == tab.id) {
-      tab.focusNode.requestFocus();
-      return;
-    }
-    setState(() => _activeTabId = tab.id);
+    _activateTab(tab);
     _focusTab(tab);
   }
 
@@ -536,9 +856,55 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     _selectTab(_tabs[nextIndex]);
   }
 
-  void _closeTab(_TerminalTab tab) {
+  Future<void> _setSplitMode(_TerminalSplitMode mode) async {
+    if (mode == _TerminalSplitMode.none) {
+      setState(() {
+        _splitMode = mode;
+        _splitTabIds.clear();
+        _broadcastSplitInput = false;
+      });
+      return;
+    }
+
+    final primaryId = _activeTabId;
+    final newTabs = <_TerminalTab>[];
+    while (!kIsWeb && _tabs.length + newTabs.length < mode.capacity) {
+      newTabs.add(_createTabState(const _TerminalConnection.local()));
+    }
+    final candidates = <int>[
+      ?primaryId,
+      for (final tab in [..._tabs, ...newTabs])
+        if (tab.id != primaryId) tab.id,
+    ];
+    final visibleIds = candidates.take(mode.capacity).toList();
+    setState(() {
+      _tabs.addAll(newTabs);
+      _splitMode = mode;
+      _splitTabIds
+        ..clear()
+        ..addAll(visibleIds);
+      _activeTabId = primaryId ?? visibleIds.firstOrNull;
+    });
+    for (final tab in newTabs) {
+      unawaited(_startSession(tab));
+    }
+    final active = _activeTab;
+    if (active != null) _focusTab(active);
+  }
+
+  Future<void> _closeTab(_TerminalTab tab) async {
+    if (tab.closing) return;
+    tab.closing = true;
+    if (!await _confirmTranscriptClose(tab)) {
+      tab.closing = false;
+      return;
+    }
+    if (!mounted || tab.isClosed) return;
     final index = _tabs.indexOf(tab);
-    if (index < 0) return;
+    if (index < 0) {
+      tab.closing = false;
+      return;
+    }
 
     final wasActive = tab.id == _activeTabId;
     _TerminalTab? nextTab;
@@ -555,11 +921,35 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     setState(() {
       _tabs.removeAt(index);
       if (wasActive) _activeTabId = nextTab?.id;
+      if (_splitMode != _TerminalSplitMode.none) {
+        final removedSlot = _splitTabIds.indexOf(tab.id);
+        _splitTabIds.remove(tab.id);
+        if (removedSlot >= 0 && _splitTabIds.length < _splitMode.capacity) {
+          final replacement = _tabs.cast<_TerminalTab?>().firstWhere(
+            (candidate) =>
+                candidate != null && !_splitTabIds.contains(candidate.id),
+            orElse: () => null,
+          );
+          if (replacement != null) {
+            _splitTabIds.insert(
+              removedSlot.clamp(0, _splitTabIds.length),
+              replacement.id,
+            );
+          }
+        }
+        if (_splitTabIds.length < 2) {
+          _splitMode = _TerminalSplitMode.none;
+          _splitTabIds.clear();
+          _broadcastSplitInput = false;
+        }
+      }
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       tab.focusNode.dispose();
       tab.terminalController.dispose();
+      tab.scrollController.dispose();
+      tab.remoteMonitorCache.dispose();
     });
     unawaited(_disposeTab(tab));
     if (nextTab != null) _focusTab(nextTab);
@@ -635,7 +1025,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           .cast<List<int>>()
           .transform(const Utf8Decoder(allowMalformed: true))
           .listen(
-            tab.terminal.write,
+            (value) => _writeTerminalOutput(tab, value),
             onError: (Object error, StackTrace stackTrace) {
               _handleSessionError(tab, sessionId, error);
             },
@@ -654,8 +1044,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.starting = false;
       tab.status = '${tab.connection.displayName}连接失败';
       tab.errorMessage = error.toString();
-      tab.terminal.write('\r\n[启动失败] $error\r\n');
+      _writeTerminalOutput(tab, '\r\n[启动失败] $error\r\n');
       if (tab.connection.kind == _ConnectionKind.ssh) {
+        await _closeSshJumpClient(tab);
         _notifySessionProgress(
           tab,
           'SSH 登录失败：$error',
@@ -668,15 +1059,61 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
   }
 
+  Future<List<SSHIdentity>> _loadSshAgentIdentities(
+    _TerminalTab tab, {
+    required String connectionLabel,
+  }) async {
+    try {
+      final identities = await loadSshAgentIdentities();
+      if (identities.isNotEmpty && mounted && !tab.isClosed) {
+        _notifySessionProgress(
+          tab,
+          '$connectionLabel SSH Agent 提供 ${identities.length} 个密钥身份',
+        );
+      }
+      return identities;
+    } catch (error) {
+      if (mounted && !tab.isClosed) {
+        _notifySessionProgress(
+          tab,
+          '$connectionLabel SSH Agent 不可用，继续尝试已配置的认证方式：$error',
+          isError: true,
+        );
+      }
+      return const [];
+    }
+  }
+
   Future<void> _openSshSession(
     _TerminalTab tab,
     _TerminalConnection connection,
   ) async {
-    await _runPortKnockSequence(tab, connection);
+    SSHClient? jumpClient;
+    final jumpHost = connection.jumpHost;
+    if (jumpHost == null) {
+      await _runPortKnockSequence(tab, connection);
+    } else {
+      if (jumpHost.address.trim().toLowerCase() ==
+              connection.address.trim().toLowerCase() &&
+          jumpHost.port == connection.port) {
+        throw StateError('跳板机和目标主机不能相同');
+      }
+      if (connection.portKnockActions.isNotEmpty) {
+        throw StateError('经跳板机连接时暂不支持目标主机端口敲门');
+      }
+      _notifySessionProgress(tab, '正在连接 SSH 跳板机“${jumpHost.name}”…');
+      jumpClient = await _openSshJumpHost(tab, jumpHost);
+      if (tab.isClosed) return;
+    }
     if (tab.isClosed) return;
 
     final savedCredentials = await _sshCredentialStore.read(
       connection.credentialKey,
+    );
+    if (!mounted || tab.isClosed) return;
+    final agentIdentities = await _loadSshAgentIdentities(
+      tab,
+      connectionLabel: 'SSH',
     );
     if (!mounted || tab.isClosed) return;
     var username = connection.username.trim();
@@ -720,7 +1157,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       }
     }
     if (username.isEmpty ||
-        ((password == null || password.isEmpty) && !hasPrivateKey) ||
+        ((password == null || password.isEmpty) &&
+            !hasPrivateKey &&
+            agentIdentities.isEmpty) ||
         privateKeyPassphraseMissing) {
       if (!mounted || tab.isClosed) return;
       final credentials = await showDialog<_SshCredentialPromptResult>(
@@ -744,20 +1183,22 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
     if (tab.isClosed) return;
 
-    List<SSHKeyPair> identities = const [];
+    final identities = <SSHIdentity>[];
     final trimmedPrivateKey = privateKeyPem?.trim() ?? '';
     if (trimmedPrivateKey.isNotEmpty) {
       try {
-        identities = SSHKeyPair.fromPem(
-          trimmedPrivateKey,
-          privateKeyPassphrase?.isEmpty ?? true ? null : privateKeyPassphrase,
+        identities.addAll(
+          SSHKeyPair.fromPem(
+            trimmedPrivateKey,
+            privateKeyPassphrase?.isEmpty ?? true ? null : privateKeyPassphrase,
+          ),
         );
       } catch (error) {
-        identities = const [];
         _notifySessionProgress(tab, '私钥无法读取：$error', isError: true);
         _notifySessionProgress(tab, '密钥登录失败，使用密码重试...');
       }
     }
+    identities.addAll(agentIdentities);
 
     final hasPassword = password != null && password.isNotEmpty;
     final orderedAttempts = switch (authenticationMode) {
@@ -779,10 +1220,15 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     SSHClient? client;
     var authenticated = false;
     for (var index = 0; index < orderedAttempts.length; index++) {
+      if (tab.isClosed) return;
       final method = orderedAttempts[index];
       final isKeyAttempt = method == _SshAuthMethod.key;
       _notifySessionProgress(tab, isKeyAttempt ? '正在尝试密钥登录...' : '正在尝试密码登录...');
-      final socket = await _connectSshSocket(connection);
+      final socket = jumpClient == null
+          ? await _connectSshSocket(connection)
+          : await jumpClient
+                .forwardLocal(connection.address, connection.port)
+                .timeout(const Duration(seconds: 15));
       if (tab.isClosed) {
         socket.destroy();
         return;
@@ -799,6 +1245,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             : (request) => _requestSshUserInfo(tab, request),
         onVerifyHostKey: (type, fingerprint) =>
             _verifySshHostKey(tab, connection, type, fingerprint),
+        keepAliveInterval: widget.settings.sshKeepAliveSeconds == 0
+            ? null
+            : Duration(seconds: widget.settings.sshKeepAliveSeconds),
         handshakeTimeout: const Duration(seconds: 15),
         authTimeout: const Duration(minutes: 5),
       );
@@ -819,6 +1268,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         } catch (_) {
           // Preserve the authentication failure when closing a failed attempt.
         }
+        if (tab.isClosed) return;
         final hasFallback = index + 1 < orderedAttempts.length;
         if (!hasFallback) Error.throwWithStackTrace(error, stackTrace);
         final nextIsKey = orderedAttempts[index + 1] == _SshAuthMethod.key;
@@ -873,7 +1323,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           .cast<List<int>>()
           .transform(const Utf8Decoder(allowMalformed: true))
           .listen(
-            tab.terminal.write,
+            (value) => _writeTerminalOutput(tab, value),
             onError: (Object error, StackTrace stackTrace) {
               _handleSshSessionError(tab, authenticatedClient, error);
             },
@@ -899,6 +1349,203 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       await authenticatedClient.close();
       rethrow;
     }
+  }
+
+  Future<SSHClient> _openSshJumpHost(
+    _TerminalTab tab,
+    SshJumpHost record,
+  ) async {
+    final connection = _TerminalConnection.ssh(
+      record.address,
+      record.port,
+      username: record.username,
+      webSocketUrl: record.webSocketUrl,
+      portKnockActions: record.portKnockActions,
+      authenticationMode: record.authenticationMode,
+      identityFile: record.identityFile,
+      sshConfigAlias: record.sshConfigAlias,
+      sessionTitle: record.name,
+    );
+    await _runPortKnockSequence(tab, connection);
+    if (tab.isClosed) throw StateError('SSH 跳板机连接已取消');
+
+    final savedCredentials = await _sshCredentialStore.read(
+      connection.credentialKey,
+    );
+    if (!mounted || tab.isClosed) {
+      throw StateError('SSH 跳板机连接已取消');
+    }
+    final agentIdentities = await _loadSshAgentIdentities(
+      tab,
+      connectionLabel: '跳板机',
+    );
+    if (!mounted || tab.isClosed) {
+      throw StateError('SSH 跳板机连接已取消');
+    }
+    var username = connection.username.trim();
+    var password = savedCredentials?.password;
+    var privateKeyPem = connection.privateKeyPem;
+    var privateKeyPassphrase = savedCredentials?.privateKeyPassphrase;
+    var rememberCredentials = savedCredentials != null;
+    if (username.isEmpty && savedCredentials != null) {
+      username = savedCredentials.username;
+    }
+    if ((privateKeyPem == null || privateKeyPem.trim().isEmpty) &&
+        savedCredentials != null) {
+      privateKeyPem = savedCredentials.privateKeyPem;
+    }
+    if ((privateKeyPem == null || privateKeyPem.trim().isEmpty) &&
+        connection.identityFile != null) {
+      try {
+        privateKeyPem = await readSshIdentityFile(connection.identityFile!);
+      } catch (error) {
+        _notifySessionProgress(tab, '无法读取跳板机私钥：$error', isError: true);
+      }
+    }
+
+    final hasPrivateKey =
+        privateKeyPem != null && privateKeyPem.trim().isNotEmpty;
+    var privateKeyPassphraseMissing = false;
+    if (hasPrivateKey &&
+        (privateKeyPassphrase == null || privateKeyPassphrase.isEmpty)) {
+      try {
+        privateKeyPassphraseMissing = SSHKeyPair.isEncryptedPem(privateKeyPem);
+      } on Object {
+        // Let the regular PEM parser report unsupported or malformed formats.
+      }
+    }
+    if (username.isEmpty ||
+        ((password == null || password.isEmpty) &&
+            !hasPrivateKey &&
+            agentIdentities.isEmpty) ||
+        privateKeyPassphraseMissing) {
+      if (!mounted || tab.isClosed) {
+        throw StateError('SSH 跳板机登录已取消');
+      }
+      final credentials = await showDialog<_SshCredentialPromptResult>(
+        context: context,
+        builder: (_) => _SshCredentialPrompt(
+          initialUsername: username,
+          initialPassword: password ?? '',
+          initialPrivateKeyPem: privateKeyPem ?? '',
+          initialPrivateKeyPassphrase: privateKeyPassphrase ?? '',
+          rememberByDefault: savedCredentials != null,
+        ),
+      );
+      if (credentials == null || tab.isClosed) {
+        throw StateError('SSH 跳板机登录已取消');
+      }
+      username = credentials.username;
+      password = credentials.password;
+      privateKeyPem = credentials.privateKeyPem;
+      privateKeyPassphrase = credentials.privateKeyPassphrase;
+      rememberCredentials = credentials.rememberCredentials;
+    }
+
+    final identities = <SSHIdentity>[];
+    final trimmedPrivateKey = privateKeyPem?.trim() ?? '';
+    if (trimmedPrivateKey.isNotEmpty) {
+      try {
+        identities.addAll(
+          SSHKeyPair.fromPem(
+            trimmedPrivateKey,
+            privateKeyPassphrase?.isEmpty ?? true ? null : privateKeyPassphrase,
+          ),
+        );
+      } catch (error) {
+        _notifySessionProgress(tab, '跳板机私钥无法读取：$error', isError: true);
+      }
+    }
+    identities.addAll(agentIdentities);
+    final hasPassword = password != null && password.isNotEmpty;
+    final orderedAttempts = switch (connection.authenticationMode) {
+      SshAuthenticationMode.passwordFirst => [
+        if (hasPassword || identities.isEmpty) _SshAuthMethod.password,
+        if (identities.isNotEmpty) _SshAuthMethod.key,
+        if (!hasPassword && identities.isNotEmpty) _SshAuthMethod.password,
+      ],
+      SshAuthenticationMode.keyFirst => [
+        if (identities.isNotEmpty) _SshAuthMethod.key,
+        _SshAuthMethod.password,
+      ],
+      SshAuthenticationMode.automatic => [
+        if (identities.isNotEmpty) _SshAuthMethod.key,
+        _SshAuthMethod.password,
+      ],
+    };
+
+    for (var index = 0; index < orderedAttempts.length; index++) {
+      if (!mounted || tab.isClosed) {
+        throw StateError('SSH 跳板机连接已取消');
+      }
+      final method = orderedAttempts[index];
+      final isKeyAttempt = method == _SshAuthMethod.key;
+      _notifySessionProgress(
+        tab,
+        isKeyAttempt ? '正在尝试跳板机密钥登录…' : '正在尝试跳板机密码登录…',
+      );
+      final socket = await _connectSshSocket(connection);
+      if (tab.isClosed) {
+        socket.destroy();
+        throw StateError('SSH 跳板机连接已取消');
+      }
+      final client = SSHClient(
+        socket,
+        username: username,
+        identities: isKeyAttempt ? identities : null,
+        onPasswordRequest: isKeyAttempt
+            ? null
+            : () => hasPassword ? password : null,
+        onUserInfoRequest: isKeyAttempt
+            ? null
+            : (request) => _requestSshUserInfo(tab, request),
+        onVerifyHostKey: (type, fingerprint) =>
+            _verifySshHostKey(tab, connection, type, fingerprint),
+        keepAliveInterval: widget.settings.sshKeepAliveSeconds == 0
+            ? null
+            : Duration(seconds: widget.settings.sshKeepAliveSeconds),
+        handshakeTimeout: const Duration(seconds: 15),
+        authTimeout: const Duration(minutes: 5),
+      );
+      tab.sshJumpClient = client;
+      try {
+        await client.authenticated;
+        if (tab.isClosed) return client;
+        if (rememberCredentials) {
+          try {
+            await _sshCredentialStore.write(
+              connection.credentialKey,
+              SshCredentials(
+                username: username,
+                password: password,
+                privateKeyPem: trimmedPrivateKey.isEmpty
+                    ? null
+                    : trimmedPrivateKey,
+                privateKeyPassphrase: privateKeyPassphrase,
+              ),
+            );
+          } catch (error) {
+            _showMessage('跳板机已连接，但凭据保存失败：$error', isError: true);
+          }
+        }
+        return client;
+      } catch (error, stackTrace) {
+        if (identical(tab.sshJumpClient, client)) tab.sshJumpClient = null;
+        try {
+          await client.close();
+        } catch (_) {
+          // Preserve the authentication failure when closing a failed attempt.
+        }
+        if (!mounted || tab.isClosed) {
+          throw StateError('SSH 跳板机连接已取消');
+        }
+        if (index + 1 == orderedAttempts.length) {
+          Error.throwWithStackTrace(error, stackTrace);
+        }
+        _notifySessionProgress(tab, '跳板机首选认证失败，正在尝试备用认证…');
+      }
+    }
+    throw StateError('SSH 跳板机认证未完成');
   }
 
   Future<SSHSocket> _connectSshSocket(_TerminalConnection connection) => kIsWeb
@@ -946,7 +1593,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               ? connection.address
               : '${connection.address}:${action.port}';
           _notifySessionProgress(tab, '$protocolName 敲门：$target');
-          tab.terminal.write('\r\n[端口敲门] $protocolName $target\r\n');
+          _writeTerminalOutput(tab, '\r\n[端口敲门] $protocolName $target\r\n');
           await knockOnce(
             connection.address,
             action.protocol,
@@ -966,7 +1613,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           );
         case PortKnockActionKind.delay:
           _notifySessionProgress(tab, '端口敲门延迟 ${action.delayMs} ms');
-          tab.terminal.write('\r\n[端口敲门] 延迟 ${action.delayMs} ms\r\n');
+          _writeTerminalOutput(tab, '\r\n[端口敲门] 延迟 ${action.delayMs} ms\r\n');
           await Future<void>.delayed(Duration(milliseconds: action.delayMs));
       }
     }
@@ -1116,7 +1763,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     if (tab.isClosed || !identical(tab.sshClient, client)) return;
     tab.status = 'SSH 输出错误';
     tab.errorMessage = error.toString();
-    tab.terminal.write('\r\n[SSH 输出错误] $error\r\n');
+    _writeTerminalOutput(tab, '\r\n[SSH 输出错误] $error\r\n');
     _refresh(tab);
   }
 
@@ -1142,8 +1789,46 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         isError: exitSignal != null || (exitCode != null && exitCode != 0),
       );
     }
+    final jumpClient = tab.sshJumpClient;
+    tab.sshJumpClient = null;
     _refresh(tab);
-    unawaited(client.close());
+    unawaited(
+      _closeTunnels(tab)
+          .then((_) async {
+            await client.close();
+            if (jumpClient != null) {
+              try {
+                await jumpClient.close();
+              } catch (_) {
+                // The jump transport may already have closed.
+              }
+            }
+          })
+          .catchError((_) {}),
+    );
+  }
+
+  Future<void> _closeSshJumpClient(_TerminalTab tab) async {
+    final client = tab.sshJumpClient;
+    tab.sshJumpClient = null;
+    if (client == null) return;
+    try {
+      await client.close();
+    } catch (_) {
+      // The jump transport may already have closed.
+    }
+  }
+
+  Future<void> _closeTunnels(_TerminalTab tab) async {
+    final tunnels = List<SshTunnelHandle>.of(tab.tunnels);
+    tab.tunnels.clear();
+    for (final tunnel in tunnels) {
+      try {
+        await tunnel.close();
+      } catch (_) {
+        // The listener may already have stopped with its SSH transport.
+      }
+    }
   }
 
   Future<void> _restartSession(_TerminalTab tab) async {
@@ -1155,7 +1840,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     try {
       await _stopSession(tab);
       if (tab.isClosed) return;
-      tab.terminal.write('\r\n[正在重新连接${tab.connection.displayName}]\r\n');
+      _writeTerminalOutput(
+        tab,
+        '\r\n[正在重新连接${tab.connection.displayName}]\r\n',
+      );
       tab.restarting = false;
       await _startSession(tab);
     } finally {
@@ -1174,6 +1862,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     final sshClient = tab.sshClient;
     tab.sshClient = null;
     tab.sshSession = null;
+    final sshJumpClient = tab.sshJumpClient;
+    tab.sshJumpClient = null;
+    await _closeTunnels(tab);
     final outputSubscription = tab.outputSubscription;
     tab.outputSubscription = null;
     tab.starting = false;
@@ -1190,6 +1881,13 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         await sshClient.close();
       } catch (_) {
         // The SSH transport may already have closed.
+      }
+    }
+    if (sshJumpClient != null) {
+      try {
+        await sshJumpClient.close();
+      } catch (_) {
+        // The jump transport may already have closed.
       }
     }
     await outputSubscription?.cancel();
@@ -1217,26 +1915,41 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
 
     final data = tab.pendingInput.takeBytes();
-    tab.inputWriteQueue = tab.inputWriteQueue
-        .then((_) async {
-          if (sshSession != null) {
-            await sshSession.stdin.addStream(
-              Stream<Uint8List>.value(Uint8List.fromList(data)),
-            );
-            await sshSession.flush();
-          } else if (sessionId != null) {
-            await writeTerminalInput(sessionId: sessionId, data: data);
-          }
-        })
-        .catchError((Object error) {
-          if (tab.isClosed) return;
-          tab.errorMessage = error.toString();
-          tab.status = '终端输入失败';
-          if (sshSession != null) {
-            _showMessage('SSH 输入失败：$error', isError: true);
-          }
-          _refresh(tab);
-        });
+    final targets = <_TerminalTab>{
+      if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none)
+        for (final id in _splitTabIds)
+          for (final target in _tabs)
+            if (target.id == id && target.isConnected) target,
+      tab,
+    };
+    for (final target in targets) {
+      final targetSessionId = target.sessionId;
+      final targetSshSession = target.sshSession;
+      if (targetSessionId == null && targetSshSession == null) continue;
+      target.inputWriteQueue = target.inputWriteQueue
+          .then((_) async {
+            if (targetSshSession != null) {
+              await targetSshSession.stdin.addStream(
+                Stream<Uint8List>.value(Uint8List.fromList(data)),
+              );
+              await targetSshSession.flush();
+            } else if (targetSessionId != null) {
+              await writeTerminalInput(
+                sessionId: targetSessionId,
+                data: Uint8List.fromList(data),
+              );
+            }
+          })
+          .catchError((Object error) {
+            if (target.isClosed) return;
+            target.errorMessage = error.toString();
+            target.status = '终端输入失败';
+            if (targetSshSession != null) {
+              _showMessage('SSH 输入失败：$error', isError: true);
+            }
+            _refresh(target);
+          });
+    }
   }
 
   void _handleResize(_TerminalTab tab, int columns, int rows) {
@@ -1275,7 +1988,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     if (tab.isClosed || tab.sessionId != sessionId) return;
     tab.status = '${tab.connection.displayName}输出错误';
     tab.errorMessage = error.toString();
-    tab.terminal.write('\r\n[${tab.connection.displayName}输出错误] $error\r\n');
+    _writeTerminalOutput(
+      tab,
+      '\r\n[${tab.connection.displayName}输出错误] $error\r\n',
+    );
     _refresh(tab);
   }
 
@@ -1293,15 +2009,36 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   Future<void> _handleSecondaryTap(_TerminalTab tab) async {
     final selection = tab.terminalController.selection;
     if (selection != null) {
-      final text = tab.terminal.buffer.getText(selection);
-      tab.terminalController.clearSelection();
-      await Clipboard.setData(ClipboardData(text: text));
+      await _copyTerminalSelection(tab, clearSelection: true);
       return;
     }
 
+    await _pasteClipboard(tab);
+  }
+
+  Future<void> _copyTerminalSelection(
+    _TerminalTab tab, {
+    bool clearSelection = false,
+  }) async {
+    final selection = tab.terminalController.selection;
+    if (selection == null) return;
+    final text = tab.terminal.buffer.getText(selection);
+    if (clearSelection) tab.terminalController.clearSelection();
+    await Clipboard.setData(ClipboardData(text: text));
+  }
+
+  Future<void> _pasteClipboard(_TerminalTab tab) async {
+    if (tab.isClosed) return;
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     final text = data?.text;
-    if (text != null && !tab.isClosed) tab.terminal.paste(text);
+    if (!mounted || text == null || tab.isClosed) return;
+    if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
+      final confirmed = await _confirmSplitBroadcastPaste(
+        '剪贴板内容会粘贴到所有可见且已连接的终端，请确认内容后继续。',
+      );
+      if (!mounted || tab.isClosed || confirmed != true) return;
+    }
+    tab.terminal.paste(text);
   }
 
   void _refresh(_TerminalTab tab) {
@@ -1322,6 +2059,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     final sshClient = tab.sshClient;
     tab.sshClient = null;
     tab.sshSession = null;
+    final sshJumpClient = tab.sshJumpClient;
+    tab.sshJumpClient = null;
+    await _closeTunnels(tab);
     if (sessionId != null) {
       try {
         await closeTerminalSession(sessionId: sessionId);
@@ -1332,6 +2072,13 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     if (sshClient != null) {
       try {
         await sshClient.close();
+      } catch (_) {
+        // Ignore cleanup errors when a tab is closed.
+      }
+    }
+    if (sshJumpClient != null) {
+      try {
+        await sshJumpClient.close();
       } catch (_) {
         // Ignore cleanup errors when a tab is closed.
       }
@@ -1347,6 +2094,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.inputFlushTimer?.cancel();
       tab.focusNode.dispose();
       tab.terminalController.dispose();
+      tab.scrollController.dispose();
+      tab.remoteMonitorCache.dispose();
       unawaited(_disposeTab(tab));
     }
     _tabs.clear();
@@ -1358,6 +2107,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     final activeTab = _activeTab;
+    final compactToolbar = MediaQuery.sizeOf(context).width < 1600;
 
     return Scaffold(
       appBar: AppBar(
@@ -1371,81 +2121,274 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             Text('Geekcore Term', style: TextStyle(fontSize: 17)),
           ],
         ),
-        actions: [
-          if (!kIsWeb) ...[
-            _ToolbarAction(
-              icon: Icons.terminal_rounded,
-              label: '本地终端',
-              onPressed: _addLocalShellTab,
-            ),
-            _ToolbarAction(
-              icon: Icons.usb_rounded,
-              label: '串口',
-              onPressed: () =>
-                  unawaited(_handleNewSession(_NewSessionAction.serial)),
-            ),
-            _ToolbarAction(
-              icon: Icons.lan_rounded,
-              label: 'Telnet',
-              onPressed: () =>
-                  unawaited(_handleNewSession(_NewSessionAction.telnet)),
-            ),
-          ],
-          _ToolbarAction(
-            icon: Icons.lock_open_rounded,
-            label: 'SSH',
-            onPressed: () =>
-                unawaited(_handleNewSession(_NewSessionAction.ssh)),
-          ),
-          if (activeTab?.sshClient != null)
-            IconButton(
-              tooltip: '远程监控',
-              onPressed: () => unawaited(_openSshRemoteMonitor(activeTab!)),
-              icon: const Icon(Icons.monitor_heart_outlined),
-            ),
-          const SizedBox(width: 8),
-          VerticalDivider(
-            width: 1,
-            indent: 14,
-            endIndent: 14,
-            color: colors.outlineVariant,
-          ),
-          const SizedBox(width: 12),
-          Icon(Icons.circle, size: 10, color: _statusColor(activeTab, colors)),
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 150,
-            child: Text(
-              activeTab?.status ?? '准备就绪',
-              overflow: TextOverflow.ellipsis,
-              maxLines: 1,
-            ),
-          ),
-          if (activeTab != null) ...[
-            const SizedBox(width: 8),
-            IconButton(
-              tooltip: '重新连接当前会话',
-              onPressed: activeTab.starting || activeTab.restarting
-                  ? null
-                  : () => _restartSession(activeTab),
-              icon: const Icon(Icons.restart_alt_rounded),
-            ),
-          ],
-          const SizedBox(width: 8),
-          FilledButton.icon(
-            onPressed: () =>
-                unawaited(_handleNewSession(_NewSessionAction.quickConnect)),
-            icon: const Icon(Icons.bolt_rounded, size: 18),
-            label: const Text('快速连接'),
-          ),
-          const SizedBox(width: 6),
-          IconButton(
-            tooltip: '设置',
-            onPressed: () => unawaited(_openSettings()),
-            icon: const Icon(Icons.settings_outlined),
-          ),
-          const SizedBox(width: 14),
-        ],
+        actions: compactToolbar
+            ? [
+                if (!kIsWeb)
+                  IconButton(
+                    tooltip: '本地终端',
+                    onPressed: _addLocalShellTab,
+                    icon: const Icon(Icons.terminal_rounded),
+                  ),
+                IconButton(
+                  tooltip: 'SSH',
+                  onPressed: () =>
+                      unawaited(_handleNewSession(_NewSessionAction.ssh)),
+                  icon: const Icon(Icons.lock_open_rounded),
+                ),
+                PopupMenuButton<_CompactToolbarAction>(
+                  tooltip: '更多工具',
+                  onSelected: (action) {
+                    switch (action) {
+                      case _CompactToolbarAction.serial:
+                        unawaited(_handleNewSession(_NewSessionAction.serial));
+                        break;
+                      case _CompactToolbarAction.telnet:
+                        unawaited(_handleNewSession(_NewSessionAction.telnet));
+                        break;
+                      case _CompactToolbarAction.tunnels:
+                        if (activeTab?.sshClient != null) {
+                          unawaited(_openSshTunnelManager(activeTab!));
+                        }
+                        break;
+                      case _CompactToolbarAction.monitor:
+                        if (activeTab?.sshClient != null) {
+                          unawaited(_openSshRemoteMonitor(activeTab!));
+                        }
+                        break;
+                      case _CompactToolbarAction.networkDiagnostics:
+                        unawaited(_openNetworkDiagnostics());
+                        break;
+                      case _CompactToolbarAction.snippets:
+                        unawaited(_openCommandSnippetManager());
+                        break;
+                      case _CompactToolbarAction.search:
+                        unawaited(_openTerminalSearch());
+                        break;
+                      case _CompactToolbarAction.transcript:
+                        if (activeTab != null) {
+                          unawaited(_toggleTranscriptLog(activeTab));
+                        }
+                        break;
+                      case _CompactToolbarAction.reconnect:
+                        if (activeTab != null &&
+                            !activeTab.starting &&
+                            !activeTab.restarting) {
+                          unawaited(_restartSession(activeTab));
+                        }
+                        break;
+                    }
+                  },
+                  itemBuilder: (context) => [
+                    if (!kIsWeb) ...[
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.serial,
+                        child: Text('连接串口…'),
+                      ),
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.telnet,
+                        child: Text('连接 Telnet…'),
+                      ),
+                    ],
+                    if (!kIsWeb && activeTab?.sshClient != null)
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.tunnels,
+                        child: Text('SSH 隧道…'),
+                      ),
+                    if (activeTab?.sshClient != null)
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.monitor,
+                        child: Text('远程监控…'),
+                      ),
+                    if (!kIsWeb)
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.networkDiagnostics,
+                        child: Text('网络诊断…'),
+                      ),
+                    const PopupMenuItem(
+                      value: _CompactToolbarAction.snippets,
+                      child: Text('命令片段…'),
+                    ),
+                    PopupMenuItem(
+                      value: _CompactToolbarAction.search,
+                      enabled: _tabs.isNotEmpty,
+                      child: const Text('搜索终端输出…'),
+                    ),
+                    if (activeTab != null) ...[
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.transcript,
+                        child: Text('终端输出记录'),
+                      ),
+                      PopupMenuItem(
+                        value: _CompactToolbarAction.reconnect,
+                        enabled: !activeTab.starting && !activeTab.restarting,
+                        child: const Text('重新连接当前会话'),
+                      ),
+                    ],
+                  ],
+                  icon: const Icon(Icons.more_horiz_rounded),
+                ),
+                IconButton(
+                  tooltip: '快速连接',
+                  onPressed: () => unawaited(
+                    _handleNewSession(_NewSessionAction.quickConnect),
+                  ),
+                  icon: const Icon(Icons.bolt_rounded),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  child: Tooltip(
+                    message: activeTab?.status ?? '准备就绪',
+                    child: Icon(
+                      Icons.circle,
+                      size: 10,
+                      color: _statusColor(activeTab, colors),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '设置',
+                  onPressed: () => unawaited(_openSettings()),
+                  icon: const Icon(Icons.settings_outlined),
+                ),
+                const SizedBox(width: 8),
+              ]
+            : [
+                if (!kIsWeb) ...[
+                  _ToolbarAction(
+                    icon: Icons.terminal_rounded,
+                    label: '本地终端',
+                    onPressed: _addLocalShellTab,
+                  ),
+                  _ToolbarAction(
+                    icon: Icons.usb_rounded,
+                    label: '串口',
+                    onPressed: () =>
+                        unawaited(_handleNewSession(_NewSessionAction.serial)),
+                  ),
+                  _ToolbarAction(
+                    icon: Icons.lan_rounded,
+                    label: 'Telnet',
+                    onPressed: () =>
+                        unawaited(_handleNewSession(_NewSessionAction.telnet)),
+                  ),
+                ],
+                _ToolbarAction(
+                  icon: Icons.lock_open_rounded,
+                  label: 'SSH',
+                  onPressed: () =>
+                      unawaited(_handleNewSession(_NewSessionAction.ssh)),
+                ),
+                if (!kIsWeb)
+                  IconButton(
+                    tooltip: activeTab?.tunnels.isNotEmpty == true
+                        ? 'SSH 隧道 (${activeTab!.tunnels.length})'
+                        : 'SSH 隧道',
+                    onPressed: activeTab?.sshClient == null
+                        ? null
+                        : () => unawaited(_openSshTunnelManager(activeTab!)),
+                    icon: Badge(
+                      isLabelVisible: activeTab?.tunnels.isNotEmpty == true,
+                      label: Text('${activeTab?.tunnels.length ?? 0}'),
+                      child: const Icon(Icons.account_tree_outlined),
+                    ),
+                  ),
+                if (activeTab?.sshClient != null)
+                  IconButton(
+                    tooltip: '远程监控',
+                    onPressed: () =>
+                        unawaited(_openSshRemoteMonitor(activeTab!)),
+                    icon: const Icon(Icons.monitor_heart_outlined),
+                  ),
+                if (!kIsWeb)
+                  IconButton(
+                    tooltip: '网络诊断',
+                    onPressed: () => unawaited(_openNetworkDiagnostics()),
+                    icon: const Icon(Icons.network_check_rounded),
+                  ),
+                IconButton(
+                  tooltip: '命令片段',
+                  onPressed: () => unawaited(_openCommandSnippetManager()),
+                  icon: const Icon(Icons.terminal_outlined),
+                ),
+                IconButton(
+                  tooltip: '搜索终端输出 (Ctrl+F)',
+                  onPressed: _tabs.isEmpty
+                      ? null
+                      : () => unawaited(_openTerminalSearch()),
+                  icon: const Icon(Icons.manage_search_rounded),
+                ),
+                IconButton(
+                  tooltip: activeTab == null
+                      ? '终端输出记录'
+                      : activeTab.transcript.isRecording
+                      ? '停止并保存终端输出记录'
+                      : activeTab.transcript.hasData
+                      ? '保存终端输出记录'
+                      : '开始记录终端输出',
+                  onPressed: activeTab == null
+                      ? null
+                      : () => unawaited(_toggleTranscriptLog(activeTab)),
+                  color: activeTab?.transcript.isRecording == true
+                      ? colors.error
+                      : activeTab?.transcript.hasData == true
+                      ? colors.primary
+                      : null,
+                  icon: Icon(
+                    activeTab?.transcript.isRecording == true
+                        ? Icons.stop_circle_outlined
+                        : activeTab?.transcript.hasData == true
+                        ? Icons.save_alt_rounded
+                        : Icons.radio_button_checked_rounded,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                VerticalDivider(
+                  width: 1,
+                  indent: 14,
+                  endIndent: 14,
+                  color: colors.outlineVariant,
+                ),
+                const SizedBox(width: 12),
+                Icon(
+                  Icons.circle,
+                  size: 10,
+                  color: _statusColor(activeTab, colors),
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 150,
+                  child: Text(
+                    activeTab?.status ?? '准备就绪',
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
+                ),
+                if (activeTab != null) ...[
+                  const SizedBox(width: 8),
+                  IconButton(
+                    tooltip: '重新连接当前会话',
+                    onPressed: activeTab.starting || activeTab.restarting
+                        ? null
+                        : () => _restartSession(activeTab),
+                    icon: const Icon(Icons.restart_alt_rounded),
+                  ),
+                ],
+                const SizedBox(width: 8),
+                FilledButton.icon(
+                  onPressed: () => unawaited(
+                    _handleNewSession(_NewSessionAction.quickConnect),
+                  ),
+                  icon: const Icon(Icons.bolt_rounded, size: 18),
+                  label: const Text('快速连接'),
+                ),
+                const SizedBox(width: 6),
+                IconButton(
+                  tooltip: '设置',
+                  onPressed: () => unawaited(_openSettings()),
+                  icon: const Icon(Icons.settings_outlined),
+                ),
+                const SizedBox(width: 14),
+              ],
       ),
       body: Row(
         children: [
@@ -1460,19 +2403,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             child: Column(
               children: [
                 _buildTabBar(colors),
-                Expanded(
-                  child: _tabs.isEmpty
-                      ? _buildHomeWorkspace(colors)
-                      : IndexedStack(
-                          index: _tabs.indexWhere(
-                            (tab) => tab.id == _activeTabId,
-                          ),
-                          children: [
-                            for (final tab in _tabs)
-                              _buildTerminalPane(tab, colors),
-                          ],
-                        ),
-                ),
+                Expanded(child: _buildTerminalWorkspace(colors)),
                 if (activeTab != null &&
                     activeTab.connection.kind == _ConnectionKind.ssh)
                   SshRemoteMonitorBar(
@@ -1524,7 +2455,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     return SizedBox(
       width: 48,
       child: ColoredBox(
-        color: const Color(0xFF101412),
+        color: colors.surfaceContainerLowest,
         child: Column(
           children: [
             const SizedBox(height: 10),
@@ -1547,7 +2478,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }) => SizedBox(
       width: 260,
       child: ColoredBox(
-        color: const Color(0xFF131816),
+        color: colors.surfaceContainerLow,
         child: Padding(
           padding: const EdgeInsets.all(18),
           child: Column(
@@ -1594,6 +2525,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     return RemoteFileBrowser(
       key: ValueKey('remote-files-${tab.id}'),
       client: tab.sshClient!,
+      sessionIdentity:
+          '${tab.connection.endpointKey}:${tab.sshClient!.username}',
       sessionTitle: tab.title,
       initialPath: tab.remoteDirectory,
       refreshToken: tab.remoteRefreshToken,
@@ -1682,8 +2615,15 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       ) ??
       false;
 
-  void _insertRemotePath(_TerminalTab tab, String path) {
+  Future<void> _insertRemotePath(_TerminalTab tab, String path) async {
     if (tab.id != _activeTabId || !tab.isConnected) return;
+    if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
+      final confirmed = await _confirmSplitBroadcastPaste(
+        '远端路径“$path”会粘贴到所有可见且已连接的终端。',
+        confirmLabel: '插入到分屏',
+      );
+      if (!mounted || tab.isClosed || confirmed != true) return;
+    }
     tab.focusNode.requestFocus();
     tab.terminal.paste(path);
   }
@@ -1694,14 +2634,22 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         query.isEmpty ||
         record.name.toLowerCase().contains(query) ||
         record.address.toLowerCase().contains(query) ||
-        record.endpointLabel.toLowerCase().contains(query);
-    final saved = _savedSessions.where(matches).toList();
+        record.endpointLabel.toLowerCase().contains(query) ||
+        record.group.toLowerCase().contains(query);
+    final saved = _savedSessions
+        .where(matches)
+        .where(
+          (record) =>
+              _sessionGroupFilter == null ||
+              record.group == _sessionGroupFilter,
+        )
+        .toList();
     final recent = _recentSessions.where(matches).toList();
 
     return SizedBox(
       width: 260,
       child: ColoredBox(
-        color: const Color(0xFF131816),
+        color: colors.surfaceContainerLow,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -1718,23 +2666,59 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       ),
                     ),
                   ),
-                  if (!kIsWeb)
-                    PopupMenuButton<_SshConfigImportSource>(
-                      tooltip: '导入 SSH 配置',
-                      onSelected: (source) =>
-                          unawaited(_importSshConfig(source)),
-                      itemBuilder: (context) => const [
-                        PopupMenuItem(
-                          value: _SshConfigImportSource.defaultConfig,
+                  IconButton(
+                    tooltip: '会话分类',
+                    onPressed: _createSessionGroup,
+                    icon: const Icon(Icons.create_new_folder_outlined),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  PopupMenuButton<_SessionSidebarAction>(
+                    tooltip: '导入或导出会话',
+                    onSelected: (action) {
+                      switch (action) {
+                        case _SessionSidebarAction.importOpenSshDefault:
+                          unawaited(
+                            _importSshConfig(
+                              _SshConfigImportSource.defaultConfig,
+                            ),
+                          );
+                          break;
+                        case _SessionSidebarAction.importOpenSshFile:
+                          unawaited(
+                            _importSshConfig(_SshConfigImportSource.chooseFile),
+                          );
+                          break;
+                        case _SessionSidebarAction.importBackup:
+                          unawaited(_importSessions());
+                          break;
+                        case _SessionSidebarAction.exportBackup:
+                          unawaited(_exportSessions());
+                          break;
+                      }
+                    },
+                    itemBuilder: (context) => [
+                      if (!kIsWeb) ...[
+                        const PopupMenuItem(
+                          value: _SessionSidebarAction.importOpenSshDefault,
                           child: Text('导入 ~/.ssh/config'),
                         ),
-                        PopupMenuItem(
-                          value: _SshConfigImportSource.chooseFile,
-                          child: Text('选择配置文件…'),
+                        const PopupMenuItem(
+                          value: _SessionSidebarAction.importOpenSshFile,
+                          child: Text('选择 OpenSSH 配置…'),
                         ),
+                        const PopupMenuDivider(),
                       ],
-                      icon: const Icon(Icons.file_open_outlined),
-                    ),
+                      const PopupMenuItem(
+                        value: _SessionSidebarAction.importBackup,
+                        child: Text('导入会话备份…'),
+                      ),
+                      const PopupMenuItem(
+                        value: _SessionSidebarAction.exportBackup,
+                        child: Text('导出会话备份…'),
+                      ),
+                    ],
+                    icon: const Icon(Icons.swap_vert_rounded),
+                  ),
                   IconButton(
                     tooltip: '新建会话',
                     onPressed: () => unawaited(
@@ -1771,6 +2755,47 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               ),
             ),
             const SizedBox(height: 12),
+            SizedBox(
+              height: 38,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: ChoiceChip(
+                      label: const Text('全部'),
+                      selected: _sessionGroupFilter == null,
+                      onSelected: (_) =>
+                          setState(() => _sessionGroupFilter = null),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: ChoiceChip(
+                      label: const Text('未分类'),
+                      selected: _sessionGroupFilter == '',
+                      onSelected: (_) =>
+                          setState(() => _sessionGroupFilter = ''),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ),
+                  for (final group in _sessionGroups)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: ChoiceChip(
+                        label: Text(group),
+                        selected: _sessionGroupFilter == group,
+                        onSelected: (_) =>
+                            setState(() => _sessionGroupFilter = group),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 4),
             Expanded(
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
@@ -1919,6 +2944,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               value: _RecordAction.delete,
               child: Text('删除会话'),
             ),
+          if (saved)
+            const PopupMenuItem(
+              value: _RecordAction.moveGroup,
+              child: Text('移动到分类…'),
+            ),
           if (!saved)
             const PopupMenuItem(
               value: _RecordAction.removeRecent,
@@ -1936,6 +2966,145 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       if (mounted) setState(() => _recentSessions = []);
     } catch (error) {
       _showMessage('清除最近连接失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _createSessionGroup() async {
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) =>
+          const _SessionNameDialog(title: '新建会话分类', initialName: ''),
+    );
+    if (!mounted || name == null) return;
+    final duplicate = _sessionGroups.any(
+      (group) => group.toLowerCase() == name.toLowerCase(),
+    );
+    if (duplicate) {
+      _showMessage('分类“$name”已存在');
+      return;
+    }
+    final groups = [..._sessionGroups, name]
+      ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    await _sessionStore.saveGroups(groups);
+    if (!mounted) return;
+    setState(() {
+      _sessionGroups = groups;
+      _sessionGroupFilter = name;
+    });
+  }
+
+  Future<void> _exportSessions() async {
+    try {
+      await _recordsReady;
+      final payload = <String, Object>{
+        'format': 'geekcore-term-sessions',
+        'version': 1,
+        'exportedAt': DateTime.now().toUtc().toIso8601String(),
+        'groups': _sessionGroups,
+        'sessions': _savedSessions.map((record) => record.toJson()).toList(),
+      };
+      final bytes = Uint8List.fromList(
+        utf8.encode(const JsonEncoder.withIndent('  ').convert(payload)),
+      );
+      final path = await FilePicker.saveFile(
+        dialogTitle: '导出已保存会话',
+        fileName: 'geekcore-term-sessions.json',
+        bytes: bytes,
+      );
+      if (mounted && path != null) {
+        _showMessage('已导出 ${_savedSessions.length} 个会话');
+      }
+    } catch (error) {
+      _showMessage('导出会话失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _importSessions() async {
+    try {
+      final file = await FilePicker.pickFile(
+        dialogTitle: '选择 Geekcore Term 会话 JSON',
+      );
+      if (file == null) return;
+      final bytes = await file.readAsBytes();
+      if (bytes.length > 2 * 1024 * 1024) {
+        throw const FormatException('会话文件不能大于 2 MiB');
+      }
+      final decoded = jsonDecode(utf8.decode(bytes));
+      if (decoded is! Map<String, dynamic> ||
+          decoded['format'] != 'geekcore-term-sessions' ||
+          decoded['version'] != 1 ||
+          decoded['sessions'] is! List) {
+        throw const FormatException('文件不是受支持的 Geekcore Term 会话备份');
+      }
+      final encodedSessions = decoded['sessions'] as List<Object?>;
+      if (encodedSessions.length > 5000) {
+        throw const FormatException('单个备份最多导入 5000 个会话');
+      }
+      final parsed = <SessionRecord>[
+        for (var index = 0; index < encodedSessions.length; index++)
+          SessionRecord.fromJson(jsonEncode(encodedSessions[index])).copyWith(
+            id: 'import-${DateTime.now().microsecondsSinceEpoch}-$index',
+          ),
+      ];
+      if (parsed.isEmpty) {
+        _showMessage('备份中没有会话');
+        return;
+      }
+      if (!mounted) return;
+      final accepted = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('导入会话'),
+          content: Text(
+            '备份包含 ${parsed.length} 个会话。导入内容只包含连接配置，不包含密码、私钥正文或已保存凭据。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('导入'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || accepted != true) return;
+      await _recordsReady;
+      final endpointKeys = _savedSessions
+          .map((record) => record.endpointKey)
+          .toSet();
+      final additions = <SessionRecord>[];
+      for (final record in parsed) {
+        if (endpointKeys.add(record.endpointKey)) additions.add(record);
+      }
+      if (additions.isEmpty) {
+        _showMessage('备份中的会话已全部存在');
+        return;
+      }
+      final updated = [...additions.reversed, ..._savedSessions];
+      final groups = {
+        ..._sessionGroups,
+        for (final record in additions)
+          if (record.group.isNotEmpty) record.group,
+        if (decoded['groups'] is List)
+          ...(decoded['groups'] as List<Object?>).whereType<String>().where(
+            (group) => group.trim().isNotEmpty,
+          ),
+      }.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      await _sessionStore.saveSaved(updated);
+      await _sessionStore.saveGroups(groups);
+      if (!mounted) return;
+      setState(() {
+        _savedSessions = updated;
+        _sessionGroups = groups;
+      });
+      _showMessage(
+        '已导入 ${additions.length} 个会话${parsed.length == additions.length ? '' : '，跳过 ${parsed.length - additions.length} 个重复项'}',
+      );
+    } catch (error) {
+      _showMessage('导入会话失败：$error', isError: true);
     }
   }
 
@@ -2031,7 +3200,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   Widget _buildTabBar(ColorScheme colors) {
     return Material(
-      color: const Color(0xFF151A17),
+      color: colors.surfaceContainerLow,
       child: SizedBox(
         height: 44,
         child: Row(
@@ -2054,11 +3223,138 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       ),
                     ),
             ),
+            if (_splitMode != _TerminalSplitMode.none)
+              IconButton(
+                tooltip: _broadcastSplitInput ? '关闭分屏输入广播' : '向所有分屏会话广播输入',
+                onPressed: () => setState(
+                  () => _broadcastSplitInput = !_broadcastSplitInput,
+                ),
+                color: _broadcastSplitInput ? colors.primary : null,
+                icon: const Icon(Icons.campaign_outlined, size: 19),
+              ),
+            PopupMenuButton<_TerminalSplitMode>(
+              tooltip: '终端分屏',
+              initialValue: _splitMode,
+              onSelected: (mode) => unawaited(_setSplitMode(mode)),
+              itemBuilder: (context) => const [
+                PopupMenuItem(
+                  value: _TerminalSplitMode.none,
+                  child: Text('单终端'),
+                ),
+                PopupMenuDivider(),
+                PopupMenuItem(
+                  value: _TerminalSplitMode.vertical,
+                  child: Text('左右两个终端'),
+                ),
+                PopupMenuItem(
+                  value: _TerminalSplitMode.horizontal,
+                  child: Text('上下两个终端'),
+                ),
+                PopupMenuItem(
+                  value: _TerminalSplitMode.quad,
+                  child: Text('四个终端'),
+                ),
+              ],
+              icon: const Icon(Icons.view_quilt_outlined, size: 20),
+            ),
             const SizedBox(width: 12),
           ],
         ),
       ),
     );
+  }
+
+  Widget _buildTerminalWorkspace(ColorScheme colors) {
+    if (_tabs.isEmpty) return _buildHomeWorkspace(colors);
+    if (_splitMode == _TerminalSplitMode.none) {
+      final activeIndex = _tabs.indexWhere((tab) => tab.id == _activeTabId);
+      return IndexedStack(
+        index: activeIndex < 0 ? 0 : activeIndex,
+        children: [for (final tab in _tabs) _buildTerminalPane(tab, colors)],
+      );
+    }
+
+    final visibleTabs = [
+      for (final id in _splitTabIds)
+        for (final tab in _tabs)
+          if (tab.id == id) tab,
+    ];
+    Widget paneAt(int index) {
+      if (index >= visibleTabs.length) {
+        return Expanded(
+          child: Center(
+            child: Text(
+              '打开一个会话即可填入此窗格',
+              style: TextStyle(color: colors.onSurfaceVariant),
+            ),
+          ),
+        );
+      }
+      final tab = visibleTabs[index];
+      return Expanded(
+        child: Container(
+          margin: const EdgeInsets.all(2),
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: tab.id == _activeTabId
+                  ? colors.primary.withValues(alpha: 0.6)
+                  : colors.outlineVariant,
+            ),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            children: [
+              Material(
+                color: colors.surfaceContainerLow,
+                child: InkWell(
+                  onTap: () => _selectTab(tab),
+                  child: SizedBox(
+                    height: 26,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.terminal_rounded,
+                            size: 14,
+                            color: tab.id == _activeTabId
+                                ? colors.primary
+                                : colors.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              '${tab.title} · ${tab.status}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 10),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Expanded(child: _buildTerminalPane(tab, colors)),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return switch (_splitMode) {
+      _TerminalSplitMode.none => _buildTerminalPane(visibleTabs.first, colors),
+      _TerminalSplitMode.vertical => Row(children: [paneAt(0), paneAt(1)]),
+      _TerminalSplitMode.horizontal => Column(children: [paneAt(0), paneAt(1)]),
+      _TerminalSplitMode.quad => Column(
+        children: [
+          Expanded(child: Row(children: [paneAt(0), paneAt(1)])),
+          Expanded(child: Row(children: [paneAt(2), paneAt(3)])),
+        ],
+      ),
+    };
   }
 
   Widget _buildTab(_TerminalTab tab, ColorScheme colors) {
@@ -2112,7 +3408,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   const SizedBox(width: 4),
                   IconButton(
                     tooltip: '关闭 ${tab.title} (Ctrl+W)',
-                    onPressed: () => _closeTab(tab),
+                    onPressed: () => unawaited(_closeTab(tab)),
                     icon: const Icon(Icons.close_rounded, size: 15),
                     visualDensity: VisualDensity.compact,
                     padding: EdgeInsets.zero,
@@ -2174,7 +3470,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                 onWillAcceptWithDetails: (details) =>
                     tab.id == _activeTabId && tab.isConnected,
                 onAcceptWithDetails: (details) =>
-                    _insertRemotePath(tab, details.data),
+                    unawaited(_insertRemotePath(tab, details.data)),
                 builder: (context, candidates, rejected) {
                   final draggingRemoteFile = candidates.isNotEmpty;
                   final draggingLocalFile = tab.localFileDragHover;
@@ -2187,6 +3483,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                           tab.terminal,
                           key: tab.terminalViewKey,
                           controller: tab.terminalController,
+                          scrollController: tab.scrollController,
                           focusNode: tab.focusNode,
                           autofocus: false,
                           // Keep Flutter's text input connection active for IBus/Fcitx
@@ -2195,13 +3492,17 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                           keyboardType: TextInputType.multiline,
                           onKeyEvent: (focusNode, event) =>
                               _handleTerminalKeyEvent(tab, focusNode, event),
+                          onTapUp: (_, _) {
+                            if (_activeTabId != tab.id) _selectTab(tab);
+                          },
                           autoResize: true,
                           backgroundOpacity: 1,
                           padding: const EdgeInsets.all(12),
                           theme: terminalTheme,
-                          textStyle: const TerminalStyle(
-                            fontSize: 14,
-                            fontFamily: 'monospace',
+                          textStyle: TerminalStyle(
+                            fontSize: widget.settings.terminalFontSize,
+                            fontFamily:
+                                widget.settings.terminalFontFamily.familyName,
                           ),
                           onSecondaryTapDown: (details, offset) {
                             unawaited(_handleSecondaryTap(tab));
@@ -2258,6 +3559,33 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   Widget _buildHomeWorkspace(ColorScheme colors) {
     final recent = _recentSessions.take(6).toList();
+    final quickActions =
+        <({String title, String subtitle, IconData icon, VoidCallback onTap})>[
+          (
+            title: '本地终端',
+            subtitle: '打开系统 Shell',
+            icon: Icons.terminal_rounded,
+            onTap: _addLocalShellTab,
+          ),
+          (
+            title: 'SSH',
+            subtitle: '连接远程主机',
+            icon: Icons.lock_outline_rounded,
+            onTap: () => unawaited(_handleNewSession(_NewSessionAction.ssh)),
+          ),
+          (
+            title: '串口',
+            subtitle: '连接设备控制台',
+            icon: Icons.usb_rounded,
+            onTap: () => unawaited(_handleNewSession(_NewSessionAction.serial)),
+          ),
+          (
+            title: 'Telnet',
+            subtitle: '连接远端服务',
+            icon: Icons.lan_rounded,
+            onTap: () => unawaited(_handleNewSession(_NewSessionAction.telnet)),
+          ),
+        ];
     return Center(
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(32),
@@ -2281,12 +3609,128 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                         ),
                       ),
                       Text(
-                        '从顶部工具栏创建连接，或从会话记录中重新打开常用连接。',
+                        '选择连接方式开始，或从会话记录中重新打开常用连接。',
                         style: TextStyle(color: colors.onSurfaceVariant),
                       ),
                     ],
                   ),
                 ],
+              ),
+              const SizedBox(height: 32),
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      '快速开始',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  Text(
+                    '选择连接方式',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: colors.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final columns = constraints.maxWidth >= 700
+                      ? 4
+                      : constraints.maxWidth >= 460
+                      ? 2
+                      : 1;
+                  final cardWidth =
+                      (constraints.maxWidth - 12 * (columns - 1)) / columns;
+                  return Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    children: [
+                      for (final action in quickActions)
+                        SizedBox(
+                          width: cardWidth,
+                          child: Card(
+                            key: ValueKey('home-quick-${action.title}'),
+                            margin: EdgeInsets.zero,
+                            elevation: 0,
+                            color: colors.surfaceContainerLow,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              side: BorderSide(color: colors.outlineVariant),
+                            ),
+                            clipBehavior: Clip.antiAlias,
+                            child: InkWell(
+                              onTap: action.onTap,
+                              child: SizedBox(
+                                height: 88,
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Container(
+                                        width: 38,
+                                        height: 38,
+                                        decoration: BoxDecoration(
+                                          color: colors.primaryContainer,
+                                          borderRadius: BorderRadius.circular(
+                                            12,
+                                          ),
+                                        ),
+                                        child: Icon(
+                                          action.icon,
+                                          size: 20,
+                                          color: colors.onPrimaryContainer,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      Expanded(
+                                        child: Column(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              action.title,
+                                              style: const TextStyle(
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
+                                            const SizedBox(height: 3),
+                                            Text(
+                                              action.subtitle,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                fontSize: 11,
+                                                color: colors.onSurfaceVariant,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      Icon(
+                                        Icons.arrow_forward_rounded,
+                                        size: 16,
+                                        color: colors.onSurfaceVariant,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  );
+                },
               ),
               const SizedBox(height: 36),
               Row(
@@ -2318,7 +3762,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                 for (final record in recent)
                   Card(
                     margin: const EdgeInsets.only(bottom: 6),
-                    color: const Color(0xFF151A17),
+                    color: colors.surfaceContainerLow,
                     child: ListTile(
                       leading: Icon(switch (record.protocol) {
                         SessionProtocol.serial => Icons.usb_rounded,
@@ -2365,8 +3809,26 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       }
       if (commandPressed &&
           !shiftPressed &&
+          event.logicalKey == LogicalKeyboardKey.keyF) {
+        unawaited(_openTerminalSearch(tab));
+        return KeyEventResult.handled;
+      }
+      if (commandPressed &&
+          shiftPressed &&
+          event.logicalKey == LogicalKeyboardKey.keyC) {
+        unawaited(_copyTerminalSelection(tab));
+        return KeyEventResult.handled;
+      }
+      if (commandPressed &&
+          shiftPressed &&
+          event.logicalKey == LogicalKeyboardKey.keyV) {
+        unawaited(_pasteClipboard(tab));
+        return KeyEventResult.handled;
+      }
+      if (commandPressed &&
+          !shiftPressed &&
           event.logicalKey == LogicalKeyboardKey.keyW) {
-        _closeTab(tab);
+        unawaited(_closeTab(tab));
         return KeyEventResult.handled;
       }
       if (commandPressed && event.logicalKey == LogicalKeyboardKey.tab) {
@@ -2438,11 +3900,45 @@ enum _SshConfigImportSource { defaultConfig, chooseFile }
 
 enum _SidebarSection { sessions, files }
 
-enum _RecordAction { save, rename, delete, removeRecent }
+enum _RecordAction { save, rename, delete, removeRecent, moveGroup }
+
+enum _TerminalSplitMode {
+  none,
+  vertical,
+  horizontal,
+  quad;
+
+  int get capacity => switch (this) {
+    _TerminalSplitMode.none => 1,
+    _TerminalSplitMode.vertical || _TerminalSplitMode.horizontal => 2,
+    _TerminalSplitMode.quad => 4,
+  };
+}
+
+enum _TranscriptCloseAction { save, discard, cancel }
+
+enum _SessionSidebarAction {
+  importOpenSshDefault,
+  importOpenSshFile,
+  importBackup,
+  exportBackup,
+}
 
 enum _ConnectionKind { local, serial, telnet, ssh }
 
 enum _SshAuthMethod { key, password }
+
+enum _CompactToolbarAction {
+  serial,
+  telnet,
+  tunnels,
+  monitor,
+  networkDiagnostics,
+  snippets,
+  search,
+  transcript,
+  reconnect,
+}
 
 enum _ConnectionDialogMode { quickConnect, addSession }
 
@@ -2465,7 +3961,8 @@ class _TerminalConnection {
       privateKeyPassphrase = null,
       sessionTitle = null,
       identityFile = null,
-      sshConfigAlias = null;
+      sshConfigAlias = null,
+      jumpHost = null;
 
   const _TerminalConnection.serial(
     this.address,
@@ -2485,7 +3982,8 @@ class _TerminalConnection {
        privateKeyPassphrase = null,
        sessionTitle = null,
        identityFile = null,
-       sshConfigAlias = null;
+       sshConfigAlias = null,
+       jumpHost = null;
 
   const _TerminalConnection.telnet(this.address, this.port)
     : kind = _ConnectionKind.telnet,
@@ -2503,7 +4001,8 @@ class _TerminalConnection {
       privateKeyPassphrase = null,
       sessionTitle = null,
       identityFile = null,
-      sshConfigAlias = null;
+      sshConfigAlias = null,
+      jumpHost = null;
 
   const _TerminalConnection.ssh(
     this.address,
@@ -2519,6 +4018,7 @@ class _TerminalConnection {
     this.sessionTitle,
     this.identityFile,
     this.sshConfigAlias,
+    this.jumpHost,
   }) : kind = _ConnectionKind.ssh,
        dataBits = 8,
        parity = 'none',
@@ -2544,26 +4044,32 @@ class _TerminalConnection {
   final String? sessionTitle;
   final String? identityFile;
   final String? sshConfigAlias;
+  final SshJumpHost? jumpHost;
 
   String get displayName => switch (kind) {
     _ConnectionKind.local => '本地终端',
     _ConnectionKind.serial => '串口 $address',
     _ConnectionKind.telnet => 'Telnet $address:$port',
-    _ConnectionKind.ssh => 'SSH $address:$port',
+    _ConnectionKind.ssh =>
+      'SSH $address:$port${jumpHost == null ? '' : ' · ${jumpHost!.name}'}',
   };
 
   String get openingStatus => switch (kind) {
     _ConnectionKind.local => '正在启动本地 shell',
     _ConnectionKind.serial => '正在打开串口 $address',
     _ConnectionKind.telnet => '正在连接 Telnet $address:$port',
-    _ConnectionKind.ssh => '正在连接 SSH $address:$port',
+    _ConnectionKind.ssh =>
+      jumpHost == null
+          ? '正在连接 SSH $address:$port'
+          : '正在经 ${jumpHost!.name} 连接 SSH $address:$port',
   };
 
   String get connectedStatus => switch (kind) {
     _ConnectionKind.local => '本地终端已连接',
     _ConnectionKind.serial => '串口已连接 · $address',
     _ConnectionKind.telnet => 'Telnet 已连接 · $address:$port',
-    _ConnectionKind.ssh => 'SSH 已连接 · $address:$port',
+    _ConnectionKind.ssh =>
+      'SSH 已连接 · $address:$port${jumpHost == null ? '' : ' · 经 ${jumpHost!.name}'}',
   };
 
   SessionProtocol? get sessionProtocol => switch (kind) {
@@ -2585,7 +4091,7 @@ class _TerminalConnection {
     _ConnectionKind.telnet =>
       '${kind.name}:${address.trim().toLowerCase()}:$port',
     _ConnectionKind.ssh =>
-      '${kind.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}',
+      '${kind.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}',
     _ConnectionKind.local => kind.name,
   };
 }
@@ -2598,10 +4104,15 @@ class _ConnectionDialogResult {
 }
 
 class _ConnectionDialog extends StatefulWidget {
-  const _ConnectionDialog({required this.initialProtocol, required this.mode});
+  const _ConnectionDialog({
+    required this.initialProtocol,
+    required this.mode,
+    required this.savedSshSessions,
+  });
 
   final _ConnectionKind initialProtocol;
   final _ConnectionDialogMode mode;
+  final List<SessionRecord> savedSshSessions;
 
   @override
   State<_ConnectionDialog> createState() => _ConnectionDialogState();
@@ -2656,6 +4167,7 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
   bool _rememberCredentials = false;
   List<PortKnockAction> _portKnockActions = const [];
   SshAuthenticationMode _authenticationMode = SshAuthenticationMode.automatic;
+  String? _jumpHostSessionId;
 
   @override
   void initState() {
@@ -2686,6 +4198,16 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
 
   void _connect() {
     if (!_formKey.currentState!.validate()) return;
+    SshJumpHost? jumpHost;
+    if (_jumpHostSessionId != null) {
+      for (final record in widget.savedSshSessions) {
+        if (record.id == _jumpHostSessionId) {
+          jumpHost = SshJumpHost.fromSession(record);
+          break;
+        }
+      }
+      if (jumpHost == null) return;
+    }
     final enteredName = _profileNameController.text.trim();
     final sessionTitle = widget.mode == _ConnectionDialogMode.addSession
         ? (enteredName.isEmpty ? _hostController.text.trim() : enteredName)
@@ -2717,6 +4239,7 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
         portKnockActions: _portKnockActions,
         authenticationMode: _authenticationMode,
         sessionTitle: sessionTitle,
+        jumpHost: jumpHost,
       ),
       _ConnectionKind.local => const _TerminalConnection.local(),
     };
@@ -2830,21 +4353,78 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
           ],
         ),
         const SizedBox(height: 16),
-        DropdownButtonFormField<SshAuthenticationMode>(
-          initialValue: _authenticationMode,
+        DropdownButtonFormField<String?>(
+          initialValue: _jumpHostSessionId,
+          isExpanded: true,
           decoration: const InputDecoration(
-            labelText: '认证模式',
-            prefixIcon: Icon(Icons.tune_rounded),
+            labelText: 'SSH 跳板机',
+            prefixIcon: Icon(Icons.route_outlined),
           ),
           items: [
-            for (final mode in SshAuthenticationMode.values)
-              DropdownMenuItem(
-                value: mode,
-                child: Text(_authenticationModeLabel(mode)),
+            const DropdownMenuItem<String?>(value: null, child: Text('直连目标主机')),
+            for (final record in widget.savedSshSessions)
+              DropdownMenuItem<String?>(
+                value: record.id,
+                child: Text(
+                  '${record.name} · ${record.address}:${record.port}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
           ],
-          onChanged: (value) {
-            if (value != null) setState(() => _authenticationMode = value);
+          validator: (value) {
+            if (value == null) return null;
+            if (_portKnockActions.isNotEmpty) {
+              return '经跳板连接时，请先清除目标主机的端口敲门操作';
+            }
+            for (final record in widget.savedSshSessions) {
+              if (record.id != value) continue;
+              if (record.address.trim().toLowerCase() ==
+                      _hostController.text.trim().toLowerCase() &&
+                  record.port ==
+                      (int.tryParse(_portController.text.trim()) ?? -1)) {
+                return '跳板机和目标主机不能相同';
+              }
+              return null;
+            }
+            return '所选跳板机会话已不存在';
+          },
+          onChanged: (value) => setState(() => _jumpHostSessionId = value),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          widget.savedSshSessions.isEmpty
+              ? '先保存一个 SSH 会话，再将其选作跳板机。'
+              : '仅支持一层跳转；跳板机凭据使用对应会话的安全凭据记录。',
+          style: TextStyle(color: colors.onSurfaceVariant),
+        ),
+        if (_jumpHostSessionId != null && _portKnockActions.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Text('经跳板连接时暂不支持对目标主机执行端口敲门。', style: TextStyle(color: colors.error)),
+        ],
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            Icon(Icons.tune_rounded, size: 18, color: colors.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Text('认证模式', style: Theme.of(context).textTheme.labelLarge),
+          ],
+        ),
+        const SizedBox(height: 8),
+        SegmentedButton<SshAuthenticationMode>(
+          segments: [
+            for (final mode in SshAuthenticationMode.values)
+              ButtonSegment(
+                value: mode,
+                label: Text(_authenticationModeLabel(mode)),
+              ),
+          ],
+          selected: {_authenticationMode},
+          showSelectedIcon: false,
+          onSelectionChanged: (selection) {
+            if (selection.isNotEmpty) {
+              setState(() => _authenticationMode = selection.first);
+            }
           },
         ),
         const SizedBox(height: 6),
@@ -2922,12 +4502,16 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
               prefixIcon: Icon(Icons.swap_horiz_rounded),
             ),
             validator: (value) => value == null || value.trim().isEmpty
-                ? '浏览器连接需要配置 WebSocket SSH 网关'
+                ? (_jumpHostSessionId == null
+                      ? '浏览器连接需要配置 WebSocket SSH 网关'
+                      : null)
                 : null,
           ),
           const SizedBox(height: 8),
           Text(
-            '网关须将二进制 WebSocket 数据帧双向转发到目标 SSH 主机。支持 {host}/{port} 占位符；否则应用会追加 host、port 查询参数。HTTPS 页面需要 wss://。URL 不要包含访问令牌或密码。',
+            _jumpHostSessionId == null
+                ? '网关须将二进制 WebSocket 数据帧双向转发到目标 SSH 主机。支持 {host}/{port} 占位符；否则应用会追加 host、port 查询参数。HTTPS 页面需要 wss://。URL 不要包含访问令牌或密码。'
+                : '目标连接会通过所选跳板机建立，目标网关可留空；跳板机配置的 WebSocket 网关将用于连接跳板机。',
             style: TextStyle(color: colors.onSurfaceVariant),
           ),
           if (_portKnockActions.isNotEmpty) ...[
@@ -4064,8 +5648,9 @@ String _authenticationModeLabel(SshAuthenticationMode mode) => switch (mode) {
 };
 
 class _SessionNameDialog extends StatefulWidget {
-  const _SessionNameDialog({required this.initialName});
+  const _SessionNameDialog({this.title = '保存会话', required this.initialName});
 
+  final String title;
   final String initialName;
 
   @override
@@ -4096,7 +5681,7 @@ class _SessionNameDialogState extends State<_SessionNameDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('保存会话'),
+      title: Text(widget.title),
       content: SizedBox(
         width: 380,
         child: TextField(
@@ -4120,22 +5705,383 @@ class _SessionNameDialogState extends State<_SessionNameDialog> {
   }
 }
 
+class _SessionGroupDialog extends StatefulWidget {
+  const _SessionGroupDialog({required this.groups, required this.initialGroup});
+
+  final List<String> groups;
+  final String initialGroup;
+
+  @override
+  State<_SessionGroupDialog> createState() => _SessionGroupDialogState();
+}
+
+class _SessionGroupDialogState extends State<_SessionGroupDialog> {
+  late String _selectedGroup = widget.initialGroup;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('移动会话到分类'),
+    content: SizedBox(
+      width: 360,
+      child: RadioGroup<String>(
+        groupValue: _selectedGroup,
+        onChanged: (value) {
+          if (value != null) setState(() => _selectedGroup = value);
+        },
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            for (final entry in [
+              ('', '未分类'),
+              ...widget.groups.map((group) => (group, group)),
+            ])
+              RadioListTile<String>(value: entry.$1, title: Text(entry.$2)),
+          ],
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(
+        onPressed: () => Navigator.pop(context, _selectedGroup),
+        child: const Text('移动'),
+      ),
+    ],
+  );
+}
+
+class _SshTunnelManagerDialog extends StatefulWidget {
+  const _SshTunnelManagerDialog({
+    required this.client,
+    required this.sessionTitle,
+    required this.tunnels,
+  });
+
+  final SSHClient client;
+  final String sessionTitle;
+  final List<SshTunnelHandle> tunnels;
+
+  @override
+  State<_SshTunnelManagerDialog> createState() =>
+      _SshTunnelManagerDialogState();
+}
+
+class _SshTunnelManagerDialogState extends State<_SshTunnelManagerDialog> {
+  bool _working = false;
+
+  Future<void> _addTunnel() async {
+    final spec = await showDialog<SshTunnelSpec>(
+      context: context,
+      builder: (_) => const _SshTunnelCreateDialog(),
+    );
+    if (!mounted || spec == null) return;
+    setState(() => _working = true);
+    try {
+      final tunnel = await startSshTunnel(widget.client, spec);
+      if (!mounted) {
+        await tunnel.close();
+        return;
+      }
+      setState(() => widget.tunnels.add(tunnel));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('已启动 ${_describeTunnel(tunnel)}')));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('启动隧道失败：$error')));
+      }
+    } finally {
+      if (mounted) setState(() => _working = false);
+    }
+  }
+
+  Future<void> _stopTunnel(SshTunnelHandle tunnel) async {
+    try {
+      await tunnel.close();
+      if (mounted) {
+        setState(() => widget.tunnels.remove(tunnel));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('关闭隧道失败：$error')));
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return AlertDialog(
+      titlePadding: const EdgeInsets.fromLTRB(22, 18, 16, 8),
+      contentPadding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+      title: Row(
+        children: [
+          const Icon(Icons.account_tree_outlined, size: 20),
+          const SizedBox(width: 10),
+          Expanded(child: Text('SSH 隧道 · ${widget.sessionTitle}')),
+        ],
+      ),
+      content: SizedBox(
+        width: 560,
+        height: 390,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '支持本地转发、远程转发和 SOCKS5 动态转发。监听地址默认限制在 127.0.0.1。',
+              style: TextStyle(fontSize: 12, color: colors.onSurfaceVariant),
+            ),
+            const SizedBox(height: 10),
+            if (_working) const LinearProgressIndicator(minHeight: 2),
+            Expanded(
+              child: widget.tunnels.isEmpty
+                  ? Center(
+                      child: Text(
+                        '当前 SSH 会话没有活动隧道',
+                        style: TextStyle(color: colors.onSurfaceVariant),
+                      ),
+                    )
+                  : ListView.separated(
+                      itemCount: widget.tunnels.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final tunnel = widget.tunnels[index];
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: Icon(
+                            tunnel.spec.type == SshTunnelType.dynamic
+                                ? Icons.public_rounded
+                                : Icons.swap_horiz_rounded,
+                            color: colors.primary,
+                          ),
+                          title: Text(_tunnelTypeLabel(tunnel.spec.type)),
+                          subtitle: Text(
+                            _describeTunnel(tunnel),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: IconButton(
+                            tooltip: '停止隧道',
+                            onPressed: _working
+                                ? null
+                                : () => unawaited(_stopTunnel(tunnel)),
+                            icon: const Icon(Icons.stop_circle_outlined),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('关闭'),
+        ),
+        FilledButton.icon(
+          onPressed: _working ? null : _addTunnel,
+          icon: const Icon(Icons.add_rounded, size: 18),
+          label: const Text('新建隧道'),
+        ),
+      ],
+    );
+  }
+}
+
+class _SshTunnelCreateDialog extends StatefulWidget {
+  const _SshTunnelCreateDialog();
+
+  @override
+  State<_SshTunnelCreateDialog> createState() => _SshTunnelCreateDialogState();
+}
+
+class _SshTunnelCreateDialogState extends State<_SshTunnelCreateDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _bindHostController = TextEditingController(text: '127.0.0.1');
+  final _bindPortController = TextEditingController(text: '8080');
+  final _targetHostController = TextEditingController(text: '127.0.0.1');
+  final _targetPortController = TextEditingController(text: '80');
+  SshTunnelType _type = SshTunnelType.local;
+
+  @override
+  void dispose() {
+    _bindHostController.dispose();
+    _bindPortController.dispose();
+    _targetHostController.dispose();
+    _targetPortController.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.pop(
+      context,
+      SshTunnelSpec(
+        type: _type,
+        bindHost: _bindHostController.text.trim(),
+        bindPort: int.parse(_bindPortController.text.trim()),
+        targetHost: _targetHostController.text.trim(),
+        targetPort: _type == SshTunnelType.dynamic
+            ? 0
+            : int.parse(_targetPortController.text.trim()),
+      ),
+    );
+  }
+
+  String? _validatePort(String? value, {required bool allowZero}) {
+    final port = int.tryParse(value?.trim() ?? '');
+    if (port == null) return '请输入端口';
+    if (port < (allowZero ? 0 : 1) || port > 65535) {
+      return allowZero ? '范围为 0 到 65535' : '范围为 1 到 65535';
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final isRemote = _type == SshTunnelType.remote;
+    final isDynamic = _type == SshTunnelType.dynamic;
+    return AlertDialog(
+      title: const Text('新建 SSH 隧道'),
+      content: SizedBox(
+        width: 460,
+        child: Form(
+          key: _formKey,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                DropdownButtonFormField<SshTunnelType>(
+                  initialValue: _type,
+                  decoration: const InputDecoration(labelText: '转发类型'),
+                  items: [
+                    for (final type in SshTunnelType.values)
+                      DropdownMenuItem(
+                        value: type,
+                        child: Text(_tunnelTypeLabel(type)),
+                      ),
+                  ],
+                  onChanged: (type) {
+                    if (type != null) setState(() => _type = type);
+                  },
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _bindHostController,
+                  decoration: InputDecoration(
+                    labelText: isRemote ? 'SSH 服务器监听地址' : '本机监听地址',
+                    helperText: '默认 127.0.0.1，只允许本机访问',
+                  ),
+                  validator: (value) =>
+                      value == null || value.trim().isEmpty ? '请输入监听地址' : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _bindPortController,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  decoration: InputDecoration(
+                    labelText: isRemote ? 'SSH 服务器监听端口' : '本机监听端口',
+                    helperText: '输入 0 可由系统分配空闲端口',
+                  ),
+                  validator: (value) => _validatePort(value, allowZero: true),
+                ),
+                if (!isDynamic) ...[
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _targetHostController,
+                    decoration: InputDecoration(
+                      labelText: isRemote ? '本机可访问的目标地址' : 'SSH 服务器可访问的目标地址',
+                    ),
+                    validator: (value) => value == null || value.trim().isEmpty
+                        ? '请输入目标地址'
+                        : null,
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _targetPortController,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    decoration: const InputDecoration(labelText: '目标端口'),
+                    validator: (value) =>
+                        _validatePort(value, allowZero: false),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                Text(
+                  isDynamic
+                      ? '建立本机 SOCKS5 代理；浏览器、SSH 客户端和其他应用可连接此端口。'
+                      : isRemote
+                      ? 'SSH 服务器上的连接会通过当前 SSH 会话转发到本机目标。'
+                      : '本机监听端口会通过当前 SSH 会话连接远端目标。',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: colors.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton.icon(
+          onPressed: _save,
+          icon: const Icon(Icons.play_arrow_rounded, size: 18),
+          label: const Text('启动隧道'),
+        ),
+      ],
+    );
+  }
+}
+
+String _tunnelTypeLabel(SshTunnelType type) => switch (type) {
+  SshTunnelType.local => '本地转发（-L）',
+  SshTunnelType.remote => '远程转发（-R）',
+  SshTunnelType.dynamic => 'SOCKS5 动态转发（-D）',
+};
+
+String _describeTunnel(SshTunnelHandle tunnel) => switch (tunnel.spec.type) {
+  SshTunnelType.local =>
+    '${tunnel.boundHost}:${tunnel.boundPort} → ${tunnel.spec.targetHost}:${tunnel.spec.targetPort}',
+  SshTunnelType.remote =>
+    'SSH 服务器 ${tunnel.boundHost}:${tunnel.boundPort} → ${tunnel.spec.targetHost}:${tunnel.spec.targetPort}',
+  SshTunnelType.dynamic => 'SOCKS5 ${tunnel.boundHost}:${tunnel.boundPort}',
+};
+
 class _TerminalTab {
   _TerminalTab({
     required this.id,
     required this.title,
     required this.connection,
   }) : terminalController = TerminalController(),
-       focusNode = FocusNode();
+       focusNode = FocusNode(),
+       scrollController = ScrollController();
 
   final int id;
   final String title;
   final _TerminalConnection connection;
   final TerminalController terminalController;
   final FocusNode focusNode;
-  final SshRemoteMonitorCache remoteMonitorCache = SshRemoteMonitorCache();
   final GlobalKey terminalViewKey = GlobalKey();
+  final ScrollController scrollController;
   final BytesBuilder pendingInput = BytesBuilder(copy: false);
+  final TerminalTranscript transcript = TerminalTranscript();
+  final SshRemoteMonitorCache remoteMonitorCache = SshRemoteMonitorCache();
   late final Terminal terminal;
 
   Future<void> inputWriteQueue = Future<void>.value();
@@ -4143,15 +6089,18 @@ class _TerminalTab {
   Timer? inputFlushTimer;
   PlatformInt64? sessionId;
   SSHClient? sshClient;
+  SSHClient? sshJumpClient;
   SSHSession? sshSession;
   String? remoteDirectory;
   int remoteRefreshToken = 0;
   RemoteTransferProtocol fileTransferProtocol = RemoteTransferProtocol.sftp;
+  final List<SshTunnelHandle> tunnels = [];
   int columns = 100;
   int rows = 30;
   bool starting = false;
   bool restarting = false;
   bool isClosed = false;
+  bool closing = false;
   bool localFileDragHover = false;
   String status = '正在连接';
   String? errorMessage;
