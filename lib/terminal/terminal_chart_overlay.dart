@@ -150,8 +150,10 @@ class _TerminalChartOverlayState extends State<TerminalChartOverlay> {
           // 1. If in render mode, show the GUI chart card
           if (block.isRenderMode) {
             if (isFullscreen) {
-              // Fullscreen mode: fill the available terminal viewport (leaving space on the right for the floating badge)
-              final maxAllowedHeight = math.max(120.0, viewportHeight - 16.0);
+              // Fullscreen mode: fill the available terminal viewport while preserving the bottom row
+              // for the command prompt line so the prompt is never obscured.
+              final reservedBottom = lineHeight + widget.padding.bottom + 4.0;
+              final maxAllowedHeight = math.max(120.0, viewportHeight - reservedBottom - 8.0);
               final rightMargin = viewportWidth > 260 ? 116.0 : 12.0;
 
               children.add(
@@ -159,6 +161,7 @@ class _TerminalChartOverlayState extends State<TerminalChartOverlay> {
                   left: math.max(8.0, widget.padding.left),
                   right: rightMargin,
                   top: 8.0,
+                  bottom: reservedBottom,
                   child: ConstrainedBox(
                     constraints: BoxConstraints(maxHeight: maxAllowedHeight),
                     child: _buildChartCard(

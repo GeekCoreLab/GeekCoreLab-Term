@@ -5326,6 +5326,13 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     if (event is KeyUpEvent) return KeyEventResult.ignored;
 
     if (event is KeyDownEvent) {
+      if (event.logicalKey == LogicalKeyboardKey.escape) {
+        if (tab.chartCoordinator.hasActiveRenderBlock) {
+          tab.chartCoordinator.closeActiveCharts();
+          return KeyEventResult.handled;
+        }
+      }
+
       final primaryPressed = defaultTargetPlatform == TargetPlatform.macOS
           ? HardwareKeyboard.instance.isMetaPressed
           : HardwareKeyboard.instance.isControlPressed;

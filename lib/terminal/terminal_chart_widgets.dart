@@ -616,7 +616,7 @@ class _ChartCardCloseButton extends StatelessWidget {
       onTap: onClose,
       borderRadius: BorderRadius.circular(4),
       child: Tooltip(
-        message: '切回原始输出 (Raw)',
+        message: '切回原始输出 (Raw) [ESC]',
         child: Padding(
           padding: const EdgeInsets.all(2),
           child: Icon(

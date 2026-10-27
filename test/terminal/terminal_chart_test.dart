@@ -340,5 +340,72 @@ CONTAINER ID   IMAGE                        COMMAND                  CREATED    
       expect(block.isRenderMode, isFalse);
       expect(terminalController.hiddenLineIndices, isEmpty);
     });
+
+    test('reverts old chart to raw when any new non-chart command is executed', () {
+      final terminal = Terminal();
+      final scrollController = ScrollController();
+      final terminalController = TerminalController();
+      final coordinator = TerminalChartCoordinator(
+        terminal: terminal,
+        scrollController: scrollController,
+        terminalController: terminalController,
+      );
+
+      // 1. Run free -h -> chart active
+      terminal.write('[hhjmk@arch ~]\$ free -h\r\n');
+      coordinator.notifyUserInput('free -h\n');
+      coordinator.observeOutput('[hhjmk@arch ~]\$ free -h\r\n');
+      const freeOut =
+          '               total        used        free      shared  buff/cache   available\r\n'
+          'Mem:           7.7Gi       2.1Gi       3.4Gi        52Mi       2.2Gi       5.3Gi\r\n'
+          'Swap:          2.0Gi       256Mi       1.7Gi\r\n'
+          '[hhjmk@arch ~]\$ ';
+      terminal.write(freeOut);
+      coordinator.observeOutput(freeOut);
+
+      expect(coordinator.blocks.length, equals(1));
+      expect(coordinator.hasActiveRenderBlock, isTrue);
+      expect(terminalController.hiddenLineIndices, isNotEmpty);
+
+      // 2. User types an arbitrary new command (e.g. ls -la)
+      terminal.write('ls -la\r\n');
+      coordinator.notifyUserInput('ls -la\n');
+
+      // The previous chart must immediately be closed and hidden lines cleared (reverted to raw)
+      expect(coordinator.hasActiveRenderBlock, isFalse);
+      expect(terminalController.hiddenLineIndices, isEmpty);
+    });
+
+    test('closeActiveCharts closes chart and returns true', () {
+      final terminal = Terminal();
+      final scrollController = ScrollController();
+      final terminalController = TerminalController();
+      final coordinator = TerminalChartCoordinator(
+        terminal: terminal,
+        scrollController: scrollController,
+        terminalController: terminalController,
+      );
+
+      terminal.write('[hhjmk@arch ~]\$ free -h\r\n');
+      coordinator.notifyUserInput('free -h\n');
+      coordinator.observeOutput('[hhjmk@arch ~]\$ free -h\r\n');
+      const freeOut =
+          '               total        used        free      shared  buff/cache   available\r\n'
+          'Mem:           7.7Gi       2.1Gi       3.4Gi        52Mi       2.2Gi       5.3Gi\r\n'
+          'Swap:          2.0Gi       256Mi       1.7Gi\r\n'
+          '[hhjmk@arch ~]\$ ';
+      terminal.write(freeOut);
+      coordinator.observeOutput(freeOut);
+
+      expect(coordinator.hasActiveRenderBlock, isTrue);
+
+      final closed = coordinator.closeActiveCharts();
+      expect(closed, isTrue);
+      expect(coordinator.hasActiveRenderBlock, isFalse);
+      expect(terminalController.hiddenLineIndices, isEmpty);
+
+      // Calling again returns false when no active chart
+      expect(coordinator.closeActiveCharts(), isFalse);
+    });
   });
 }

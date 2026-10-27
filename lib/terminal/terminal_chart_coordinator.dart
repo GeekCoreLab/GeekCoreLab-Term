@@ -138,6 +138,10 @@ class TerminalChartCoordinator extends ChangeNotifier {
   }
 
   void _handleCommandEntered(String cmd) {
+    // When executing any new command, close any previously active chart blocks
+    // so they revert back to raw output and scroll normally.
+    closeActiveCharts();
+
     final trimmed = cmd.trim();
     final type = TerminalCommandChartParser.matchCommandType(trimmed);
     if (type != null) {
@@ -408,6 +412,27 @@ class TerminalChartCoordinator extends ChangeNotifier {
   static bool _setsEqual(Set<int> a, Set<int> b) {
     if (a.length != b.length) return false;
     return a.containsAll(b);
+  }
+
+  /// Whether there is currently any visible GUI chart block displayed
+  bool get hasActiveRenderBlock =>
+      _blocks.any((b) => b.isRenderMode);
+
+  /// Dismisses all visible GUI chart blocks, reverting them back to raw terminal output.
+  /// Returns true if at least one chart was active and closed.
+  bool closeActiveCharts() {
+    var closedAny = false;
+    for (final b in _blocks) {
+      if (b.isRenderMode) {
+        b.isRenderMode = false;
+        closedAny = true;
+      }
+    }
+    if (closedAny) {
+      _updateHiddenLines();
+      notifyListeners();
+    }
+    return closedAny;
   }
 
   void toggleBlockMode(CapturedCommandBlock block) {
