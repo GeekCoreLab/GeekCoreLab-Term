@@ -354,9 +354,35 @@ class TerminalInlineHintTransformer {
   String _lineBuffer = '';
   Timer? _flushTimer;
 
+  /// Whether we are currently inside the output of a whitelisted command
+  /// (e.g. systemctl status/service ... status).
+  bool _isWhitelistedCommand = false;
+
+  /// Patterns that activate inline hint transformation
+  static final List<RegExp> _whitelistPatterns = [
+    RegExp(r'\bsystemctl\s+(?:status|is-active|is-enabled)\b', caseSensitive: false),
+    RegExp(r'\bservice\s+\S+\s+status\b', caseSensitive: false),
+    RegExp(r'\b(?:Loaded:\s*(?:loaded|masked)|Active:\s*(?:active|inactive|failed))\b', caseSensitive: false),
+  ];
+
+  /// Patterns that indicate a shell prompt has returned (ending the command output)
+  static final RegExp _promptPattern = RegExp(
+    r'(?:^|[\r\n])(?:[\w.\-]+@[\w.\-]+:[^#$]*[#$]|\$ |# )\s*$',
+  );
+
   /// Callback invoked when buffered text (e.g. an unfinished line or shell prompt)
   /// is flushed asynchronously after a brief pause so terminal displays stay instant.
   void Function(String)? onFlush;
+
+  /// Notify the transformer about user keyboard input (e.g. commands typed in terminal)
+  void notifyUserInput(String input) {
+    for (final pattern in _whitelistPatterns) {
+      if (pattern.hasMatch(input)) {
+        _isWhitelistedCommand = true;
+        break;
+      }
+    }
+  }
 
   String transform(String chunk, {DateTime Function()? clock}) {
     if (chunk.isEmpty) return chunk;
@@ -375,7 +401,6 @@ class TerminalInlineHintTransformer {
     }
 
     final lastMatch = matches.last;
-    final readyChunk = combined.substring(0, lastMatch.end);
     _lineBuffer = combined.substring(lastMatch.end);
 
     if (_lineBuffer.isNotEmpty) {
@@ -385,7 +410,7 @@ class TerminalInlineHintTransformer {
     final buffer = StringBuffer();
     for (final match in matches) {
       final line = match.group(0)!;
-      buffer.write(_processLine(line, clock: clock));
+      buffer.write(_processLineStateful(line, clock: clock));
     }
     return buffer.toString();
   }
@@ -394,7 +419,7 @@ class TerminalInlineHintTransformer {
     _flushTimer?.cancel();
     _flushTimer = Timer(const Duration(milliseconds: 20), () {
       if (_lineBuffer.isNotEmpty) {
-        final pending = _processLine(_lineBuffer, clock: clock);
+        final pending = _processLineStateful(_lineBuffer, clock: clock);
         _lineBuffer = '';
         onFlush?.call(pending);
       }
@@ -405,7 +430,7 @@ class TerminalInlineHintTransformer {
     _flushTimer?.cancel();
     _flushTimer = null;
     if (_lineBuffer.isEmpty) return '';
-    final res = _processLine(_lineBuffer, clock: clock);
+    final res = _processLineStateful(_lineBuffer, clock: clock);
     _lineBuffer = '';
     return res;
   }
@@ -414,13 +439,46 @@ class TerminalInlineHintTransformer {
     _flushTimer?.cancel();
     _flushTimer = null;
     _lineBuffer = '';
+    _isWhitelistedCommand = false;
   }
 
   void dispose() {
     _flushTimer?.cancel();
     _flushTimer = null;
     _lineBuffer = '';
+    _isWhitelistedCommand = false;
     onFlush = null;
+  }
+
+  String _processLineStateful(String line, {DateTime Function()? clock}) {
+    final plainText = _stripAnsi(line);
+
+    // 1. Check if line is command echo that triggers whitelist
+    for (final pattern in _whitelistPatterns) {
+      if (pattern.hasMatch(plainText)) {
+        _isWhitelistedCommand = true;
+        break;
+      }
+    }
+
+    // 2. If active, perform inline hints decoration
+    final output = _isWhitelistedCommand
+        ? _processLine(line, clock: clock)
+        : line;
+
+    // 3. Check if shell prompt returned, which ends the whitelisted command output
+    if (_promptPattern.hasMatch(plainText.trimRight())) {
+      _isWhitelistedCommand = false;
+    }
+
+    return output;
+  }
+
+  static String _stripAnsi(String text) {
+    return text.replaceAll(
+      RegExp(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)'),
+      '',
+    );
   }
 
   static String _processLine(String line, {DateTime Function()? clock}) {

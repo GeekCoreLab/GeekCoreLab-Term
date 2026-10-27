@@ -44,6 +44,8 @@ import 'package:geekcore_term/terminal/startup_session_group.dart';
 import 'package:geekcore_term/terminal/terminal_macro.dart';
 import 'package:geekcore_term/terminal/terminal_input_recording.dart';
 import 'package:geekcore_term/terminal/terminal_recorded_macro_dialog.dart';
+import 'package:geekcore_term/terminal/terminal_chart_coordinator.dart';
+import 'package:geekcore_term/terminal/terminal_chart_overlay.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
 import 'package:geekcore_term/settings/settings_page.dart';
@@ -923,6 +925,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       );
     }
     if (!tab.isClosed) tab.assistant.observe(value);
+    if (!tab.isClosed) tab.chartCoordinator.observeOutput(value);
     final result = tab.transcript.append(value);
     if (result == TranscriptAppendResult.limitReached && !tab.isClosed) {
       _showMessage('终端记录达到 10 MiB 上限，已停止记录', isError: true);
@@ -2832,6 +2835,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   void _recordTerminalInput(_TerminalTab tab, String value) {
+    tab.inlineHintTransformer.notifyUserInput(value);
+    tab.chartCoordinator.notifyUserInput(value);
     if (!tab.inputRecorder.isRecording) return;
     if (!tab.inputRecorder.record(value)) {
       final prefix = tab.id == _activeTabId ? '' : '会话${tab.title}：';
@@ -5012,6 +5017,17 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                           onSecondaryTapDown: (details, offset) {
                             unawaited(_handleSecondaryTap(tab));
                           },
+                        ),
+                        TerminalChartOverlay(
+                          coordinator: tab.chartCoordinator,
+                          terminal: tab.terminal,
+                          scrollController: tab.scrollController,
+                          textStyle: TerminalStyle(
+                            fontSize: widget.settings.terminalFontSize,
+                            fontFamily:
+                                widget.settings.terminalFontFamily.familyName,
+                          ),
+                          padding: const EdgeInsets.all(12),
                         ),
                         if (draggingRemoteFile || draggingLocalFile)
                           Positioned.fill(
@@ -8090,6 +8106,12 @@ class _TerminalTab {
   final TerminalAssistantAnalyzer assistant = TerminalAssistantAnalyzer();
   final TerminalInlineHintTransformer inlineHintTransformer =
       TerminalInlineHintTransformer();
+  late final TerminalChartCoordinator chartCoordinator =
+      TerminalChartCoordinator(
+        terminal: terminal,
+        scrollController: scrollController,
+        terminalController: terminalController,
+      );
   final TerminalInputRecorder inputRecorder = TerminalInputRecorder();
   late final TerminalKeywordHighlighter keywordHighlighter =
       TerminalKeywordHighlighter(terminalController);

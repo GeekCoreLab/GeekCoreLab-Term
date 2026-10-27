@@ -36,6 +36,15 @@ class TerminalController with ChangeNotifier {
   List<TerminalHighlight> get highlights => _highlights;
   final _highlights = <TerminalHighlight>[];
 
+  /// Set of buffer line indices that should be hidden (skipped during painting)
+  Set<int> get hiddenLineIndices => _hiddenLineIndices;
+  Set<int> _hiddenLineIndices = const {};
+
+  void setHiddenLineIndices(Set<int> indices) {
+    _hiddenLineIndices = Set.unmodifiable(indices);
+    notifyListeners();
+  }
+
   BufferRange? get selection {
     final base = _selectionBase;
     final extent = _selectionExtent;
