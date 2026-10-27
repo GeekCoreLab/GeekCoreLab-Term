@@ -22,6 +22,7 @@ import 'package:geekcore_term/terminal/ssh_agent.dart';
 import 'package:geekcore_term/terminal/ssh_identity_file.dart';
 import 'package:geekcore_term/terminal/ssh_tunnel.dart';
 import 'package:geekcore_term/terminal/ssh_terminal_environment.dart';
+import 'package:geekcore_term/terminal/ssh_jump_port_knock.dart';
 import 'package:geekcore_term/terminal/ssh_remote_monitor_dialog.dart';
 import 'package:geekcore_term/terminal/ssh_remote_monitor_bar.dart';
 import 'package:geekcore_term/terminal/ssh_remote_monitor_cache.dart';
@@ -35,6 +36,7 @@ import 'package:geekcore_term/terminal/terminal_assistant.dart';
 import 'package:geekcore_term/terminal/terminal_assistant_panel.dart';
 import 'package:geekcore_term/terminal/terminal_input_targets.dart';
 import 'package:geekcore_term/terminal/terminal_shortcuts.dart';
+import 'package:geekcore_term/terminal/terminal_tab_order.dart';
 import 'package:geekcore_term/terminal/terminal_macro.dart';
 import 'package:geekcore_term/terminal/terminal_input_recording.dart';
 import 'package:geekcore_term/terminal/terminal_recorded_macro_dialog.dart';
@@ -1441,6 +1443,20 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     _focusTab(tab);
   }
 
+  void _reorderTabs(int oldIndex, int newIndex) {
+    if (oldIndex == newIndex || _tabs.length < 2) return;
+    final reordered = reorderListItem(
+      _tabs,
+      oldIndex: oldIndex,
+      newIndex: newIndex,
+    );
+    setState(() {
+      _tabs
+        ..clear()
+        ..addAll(reordered);
+    });
+  }
+
   void _selectAdjacentTab(int direction) {
     if (_tabs.length < 2) return;
     final currentIndex = _tabs.indexWhere((tab) => tab.id == _activeTabId);
@@ -1716,12 +1732,17 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           jumpHost.port == connection.port) {
         throw StateError('跳板机和目标主机不能相同');
       }
-      if (connection.portKnockActions.isNotEmpty) {
-        throw StateError('经跳板机连接时暂不支持目标主机端口敲门');
+      if (connection.portKnockActions.any(
+        (action) =>
+            action.kind == PortKnockActionKind.knock &&
+            action.protocol != PortKnockProtocol.tcp,
+      )) {
+        throw UnsupportedError('经 SSH 跳板只支持 TCP 端口敲门');
       }
       _notifySessionProgress(tab, '正在连接 SSH 跳板机“${jumpHost.name}”…');
       jumpClient = await _openSshJumpHost(tab, jumpHost);
       if (tab.isClosed) return;
+      await _runPortKnockSequence(tab, connection, viaJumpClient: jumpClient);
     }
     if (tab.isClosed) return;
 
@@ -2245,8 +2266,12 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   Future<void> _runPortKnockSequence(
     _TerminalTab tab,
-    _TerminalConnection connection,
-  ) async {
+    _TerminalConnection connection, {
+    SSHClient? viaJumpClient,
+  }) async {
+    if (connection.jumpHost != null && viaJumpClient == null) {
+      throw StateError('目标主机敲门需要已连接的 SSH 跳板');
+    }
     for (final action in connection.portKnockActions) {
       if (tab.isClosed) return;
       switch (action.kind) {
@@ -2259,25 +2284,44 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           final target = action.protocol == PortKnockProtocol.icmp
               ? connection.address
               : '${connection.address}:${action.port}';
-          _notifySessionProgress(tab, '$protocolName 敲门：$target');
-          _writeTerminalOutput(tab, '\r\n[端口敲门] $protocolName $target\r\n');
-          await knockOnce(
-            connection.address,
-            action.protocol,
-            action.port,
-            webSocketUri: kIsWeb
-                ? _webSocketUri(
-                    connection.webSocketUrl,
-                    connection.address,
-                    action.protocol == PortKnockProtocol.icmp
-                        ? null
-                        : action.port,
-                    transport: action.protocol == PortKnockProtocol.tcp
-                        ? null
-                        : action.protocol.name,
-                  )
-                : null,
+          final viaJump = viaJumpClient != null;
+          _notifySessionProgress(
+            tab,
+            '$protocolName 敲门：$target${viaJump ? '（经 SSH 跳板）' : ''}',
           );
+          _writeTerminalOutput(
+            tab,
+            '\r\n[端口敲门] $protocolName $target${viaJump ? '（经 SSH 跳板）' : ''}\r\n',
+          );
+          if (viaJump) {
+            if (action.protocol != PortKnockProtocol.tcp) {
+              throw UnsupportedError('经 SSH 跳板只支持 TCP 端口敲门');
+            }
+            final jumpClient = viaJumpClient;
+            await knockTcpThroughSshJump(
+              openChannel: () =>
+                  jumpClient.forwardLocal(connection.address, action.port),
+              closeChannel: (channel) => channel.close(),
+            );
+          } else {
+            await knockOnce(
+              connection.address,
+              action.protocol,
+              action.port,
+              webSocketUri: kIsWeb
+                  ? _webSocketUri(
+                      connection.webSocketUrl,
+                      connection.address,
+                      action.protocol == PortKnockProtocol.icmp
+                          ? null
+                          : action.port,
+                      transport: action.protocol == PortKnockProtocol.tcp
+                          ? null
+                          : action.protocol.name,
+                    )
+                  : null,
+            );
+          }
         case PortKnockActionKind.delay:
           _notifySessionProgress(tab, '端口敲门延迟 ${action.delayMs} ms');
           _writeTerminalOutput(tab, '\r\n[端口敲门] 延迟 ${action.delayMs} ms\r\n');
@@ -4235,13 +4279,14 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                         style: TextStyle(color: colors.onSurfaceVariant),
                       ),
                     )
-                  : SingleChildScrollView(
+                  : ReorderableListView.builder(
                       scrollDirection: Axis.horizontal,
-                      child: Row(
-                        children: [
-                          for (final tab in _tabs) _buildTab(tab, colors),
-                        ],
-                      ),
+                      buildDefaultDragHandles: false,
+                      padding: EdgeInsets.zero,
+                      itemCount: _tabs.length,
+                      onReorderItem: _reorderTabs,
+                      itemBuilder: (context, index) =>
+                          _buildTab(_tabs[index], colors, index: index),
                     ),
             ),
             if (_tabs.length > 1)
@@ -4462,80 +4507,103 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     };
   }
 
-  Widget _buildTab(_TerminalTab tab, ColorScheme colors) {
+  Widget _buildTab(_TerminalTab tab, ColorScheme colors, {required int index}) {
     final selected = tab.id == _activeTabId;
-    return Padding(
-      padding: const EdgeInsets.only(left: 5, top: 5, bottom: 5),
-      child: Material(
-        color: selected ? colors.surfaceContainerHighest : Colors.transparent,
-        borderRadius: BorderRadius.circular(7),
-        child: InkWell(
+    final dragHandle = SizedBox(
+      width: 19,
+      height: 30,
+      child: Center(
+        child: Icon(
+          Icons.drag_indicator_rounded,
+          size: 16,
+          color: selected ? colors.primary : colors.outline,
+        ),
+      ),
+    );
+    final dragListener = switch (Theme.of(context).platform) {
+      TargetPlatform.android || TargetPlatform.iOS || TargetPlatform.fuchsia =>
+        ReorderableDelayedDragStartListener(index: index, child: dragHandle),
+      _ => ReorderableDragStartListener(index: index, child: dragHandle),
+    };
+    return KeyedSubtree(
+      key: ValueKey('terminal-tab-${tab.id}'),
+      child: Padding(
+        padding: const EdgeInsets.only(left: 5, top: 5, bottom: 5),
+        child: Material(
+          color: selected ? colors.surfaceContainerHighest : Colors.transparent,
           borderRadius: BorderRadius.circular(7),
-          onTap: () => _selectTab(tab),
-          child: SizedBox(
-            width: 204,
-            child: Padding(
-              padding: const EdgeInsets.only(left: 10, right: 4),
-              child: Row(
-                children: [
-                  Icon(
-                    tab.connection.kind == _ConnectionKind.sftp
-                        ? Icons.folder_open_rounded
-                        : Icons.terminal_rounded,
-                    size: 16,
-                    color: selected ? colors.primary : colors.onSurfaceVariant,
-                  ),
-                  if (tab.inputRecorder.isRecording) ...[
-                    const SizedBox(width: 5),
-                    Tooltip(
-                      message: '正在录制键盘输入',
-                      child: Icon(
-                        Icons.fiber_manual_record_rounded,
-                        size: 12,
-                        color: colors.error,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(7),
+            onTap: () => _selectTab(tab),
+            child: SizedBox(
+              width: 224,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 4, right: 4),
+                child: Row(
+                  children: [
+                    Tooltip(message: '拖动以调整标签顺序', child: dragListener),
+                    const SizedBox(width: 2),
+                    Icon(
+                      tab.connection.kind == _ConnectionKind.sftp
+                          ? Icons.folder_open_rounded
+                          : Icons.terminal_rounded,
+                      size: 16,
+                      color: selected
+                          ? colors.primary
+                          : colors.onSurfaceVariant,
+                    ),
+                    if (tab.inputRecorder.isRecording) ...[
+                      const SizedBox(width: 5),
+                      Tooltip(
+                        message: '正在录制键盘输入',
+                        child: Icon(
+                          Icons.fiber_manual_record_rounded,
+                          size: 12,
+                          color: colors.error,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            tab.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          Text(
+                            tab.status,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 9,
+                              color: _statusColor(tab, colors),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    IconButton(
+                      tooltip: '关闭 ${tab.title} (Ctrl+W)',
+                      onPressed: () => unawaited(_closeTab(tab)),
+                      icon: const Icon(Icons.close_rounded, size: 15),
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 28,
+                        height: 28,
                       ),
                     ),
                   ],
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          tab.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        Text(
-                          tab.status,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 9,
-                            color: _statusColor(tab, colors),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  IconButton(
-                    tooltip: '关闭 ${tab.title} (Ctrl+W)',
-                    onPressed: () => unawaited(_closeTab(tab)),
-                    icon: const Icon(Icons.close_rounded, size: 15),
-                    visualDensity: VisualDensity.compact,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(
-                      width: 28,
-                      height: 28,
-                    ),
-                  ),
-                ],
+                ),
               ),
             ),
           ),

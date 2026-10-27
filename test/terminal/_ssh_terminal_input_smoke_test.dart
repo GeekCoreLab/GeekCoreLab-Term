@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geekcore_term/terminal/terminal_macro.dart';
+import 'package:geekcore_term/terminal/ssh_jump_port_knock.dart';
 
 void main() {
   test(
@@ -29,6 +30,9 @@ void main() {
       Process? server;
       SSHClient? sshClient;
       SSHSession? session;
+      ServerSocket? knockListener;
+      StreamSubscription<Socket>? knockSubscription;
+      Socket? knockedSocket;
       StreamSubscription<Uint8List>? stdoutSubscription;
       StreamSubscription<Uint8List>? stderrSubscription;
       final output = StringBuffer();
@@ -94,6 +98,7 @@ PermitRootLogin yes
 PermitTTY yes
 AllowUsers $user
 Subsystem sftp internal-sftp
+AllowTcpForwarding yes
 ''');
 
         server = await Process.start('/usr/bin/sshd', [
@@ -142,6 +147,38 @@ Subsystem sftp internal-sftp
           onVerifyHostKey: (_, _) => true,
         );
         await sshClient.authenticated;
+
+        knockListener = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4,
+          0,
+        );
+        final knockAccepted = Completer<Socket>();
+        knockSubscription = knockListener.listen((socket) {
+          if (!knockAccepted.isCompleted) knockAccepted.complete(socket);
+        });
+        await knockTcpThroughSshJump<SSHForwardChannel>(
+          openChannel: () => sshClient!.forwardLocal(
+            InternetAddress.loopbackIPv4.address,
+            knockListener!.port,
+          ),
+          closeChannel: (channel) => channel.destroy(),
+        );
+        knockedSocket = await knockAccepted.future.timeout(
+          const Duration(seconds: 5),
+        );
+        final knockSocketClosed = Completer<void>();
+        knockedSocket.listen(
+          (_) {},
+          onDone: () {
+            if (!knockSocketClosed.isCompleted) knockSocketClosed.complete();
+          },
+        );
+        await knockSocketClosed.future.timeout(const Duration(seconds: 5));
+        await knockSubscription.cancel();
+        knockSubscription = null;
+        await knockListener.close();
+        knockListener = null;
+
         final sftp = await sshClient.sftp();
         await sftp.listdir('/tmp');
         await sftp.close();
@@ -206,6 +243,9 @@ Subsystem sftp internal-sftp
         await Future<void>.delayed(const Duration(milliseconds: 150));
         expect(channelDone, isFalse, reason: 'SSH macro closed the channel');
       } finally {
+        await knockSubscription?.cancel();
+        knockedSocket?.destroy();
+        await knockListener?.close();
         await stdoutSubscription?.cancel();
         await stderrSubscription?.cancel();
         session?.close();
