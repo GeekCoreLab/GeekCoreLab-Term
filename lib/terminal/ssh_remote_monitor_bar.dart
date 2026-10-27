@@ -152,6 +152,28 @@ class _SshRemoteMonitorBarState extends State<SshRemoteMonitorBar> {
                                         ? '—'
                                         : '${metrics.diskPercent}%',
                                   ),
+                                  if (metrics.networkReceivedBytes != null) ...[
+                                    _MonitorMetric(
+                                      icon: Icons.south_rounded,
+                                      label: '收',
+                                      value: _formatRate(
+                                        widget
+                                            .cache
+                                            .trafficRate
+                                            ?.receivedBytesPerSecond,
+                                      ),
+                                    ),
+                                    _MonitorMetric(
+                                      icon: Icons.north_rounded,
+                                      label: '发',
+                                      value: _formatRate(
+                                        widget
+                                            .cache
+                                            .trafficRate
+                                            ?.transmittedBytesPerSecond,
+                                      ),
+                                    ),
+                                  ],
                                   _MonitorMetric(
                                     icon: Icons.account_tree_outlined,
                                     label: '进程',
@@ -237,3 +259,17 @@ class _MonitorMetric extends StatelessWidget {
 
 String _formatTime(DateTime value) =>
     '${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}:${value.second.toString().padLeft(2, '0')}';
+
+String _formatRate(double? bytesPerSecond) {
+  if (bytesPerSecond == null) return '—';
+  if (bytesPerSecond >= 1024 * 1024 * 1024) {
+    return '${(bytesPerSecond / (1024 * 1024 * 1024)).toStringAsFixed(1)} GiB/s';
+  }
+  if (bytesPerSecond >= 1024 * 1024) {
+    return '${(bytesPerSecond / (1024 * 1024)).toStringAsFixed(1)} MiB/s';
+  }
+  if (bytesPerSecond >= 1024) {
+    return '${(bytesPerSecond / 1024).toStringAsFixed(1)} KiB/s';
+  }
+  return '${bytesPerSecond.toStringAsFixed(0)} B/s';
+}

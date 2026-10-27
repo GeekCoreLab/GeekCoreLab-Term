@@ -18,6 +18,8 @@ class SshRemoteMetrics {
     this.diskAvailableKiB,
     this.diskPercent,
     this.processCount,
+    this.networkReceivedBytes,
+    this.networkTransmittedBytes,
     this.topProcesses = const [],
   });
 
@@ -32,6 +34,8 @@ class SshRemoteMetrics {
   final int? diskAvailableKiB;
   final int? diskPercent;
   final int? processCount;
+  final int? networkReceivedBytes;
+  final int? networkTransmittedBytes;
   final List<SshRemoteProcessMetric> topProcesses;
 
   int? get memoryUsedKiB {
@@ -46,6 +50,32 @@ class SshRemoteMetrics {
     final total = memoryTotalKiB;
     if (used == null || total == null || total <= 0) return null;
     return used * 100 / total;
+  }
+
+  SshRemoteTrafficRate? trafficRateSince(SshRemoteMetrics previous) {
+    final elapsedMicros = sampledAt
+        .difference(previous.sampledAt)
+        .inMicroseconds;
+    if (elapsedMicros <= 0) return null;
+
+    double? calculate(int? current, int? prior) {
+      if (current == null || prior == null || current < prior) return null;
+      return (current - prior) / elapsedMicros * Duration.microsecondsPerSecond;
+    }
+
+    final received = calculate(
+      networkReceivedBytes,
+      previous.networkReceivedBytes,
+    );
+    final transmitted = calculate(
+      networkTransmittedBytes,
+      previous.networkTransmittedBytes,
+    );
+    if (received == null && transmitted == null) return null;
+    return SshRemoteTrafficRate(
+      receivedBytesPerSecond: received,
+      transmittedBytesPerSecond: transmitted,
+    );
   }
 
   static SshRemoteMetrics parse(String output, {DateTime? sampledAt}) {
@@ -65,6 +95,9 @@ class SshRemoteMetrics {
     int? diskAvailable;
     int? diskPercent;
     int? processCount;
+    var networkReceivedBytes = 0;
+    var networkTransmittedBytes = 0;
+    var hasNetworkCounters = false;
     final processes = <SshRemoteProcessMetric>[];
 
     for (final line in lines.skip(markerIndex + 1)) {
@@ -87,6 +120,16 @@ class SshRemoteMetrics {
           diskPercent = int.tryParse(fields[4].replaceAll('%', ''));
         case 'COUNT' when fields.length >= 2:
           processCount = int.tryParse(fields[1]);
+        case 'NET' when fields.length >= 4:
+          if (fields[1] != 'lo') {
+            final received = int.tryParse(fields[2]);
+            final transmitted = int.tryParse(fields[3]);
+            if (received != null && transmitted != null) {
+              networkReceivedBytes += received;
+              networkTransmittedBytes += transmitted;
+              hasNetworkCounters = true;
+            }
+          }
         case 'PROC' when fields.length >= 5:
           final pid = int.tryParse(fields[1]);
           final cpu = double.tryParse(fields[2]);
@@ -104,7 +147,10 @@ class SshRemoteMetrics {
       }
     }
 
-    if (load1 == null && memoryTotal == null && diskTotal == null) {
+    if (load1 == null &&
+        memoryTotal == null &&
+        diskTotal == null &&
+        !hasNetworkCounters) {
       throw const FormatException('远端监控工具不可用或没有返回系统指标');
     }
     return SshRemoteMetrics(
@@ -119,9 +165,23 @@ class SshRemoteMetrics {
       diskAvailableKiB: diskAvailable,
       diskPercent: diskPercent,
       processCount: processCount,
+      networkReceivedBytes: hasNetworkCounters ? networkReceivedBytes : null,
+      networkTransmittedBytes: hasNetworkCounters
+          ? networkTransmittedBytes
+          : null,
       topProcesses: List.unmodifiable(processes),
     );
   }
+}
+
+class SshRemoteTrafficRate {
+  const SshRemoteTrafficRate({
+    required this.receivedBytesPerSecond,
+    required this.transmittedBytesPerSecond,
+  });
+
+  final double? receivedBytesPerSecond;
+  final double? transmittedBytesPerSecond;
 }
 
 class SshRemoteProcessMetric {
@@ -142,7 +202,18 @@ class SshRemoteProcessMetric {
 class SshRemoteMonitor {
   const SshRemoteMonitor();
 
-  static const sampleCommand = r'''
+  static const networkCounterAwkProgram = r'''NR > 2 {
+  separator = match($0, /:[[:space:]]+[0-9]/)
+  if (!separator) next
+  iface = substr($0, 1, RSTART - 1)
+  countersText = substr($0, RSTART + 1)
+  gsub(/^[[:space:]]+|[[:space:]]+$/, "", iface)
+  sub(/^[[:space:]]+/, "", countersText)
+  split(countersText, counters, /[[:space:]]+/)
+  if (iface != "lo") printf "NET\t%s\t%s\t%s\n", iface, counters[1], counters[9]
+}''';
+
+  static const _sampleCommandTemplate = r'''
 if [ ! -r /proc/meminfo ] || [ ! -r /proc/loadavg ]; then
   printf '__GEEKCORE_TERM_MONITOR_V1__\n'
   printf 'UNSUPPORTED\tLinux /proc unavailable\n'
@@ -153,7 +224,15 @@ awk '/^MemTotal:/ { total = $2 } /^MemAvailable:/ { available = $2; seen = 1 } E
 awk '{ printf "LOAD\t%s\t%s\t%s\n", $1, $2, $3 }' /proc/loadavg
 df -Pk / 2>/dev/null | awk 'NR == 2 { print "DISK\t" $2 "\t" $3 "\t" $4 "\t" $5 }'
 ps -eo pid=,pcpu=,pmem=,comm= --sort=-pcpu 2>/dev/null | awk '{ count++; if (count <= 5) printf "PROC\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4 } END { printf "COUNT\t%d\n", count }'
+if [ -r /proc/net/dev ]; then
+  awk '__GEEKCORE_TERM_NET_AWK__' /proc/net/dev 2>/dev/null
+fi
 ''';
+
+  static final sampleCommand = _sampleCommandTemplate.replaceAll(
+    '__GEEKCORE_TERM_NET_AWK__',
+    networkCounterAwkProgram,
+  );
 
   Future<SshRemoteMetrics> sample(SSHClient client) async {
     if (client.isClosed) throw StateError('SSH 会话已断开');

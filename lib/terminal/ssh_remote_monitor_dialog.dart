@@ -57,6 +57,7 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
     final cache = widget.cache;
     final metrics = cache.metrics;
     final error = cache.error;
+    final trafficRate = cache.trafficRate;
     return AlertDialog(
       title: Row(
         children: [
@@ -168,6 +169,28 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
                                   .toList(),
                             ),
                           ),
+                          if (metrics.networkReceivedBytes != null) ...[
+                            _MetricCard(
+                              width: cardWidth,
+                              title: '网络接收',
+                              icon: Icons.south_rounded,
+                              value: _formatRate(
+                                trafficRate?.receivedBytesPerSecond,
+                              ),
+                              detail: '所有非 lo 接口 · RX',
+                              trend: _sparkline(cache.receiveRates),
+                            ),
+                            _MetricCard(
+                              width: cardWidth,
+                              title: '网络发送',
+                              icon: Icons.north_rounded,
+                              value: _formatRate(
+                                trafficRate?.transmittedBytesPerSecond,
+                              ),
+                              detail: '所有非 lo 接口 · TX',
+                              trend: _sparkline(cache.transmitRates),
+                            ),
+                          ],
                           _MetricCard(
                             width: cardWidth,
                             title: '进程',
@@ -192,7 +215,7 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
                   ],
                   const SizedBox(height: 10),
                   Text(
-                    '趋势共享底部监控栏的数据，保留最近 2 分钟；关闭 SSH 标签后清除。负载值需结合远端 CPU 核心数判断。',
+                    '趋势共享底部监控栏的数据，保留最近 2 分钟；关闭 SSH 标签后清除。网络速度统计所有非 lo 接口，虚拟网桥可能造成重复计数。负载值需结合远端 CPU 核心数判断。',
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       color: colors.onSurfaceVariant,
                     ),
@@ -438,6 +461,20 @@ String _formatBytes(int bytes) {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(0)} MiB';
   }
   return '${(bytes / 1024).toStringAsFixed(0)} KiB';
+}
+
+String _formatRate(double? bytesPerSecond) {
+  if (bytesPerSecond == null) return '采集中';
+  if (bytesPerSecond >= 1024 * 1024 * 1024) {
+    return '${(bytesPerSecond / (1024 * 1024 * 1024)).toStringAsFixed(1)} GiB/s';
+  }
+  if (bytesPerSecond >= 1024 * 1024) {
+    return '${(bytesPerSecond / (1024 * 1024)).toStringAsFixed(1)} MiB/s';
+  }
+  if (bytesPerSecond >= 1024) {
+    return '${(bytesPerSecond / 1024).toStringAsFixed(1)} KiB/s';
+  }
+  return '${bytesPerSecond.toStringAsFixed(0)} B/s';
 }
 
 String _formatTime(DateTime value) =>

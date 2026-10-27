@@ -7,10 +7,12 @@ import 'ssh_remote_monitor.dart';
 
 /// Per-session monitor state shared by the terminal strip and detail dialog.
 class SshRemoteMonitorCache extends ChangeNotifier {
+  SshRemoteMonitorCache({this.monitor = const SshRemoteMonitor()});
+
   static const sampleInterval = Duration(seconds: 5);
   static const historyLimit = 24;
 
-  final SshRemoteMonitor _monitor = const SshRemoteMonitor();
+  final SshRemoteMonitor monitor;
   final List<SshRemoteMetrics> _history = [];
 
   SSHClient? _client;
@@ -21,11 +23,32 @@ class SshRemoteMonitorCache extends ChangeNotifier {
   bool _sampling = false;
   bool _disposed = false;
   int _generation = 0;
+  int? _trafficBreakBeforeIndex;
 
   SshRemoteMetrics? get metrics => _metrics;
   String? get error => _error;
   bool get isSampling => _sampling;
   List<SshRemoteMetrics> get history => List.unmodifiable(_history);
+  SshRemoteTrafficRate? get trafficRate {
+    if (_history.length < 2) return null;
+    if (_trafficBreakBeforeIndex == _history.length - 1) return null;
+    return _history.last.trafficRateSince(_history[_history.length - 2]);
+  }
+
+  List<double?> get receiveRates =>
+      _trafficRateHistory((rate) => rate?.receivedBytesPerSecond);
+
+  List<double?> get transmitRates =>
+      _trafficRateHistory((rate) => rate?.transmittedBytesPerSecond);
+
+  List<double?> _trafficRateHistory(
+    double? Function(SshRemoteTrafficRate?) select,
+  ) => List<double?>.generate(_history.length, (index) {
+    if (index == 0) return null;
+    if (_trafficBreakBeforeIndex == index) return null;
+    final rate = _history[index].trafficRateSince(_history[index - 1]);
+    return select(rate);
+  }, growable: false);
 
   /// Starts sampling while this session is shown in the monitor strip.
   void watch(SSHClient? client) {
@@ -45,6 +68,7 @@ class SshRemoteMonitorCache extends ChangeNotifier {
       _metrics = null;
       _error = null;
       _history.clear();
+      _trafficBreakBeforeIndex = null;
     }
 
     _watching = true;
@@ -60,6 +84,9 @@ class SshRemoteMonitorCache extends ChangeNotifier {
     _watching = false;
     _timer?.cancel();
     _timer = null;
+    _generation++;
+    _sampling = false;
+    if (_history.isNotEmpty) _trafficBreakBeforeIndex = _history.length;
     notifyListeners();
   }
 
@@ -76,12 +103,20 @@ class SshRemoteMonitorCache extends ChangeNotifier {
     _sampling = true;
     notifyListeners();
     try {
-      final metrics = await _monitor.sample(client);
+      final metrics = await monitor.sample(client);
       if (generation != _generation || !identical(_client, client)) return;
       _metrics = metrics;
       _error = null;
       _history.add(metrics);
-      if (_history.length > historyLimit) _history.removeAt(0);
+      if (_history.length > historyLimit) {
+        _history.removeAt(0);
+        final trafficBreak = _trafficBreakBeforeIndex;
+        if (trafficBreak != null) {
+          _trafficBreakBeforeIndex = trafficBreak == 0
+              ? null
+              : trafficBreak - 1;
+        }
+      }
     } catch (error) {
       if (generation != _generation || !identical(_client, client)) return;
       _error = error.toString().replaceFirst('Bad state: ', '');
