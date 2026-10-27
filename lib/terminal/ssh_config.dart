@@ -5,6 +5,24 @@ class SshConfigHost {
     required this.port,
     this.username = '',
     this.identityFile,
+    this.proxyJump,
+  });
+
+  final String alias;
+  final String hostName;
+  final int port;
+  final String username;
+  final String? identityFile;
+  final SshConfigProxyJump? proxyJump;
+}
+
+class SshConfigProxyJump {
+  const SshConfigProxyJump({
+    required this.alias,
+    required this.hostName,
+    required this.port,
+    required this.username,
+    required this.identityFile,
   });
 
   final String alias;
@@ -76,9 +94,6 @@ SshConfigParseResult parseOpenSshConfig(String source) {
       warnings.add('忽略缺少值的配置项：${tokens.first}');
       continue;
     }
-    if (keyword == 'proxyjump' || keyword == 'proxycommand') {
-      warnings.add('ProxyJump / ProxyCommand 未导入');
-    }
     activeBlock ??= _ConfigBlock(null)..isGlobal = true;
     if (!blocks.contains(activeBlock)) blocks.insert(0, activeBlock);
     activeBlock.directives.add(_ConfigDirective(keyword, values));
@@ -93,10 +108,14 @@ SshConfigParseResult parseOpenSshConfig(String source) {
     }
   }
 
-  final hosts = <SshConfigHost>[];
+  final hostsByAlias = <String, SshConfigHost>{};
+  final proxyJumpByAlias = <String, String?>{};
+  final proxyCommandAliases = <String>{};
   for (final alias in aliases.values) {
     final values = <String, String>{};
     final identityFiles = <String>[];
+    var hasProxyCommand = false;
+    var hasProxyRoute = false;
     for (final block in blocks) {
       if (!_blockMatches(block, alias)) continue;
       for (final directive in block.directives) {
@@ -112,6 +131,18 @@ SshConfigParseResult parseOpenSshConfig(String source) {
                   !identityFiles.contains(path)) {
                 identityFiles.add(path);
               }
+            }
+            break;
+          case 'proxyjump':
+            if (!hasProxyRoute) {
+              hasProxyRoute = true;
+              values[directive.name] = directive.values.first;
+            }
+            break;
+          case 'proxycommand':
+            if (!hasProxyRoute) {
+              hasProxyRoute = true;
+              hasProxyCommand = directive.values.first.toLowerCase() != 'none';
             }
             break;
         }
@@ -142,18 +173,75 @@ SshConfigParseResult parseOpenSshConfig(String source) {
             port: port,
             username: username,
           );
-    hosts.add(
-      SshConfigHost(
-        alias: alias,
-        hostName: hostName,
-        port: port,
-        username: username,
-        identityFile: identityFile,
-      ),
+    hostsByAlias[alias.toLowerCase()] = SshConfigHost(
+      alias: alias,
+      hostName: hostName,
+      port: port,
+      username: username,
+      identityFile: identityFile,
     );
+    proxyJumpByAlias[alias.toLowerCase()] = values['proxyjump'];
+    if (hasProxyCommand) proxyCommandAliases.add(alias.toLowerCase());
     if (identityFiles.length > 1) {
       warnings.add('$alias 配置了多个 IdentityFile；导入了第一个');
     }
+  }
+
+  final hosts = <SshConfigHost>[];
+  for (final alias in aliases.values) {
+    final key = alias.toLowerCase();
+    final host = hostsByAlias[key];
+    if (host == null) continue;
+    if (proxyCommandAliases.contains(key)) {
+      warnings.add('$alias 使用 ProxyCommand；该主机未导入，避免忽略代理后改为直连');
+      continue;
+    }
+
+    final proxyJumpValue = proxyJumpByAlias[key];
+    if (proxyJumpValue == null || proxyJumpValue.toLowerCase() == 'none') {
+      hosts.add(host);
+      continue;
+    }
+    if (proxyJumpValue.contains(',') ||
+        proxyJumpValue.contains('@') ||
+        proxyJumpValue.contains(':') ||
+        proxyJumpValue.trim().isEmpty) {
+      warnings.add('$alias 的 ProxyJump 不是单个 Host 别名；该主机未导入');
+      continue;
+    }
+    final jumpKey = proxyJumpValue.toLowerCase();
+    final jump = hostsByAlias[jumpKey];
+    if (jump == null) {
+      warnings.add('$alias 的 ProxyJump 别名“$proxyJumpValue”未定义；该主机未导入');
+      continue;
+    }
+    if (jumpKey == key) {
+      warnings.add('$alias 的 ProxyJump 指向自身；该主机未导入');
+      continue;
+    }
+    final jumpRoute = proxyJumpByAlias[jumpKey];
+    if ((jumpRoute != null && jumpRoute.toLowerCase() != 'none') ||
+        proxyCommandAliases.contains(jumpKey)) {
+      warnings.add('$alias 的跳板机“${jump.alias}”本身使用代理；多层跳转暂不支持，该主机未导入');
+      continue;
+    }
+
+    hosts.add(
+      SshConfigHost(
+        alias: host.alias,
+        hostName: host.hostName,
+        port: host.port,
+        username: host.username,
+        identityFile: host.identityFile,
+        proxyJump: SshConfigProxyJump(
+          alias: jump.alias,
+          hostName: jump.hostName,
+          port: jump.port,
+          username: jump.username,
+          identityFile: jump.identityFile,
+        ),
+      ),
+    );
   }
 
   return SshConfigParseResult(hosts: hosts, warnings: warnings.toList());

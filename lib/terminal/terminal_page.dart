@@ -3173,6 +3173,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           username: host.username,
           identityFile: host.identityFile,
           sshConfigAlias: host.alias,
+          jumpHost: host.proxyJump == null
+              ? null
+              : SshJumpHost(
+                  name: host.proxyJump!.alias,
+                  address: host.proxyJump!.hostName,
+                  port: host.proxyJump!.port,
+                  username: host.proxyJump!.username,
+                  identityFile: host.proxyJump!.identityFile,
+                  sshConfigAlias: host.proxyJump!.alias,
+                ),
           lastConnectedAt: DateTime.now(),
         );
         if (!existingEndpoints.add(record.endpointKey)) {

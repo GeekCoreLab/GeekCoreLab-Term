@@ -66,21 +66,95 @@ Host node
   ProxyJump gateway
   Match host other
   User ignored
+Host gateway
+  HostName gateway.example.net
+  User jump-user
+  Port 2200
+  IdentityFile ~/.ssh/gateway_ed25519
 Host final
   HostName final.example.net
 ''');
 
         final node = result.hosts.firstWhere((host) => host.alias == 'node');
+        final gateway = node.proxyJump!;
         final finalHost = result.hosts.firstWhere(
           (host) => host.alias == 'final',
         );
         expect(node.identityFile, '~/.ssh/node.example.net_deploy_2022');
+        expect(gateway.alias, 'gateway');
+        expect(gateway.hostName, 'gateway.example.net');
+        expect(gateway.port, 2200);
+        expect(gateway.username, 'jump-user');
+        expect(gateway.identityFile, '~/.ssh/gateway_ed25519');
         expect(result.warnings, contains(contains('Include')));
-        expect(result.warnings, contains(contains('ProxyJump')));
+        expect(result.warnings, isNot(contains(contains('ProxyJump'))));
         expect(result.warnings, contains(contains('Match')));
         expect(finalHost.hostName, 'final.example.net');
       },
     );
+
+    test('does not import routes it cannot preserve safely', () {
+      final result = parseOpenSshConfig('''
+Host missing-route
+  ProxyJump absent
+Host multi-route
+  ProxyJump first,second
+Host command-route
+  ProxyCommand ssh -W %h:%p proxy
+Host gateway
+  HostName gateway.example.net
+''');
+
+      expect(result.hosts.map((host) => host.alias), ['gateway']);
+      expect(result.warnings, contains(contains('别名“absent”未定义')));
+      expect(result.warnings, contains(contains('不是单个 Host 别名')));
+      expect(result.warnings, contains(contains('ProxyCommand')));
+    });
+
+    test('imports ProxyJump none as a direct connection', () {
+      final result = parseOpenSshConfig('''
+Host direct
+  ProxyJump none
+Host *
+  ProxyJump gateway
+''');
+
+      expect(result.hosts.single.alias, 'direct');
+      expect(result.hosts.single.proxyJump, isNull);
+      expect(result.warnings, isEmpty);
+    });
+
+    test('honors the first ProxyJump or ProxyCommand route directive', () {
+      final result = parseOpenSshConfig('''
+Host jump-first
+  ProxyJump gateway
+  ProxyCommand unsafe-command
+Host command-first
+  ProxyCommand unsafe-command
+  ProxyJump gateway
+Host gateway
+''');
+
+      expect(result.hosts.map((host) => host.alias), ['jump-first', 'gateway']);
+      expect(result.hosts.first.proxyJump?.alias, 'gateway');
+      expect(result.warnings, contains(contains('ProxyCommand')));
+    });
+
+    test('rejects self and nested ProxyJump routes', () {
+      final result = parseOpenSshConfig('''
+Host self
+  ProxyJump self
+Host outer
+  ProxyJump middle
+Host middle
+  ProxyJump inner
+Host inner
+''');
+
+      expect(result.hosts.map((host) => host.alias), ['middle', 'inner']);
+      expect(result.warnings, contains(contains('指向自身')));
+      expect(result.warnings, contains(contains('多层跳转暂不支持')));
+    });
 
     test('skips invalid ports and ignores comments outside quotes', () {
       final result = parseOpenSshConfig('''

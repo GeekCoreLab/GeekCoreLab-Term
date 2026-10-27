@@ -40,7 +40,7 @@ class _SshConfigImportDialogState extends State<SshConfigImportDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text(
-              '选择要加入已保存会话的主机。支持 Host、HostName、User、Port 和 IdentityFile。',
+              '选择要加入已保存会话的主机。支持 Host、HostName、User、Port、IdentityFile 和单层 ProxyJump 别名。',
               style: TextStyle(color: colors.onSurfaceVariant),
             ),
             if (widget.warnings.isNotEmpty) ...[
@@ -74,6 +74,7 @@ class _SshConfigImportDialogState extends State<SshConfigImportDialog> {
                     '${host.hostName}:${host.port}',
                     if (host.identityFile != null)
                       '密钥 ${host.identityFile!.split(RegExp(r'[\\/]')).last}',
+                    if (host.proxyJump != null) '经 ${host.proxyJump!.alias}',
                   ].join(' · ');
                   return CheckboxListTile(
                     dense: true,
