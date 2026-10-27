@@ -17,6 +17,12 @@ void main() {
       if (await root.exists()) await root.delete(recursive: true);
     });
 
+    test('preserves backslashes in POSIX file names', () {
+      if (Platform.isWindows) return;
+
+      expect(localFileName('${root.path}/part\\name.txt'), 'part\\name.txt');
+    });
+
     test(
       'lists ordinary files and directories in a stable type order',
       () async {

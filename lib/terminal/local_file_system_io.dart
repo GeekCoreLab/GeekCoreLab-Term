@@ -32,6 +32,15 @@ Future<List<LocalFileEntry>> listLocalDirectory(String path) async {
       entries.add(
         LocalFileEntry(name: name, path: entity.path, isDirectory: true),
       );
+    } else if (type == FileSystemEntityType.link) {
+      entries.add(
+        LocalFileEntry(
+          name: name,
+          path: entity.path,
+          isDirectory: false,
+          isSymbolicLink: true,
+        ),
+      );
     } else if (type == FileSystemEntityType.file) {
       final stat = await entity.stat();
       entries.add(
@@ -43,6 +52,15 @@ Future<List<LocalFileEntry>> listLocalDirectory(String path) async {
           modified: stat.modified,
         ),
       );
+    } else if (type != FileSystemEntityType.notFound) {
+      entries.add(
+        LocalFileEntry(
+          name: name,
+          path: entity.path,
+          isDirectory: false,
+          isOther: true,
+        ),
+      );
     }
   }
   entries.sort((left, right) {
@@ -51,6 +69,18 @@ Future<List<LocalFileEntry>> listLocalDirectory(String path) async {
     return left.name.toLowerCase().compareTo(right.name.toLowerCase());
   });
   return entries;
+}
+
+Future<int> localDirectoryModifiedAtMillis(String path) async {
+  if (await FileSystemEntity.type(path, followLinks: false) !=
+      FileSystemEntityType.directory) {
+    throw FileSystemException('目录在比较期间被替换或移除', path);
+  }
+  final stat = await Directory(path).stat();
+  if (stat.type != FileSystemEntityType.directory) {
+    throw FileSystemException('比较路径不再是目录', path);
+  }
+  return stat.modified.millisecondsSinceEpoch;
 }
 
 Future<bool> localFileExists(String path) async =>
@@ -72,7 +102,8 @@ String localJoinPath(String directory, String name) {
 }
 
 String localFileName(String path) {
-  final normalized = path.replaceAll('\\', '/').replaceAll(RegExp(r'/+$'), '');
+  final platformPath = Platform.isWindows ? path.replaceAll('\\', '/') : path;
+  final normalized = platformPath.replaceAll(RegExp(r'/+$'), '');
   if (normalized.isEmpty) return '';
   return normalized.substring(normalized.lastIndexOf('/') + 1);
 }

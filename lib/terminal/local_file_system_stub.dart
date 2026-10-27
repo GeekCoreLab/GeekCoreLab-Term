@@ -11,6 +11,9 @@ Future<String?> defaultLocalDirectory() async => null;
 Future<List<LocalFileEntry>> listLocalDirectory(String path) =>
     Future.error(UnsupportedError('本地文件浏览在当前平台不可用'));
 
+Future<int> localDirectoryModifiedAtMillis(String path) =>
+    Future.error(UnsupportedError('本地文件浏览在当前平台不可用'));
+
 Future<bool> localFileExists(String path) => Future.value(false);
 
 String localParentDirectory(String path) => path;

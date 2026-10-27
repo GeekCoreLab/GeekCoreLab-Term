@@ -7,6 +7,9 @@ import 'package:flutter/material.dart';
 import 'package:geekcore_term/terminal/local_file_system.dart';
 import 'package:geekcore_term/terminal/file_comparison.dart';
 import 'package:geekcore_term/terminal/file_comparison_dialog.dart';
+import 'package:geekcore_term/terminal/directory_comparison.dart';
+import 'package:geekcore_term/terminal/directory_comparison_dialog.dart';
+import 'package:geekcore_term/terminal/directory_comparison_scan.dart';
 import 'package:geekcore_term/terminal/remote_file_transfer.dart';
 
 class RemoteFileManagerDialog extends StatefulWidget {
@@ -129,7 +132,7 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
     });
     try {
       final absolutePath = await sftp.absolute(path);
-      final entries = await sftp.listdir(absolutePath);
+      final entries = (await sftp.listdir(absolutePath)).toList();
       entries.removeWhere(
         (entry) =>
             entry.filename == '.' ||
@@ -227,6 +230,14 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
   Future<void> _queueUploads() async {
     final path = _remotePath;
     if (_selectedLocalPaths.isEmpty || path == null || _transferring) return;
+    if (_localEntries.any(
+      (entry) =>
+          _selectedLocalPaths.contains(entry.path) &&
+          (entry.isSymbolicLink || entry.isOther),
+    )) {
+      widget.onMessage('本地符号链接或特殊文件不能作为普通文件上传，请取消选择', isError: true);
+      return;
+    }
     setState(() => _transferring = true);
     try {
       await widget.onQueueUploads(
@@ -256,11 +267,11 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
         .where(
           (entry) =>
               _selectedRemotePaths.contains(entry.filename) &&
-              !entry.attr.isDirectory,
+              entry.attr.isFile,
         )
         .toList();
     if (entries.isEmpty) {
-      widget.onMessage('请选择一个或多个远端文件', isError: true);
+      widget.onMessage('请选择一个或多个远端普通文件；目录和符号链接不能下载', isError: true);
       return;
     }
     setState(() => _transferring = true);
@@ -295,8 +306,37 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
     return local.length == 1 &&
         remote.length == 1 &&
         !local.single.isDirectory &&
+        !local.single.isSymbolicLink &&
+        !local.single.isOther &&
         remote.single.attr.isFile;
   }
+
+  bool get _canCompareDirectories {
+    if (!localFileSystemSupported ||
+        _selectedLocalPaths.length != 1 ||
+        _selectedRemotePaths.length != 1) {
+      return false;
+    }
+    final local = _localEntries.where(
+      (entry) => entry.path == _selectedLocalPaths.single,
+    );
+    final remote = _remoteEntries.where(
+      (entry) => entry.filename == _selectedRemotePaths.single,
+    );
+    return local.length == 1 &&
+        remote.length == 1 &&
+        local.single.isDirectory &&
+        remote.single.attr.isDirectory;
+  }
+
+  bool get _canCompareSelection =>
+      _canCompareFiles ||
+      _canCompareDirectories ||
+      (localFileSystemSupported &&
+          _selectedLocalPaths.isEmpty &&
+          _selectedRemotePaths.isEmpty &&
+          _localPath != null &&
+          _remotePath != null);
 
   Future<Uint8List> _readLocalForComparison(String path) async {
     final source = await localFileSource(path);
@@ -361,24 +401,52 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
   bool _sameRemoteFileVersion(SftpFileAttrs left, SftpFileAttrs right) =>
       left.size == right.size && left.modifyTime == right.modifyTime;
 
-  Future<void> _compareSelectedFiles() async {
-    if (!_canCompareFiles || _comparing || _transferring) return;
-    final localPath = _selectedLocalPaths.single;
-    final remoteName = _selectedRemotePaths.single;
+  Future<void> _compareSelected() async {
+    if (!_canCompareSelection || _comparing || _transferring) return;
+    final comparingCurrentDirectories =
+        _selectedLocalPaths.isEmpty && _selectedRemotePaths.isEmpty;
+    final localPath = comparingCurrentDirectories
+        ? _localPath
+        : _selectedLocalPaths.single;
     final remotePath = _remotePath;
     final sftp = _sftp;
-    if (remotePath == null || sftp == null) return;
-    final localEntry = _localEntries.singleWhere(
-      (entry) => entry.path == localPath,
-    );
-    final remoteEntry = _remoteEntries.singleWhere(
-      (entry) => entry.filename == remoteName,
-    );
-    final fullRemotePath = remotePath.endsWith('/')
-        ? '$remotePath$remoteName'
-        : '$remotePath/$remoteName';
+    if (localPath == null || remotePath == null || sftp == null) return;
+    final localEntry = comparingCurrentDirectories
+        ? null
+        : _localEntries.singleWhere((entry) => entry.path == localPath);
+    final remoteEntry = comparingCurrentDirectories
+        ? null
+        : _remoteEntries.singleWhere(
+            (entry) => entry.filename == _selectedRemotePaths.single,
+          );
+    final fullRemotePath = comparingCurrentDirectories
+        ? remotePath
+        : remotePath.endsWith('/')
+        ? '$remotePath${_selectedRemotePaths.single}'
+        : '$remotePath/${_selectedRemotePaths.single}';
     setState(() => _comparing = true);
     try {
+      if (comparingCurrentDirectories ||
+          (localEntry!.isDirectory && remoteEntry!.attr.isDirectory)) {
+        final localTree = await scanLocalDirectoryTree(localPath);
+        final remoteTree = await scanRemoteDirectoryTree(sftp, fullRemotePath);
+        if (!mounted) return;
+        await showDialog<void>(
+          context: context,
+          builder: (context) => DirectoryComparisonDialog(
+            localRoot: localPath,
+            remoteRoot: fullRemotePath,
+            comparison: compareDirectorySnapshots(
+              local: localTree.items,
+              remote: remoteTree.items,
+              isComplete: localTree.isComplete && remoteTree.isComplete,
+              isSnapshotStable:
+                  localTree.isSnapshotStable && remoteTree.isSnapshotStable,
+            ),
+          ),
+        );
+        return;
+      }
       final localBytes = await _readLocalForComparison(localPath);
       final remoteBytes = await _readRemoteForComparison(sftp, fullRemotePath);
       if (!mounted) return;
@@ -387,13 +455,13 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
         builder: (context) => FileComparisonDialog(
           leftName: localEntry.name,
           leftPath: localEntry.path,
-          rightName: remoteEntry.filename,
+          rightName: remoteEntry!.filename,
           rightPath: fullRemotePath,
           comparison: compareFileContents(localBytes, remoteBytes),
         ),
       );
     } catch (error) {
-      if (mounted) widget.onMessage('比较文件失败：$error', isError: true);
+      if (mounted) widget.onMessage('比较失败：$error', isError: true);
     } finally {
       if (mounted) setState(() => _comparing = false);
     }
@@ -712,8 +780,15 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
           colors: colors,
           name: entry.name,
           isDirectory: entry.isDirectory,
+          isSymbolicLink: entry.isSymbolicLink,
           selected: selected,
-          detail: entry.isDirectory ? '文件夹' : _formatBytes(entry.size ?? 0),
+          detail: entry.isSymbolicLink
+              ? '符号链接'
+              : entry.isOther
+              ? '特殊文件'
+              : entry.isDirectory
+              ? '文件夹'
+              : _formatBytes(entry.size ?? 0),
           onTap: () => setState(() {
             if (selected) {
               _selectedLocalPaths.remove(entry.path);
@@ -754,8 +829,11 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
           colors: colors,
           name: entry.filename,
           isDirectory: entry.attr.isDirectory,
+          isSymbolicLink: entry.attr.isSymbolicLink,
           selected: selected,
-          detail: entry.attr.isDirectory
+          detail: entry.attr.isSymbolicLink
+              ? '符号链接'
+              : entry.attr.isDirectory
               ? '文件夹'
               : _formatBytes(entry.attr.size ?? 0),
           onTap: () => setState(() {
@@ -777,6 +855,7 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
     required ColorScheme colors,
     required String name,
     required bool isDirectory,
+    bool isSymbolicLink = false,
     required bool selected,
     required String detail,
     required VoidCallback onTap,
@@ -798,11 +877,17 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
             children: [
               const SizedBox(width: 10),
               Icon(
-                isDirectory
+                isSymbolicLink
+                    ? Icons.link_rounded
+                    : isDirectory
                     ? Icons.folder_rounded
                     : Icons.insert_drive_file_outlined,
                 size: 19,
-                color: isDirectory ? colors.tertiary : colors.onSurfaceVariant,
+                color: isSymbolicLink
+                    ? colors.onSurfaceVariant
+                    : isDirectory
+                    ? colors.tertiary
+                    : colors.onSurfaceVariant,
               ),
               const SizedBox(width: 9),
               Expanded(
@@ -879,7 +964,7 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
         Expanded(
           child: Text(
             localFileSystemSupported
-                ? '双击目录进入；单击选择文件，传输任务进入会话队列。'
+                ? '可比较当前目录或两侧所选文件/目录；双击目录进入，传输任务进入会话队列。'
                 : 'Web 版本可浏览远端目录；本地目录操作需要桌面或移动客户端。',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
@@ -887,8 +972,8 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
           ),
         ),
         TextButton(
-          onPressed: _canCompareFiles && !_comparing && !_transferring
-              ? _compareSelectedFiles
+          onPressed: _canCompareSelection && !_comparing && !_transferring
+              ? _compareSelected
               : null,
           child: _comparing
               ? const SizedBox(

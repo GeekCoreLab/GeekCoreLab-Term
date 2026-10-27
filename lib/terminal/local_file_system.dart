@@ -16,6 +16,9 @@ Future<String?> defaultLocalDirectory() => platform.defaultLocalDirectory();
 Future<List<LocalFileEntry>> listLocalDirectory(String path) =>
     platform.listLocalDirectory(path);
 
+Future<int> localDirectoryModifiedAtMillis(String path) =>
+    platform.localDirectoryModifiedAtMillis(path);
+
 Future<bool> localFileExists(String path) => platform.localFileExists(path);
 
 String localParentDirectory(String path) => platform.localParentDirectory(path);

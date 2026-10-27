@@ -3,6 +3,8 @@ class LocalFileEntry {
     required this.name,
     required this.path,
     required this.isDirectory,
+    this.isSymbolicLink = false,
+    this.isOther = false,
     this.size,
     this.modified,
   });
@@ -10,6 +12,8 @@ class LocalFileEntry {
   final String name;
   final String path;
   final bool isDirectory;
+  final bool isSymbolicLink;
+  final bool isOther;
   final int? size;
   final DateTime? modified;
 }
