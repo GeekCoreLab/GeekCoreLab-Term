@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geekcore_term/terminal/ssh_remote_monitor.dart';
@@ -41,6 +42,35 @@ COUNT\t42
       expect(metrics.topProcesses.first.cpuPercent, 12.5);
     });
 
+    test('parses Windows CPU, memory, system drive and adapter counters', () {
+      final sampledAt = DateTime.utc(2026, 10, 27, 6, 0);
+      final metrics = SshRemoteMetrics.parse('''
+__GEEKCORE_TERM_MONITOR_V1__
+OS\twindows
+CPU\t12.5
+MEM\t16000000\t4000000
+DISK\tC:\\\t1000000\t700000\t300000\t70
+NET\tEthernet\t4000\t6000
+PROC\t1234\t8.5\t1.2\tsshd
+COUNT\t128
+''', sampledAt: sampledAt);
+
+      expect(metrics.platform, SshRemotePlatform.windows);
+      expect(metrics.sampledAt, sampledAt);
+      expect(metrics.load1, isNull);
+      expect(metrics.cpuPercent, 12.5);
+      expect(metrics.memoryUsedPercent, 75);
+      expect(metrics.diskLabel, r'C:\');
+      expect(metrics.diskTotalKiB, 1000000);
+      expect(metrics.diskUsedKiB, 700000);
+      expect(metrics.diskAvailableKiB, 300000);
+      expect(metrics.diskPercent, 70);
+      expect(metrics.networkReceivedBytes, 4000);
+      expect(metrics.networkTransmittedBytes, 6000);
+      expect(metrics.processCount, 128);
+      expect(metrics.topProcesses.single.name, 'sshd');
+    });
+
     test('rejects unsupported hosts with an actionable message', () {
       expect(
         () => SshRemoteMetrics.parse(
@@ -50,7 +80,7 @@ COUNT\t42
           isA<FormatException>().having(
             (error) => error.message,
             'message',
-            contains('只支持 Linux'),
+            contains('Linux /proc'),
           ),
         ),
       );
@@ -123,6 +153,38 @@ COUNT\t42
     expect(command, isNot(contains('rm ')));
     expect(command, isNot(contains('kill ')));
     expect(command, isNot(contains('systemctl')));
+  });
+
+  test('Windows collector is a fixed encoded read-only PowerShell script', () {
+    expect(SshRemoteMonitor.windowsProbeCommand, isNot(contains('\n')));
+    expect(
+      SshRemoteMonitor.windowsProbeCommand,
+      contains('cmd.exe /d /c echo'),
+    );
+    expect(SshRemoteMonitor.windowsSampleCommand.length, lessThan(8000));
+
+    final match = RegExp(
+      r'-EncodedCommand ([A-Za-z0-9+/=]+)$',
+    ).firstMatch(SshRemoteMonitor.windowsSampleCommand);
+    expect(match, isNotNull);
+    final bytes = base64Decode(match!.group(1)!);
+    expect(bytes.length.isEven, isTrue);
+    final units = <int>[];
+    for (var index = 0; index < bytes.length; index += 2) {
+      units.add(bytes[index] | (bytes[index + 1] << 8));
+    }
+    final script = String.fromCharCodes(units);
+
+    expect(
+      script,
+      contains('Get-CimInstance -ClassName Win32_OperatingSystem'),
+    );
+    expect(script, contains('Get-NetAdapterStatistics'));
+    expect(script, contains('Win32_PerfFormattedData_PerfProc_Process'));
+    expect(script, isNot(contains('Stop-Process')));
+    expect(script, isNot(contains('Remove-Item')));
+    expect(script, isNot(contains('Set-Service')));
+    expect(script, isNot(contains('Invoke-Expression')));
   });
 
   test(

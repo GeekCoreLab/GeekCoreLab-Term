@@ -1,6 +1,7 @@
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter/material.dart';
 
+import 'ssh_remote_monitor.dart';
 import 'ssh_remote_monitor_cache.dart';
 
 /// Compact, single-line remote metrics strip for the active SSH session.
@@ -131,13 +132,23 @@ class _SshRemoteMonitorBarState extends State<SshRemoteMonitorBar> {
                                   ),
                                 ]
                               : [
-                                  _MonitorMetric(
-                                    icon: Icons.speed_rounded,
-                                    label: '负载',
-                                    value:
-                                        metrics.load1?.toStringAsFixed(2) ??
-                                        '—',
-                                  ),
+                                  if (metrics.platform ==
+                                      SshRemotePlatform.windows)
+                                    _MonitorMetric(
+                                      icon: Icons.speed_rounded,
+                                      label: 'CPU',
+                                      value: metrics.cpuPercent == null
+                                          ? '—'
+                                          : '${metrics.cpuPercent!.toStringAsFixed(1)}%',
+                                    )
+                                  else
+                                    _MonitorMetric(
+                                      icon: Icons.speed_rounded,
+                                      label: '负载',
+                                      value:
+                                          metrics.load1?.toStringAsFixed(2) ??
+                                          '—',
+                                    ),
                                   _MonitorMetric(
                                     icon: Icons.memory_rounded,
                                     label: '内存',
@@ -147,7 +158,11 @@ class _SshRemoteMonitorBarState extends State<SshRemoteMonitorBar> {
                                   ),
                                   _MonitorMetric(
                                     icon: Icons.storage_rounded,
-                                    label: '根盘',
+                                    label:
+                                        metrics.platform ==
+                                            SshRemotePlatform.windows
+                                        ? '系统盘'
+                                        : '根盘',
                                     value: metrics.diskPercent == null
                                         ? '—'
                                         : '${metrics.diskPercent}%',

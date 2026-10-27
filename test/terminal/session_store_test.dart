@@ -77,6 +77,41 @@ void main() {
       expect(decoded.flowControl, 'hardware');
     });
 
+    test(
+      'round-trips standalone SFTP profiles without duplicating SSH creds',
+      () {
+        final sftp = SessionRecord(
+          id: 'sftp-storage',
+          name: '文件服务器',
+          protocol: SessionProtocol.sftp,
+          address: 'files.example.net',
+          port: 2222,
+          username: 'deploy',
+          sshConfigAlias: 'files',
+          group: '存储',
+          lastConnectedAt: DateTime.utc(2026, 10, 27),
+        );
+        final ssh = SessionRecord(
+          id: 'ssh-storage',
+          name: '终端服务器',
+          protocol: SessionProtocol.ssh,
+          address: sftp.address,
+          port: sftp.port,
+          username: sftp.username,
+          sshConfigAlias: sftp.sshConfigAlias,
+          lastConnectedAt: sftp.lastConnectedAt,
+        );
+
+        final decoded = SessionRecord.fromJson(jsonEncode(sftp.toJson()));
+        expect(decoded.protocol, SessionProtocol.sftp);
+        expect(decoded.address, sftp.address);
+        expect(decoded.username, sftp.username);
+        expect(decoded.group, '存储');
+        expect(decoded.credentialKey, ssh.credentialKey);
+        expect(decoded.endpointKey, isNot(ssh.endpointKey));
+      },
+    );
+
     test('loads records written before optional SSH metadata existed', () {
       final oldJson = jsonEncode({
         'id': 'old',

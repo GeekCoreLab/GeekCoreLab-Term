@@ -85,7 +85,7 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Text(
-                  '${widget.sessionTitle} · Linux · 只读 · 每 5 秒采样',
+                  '${widget.sessionTitle} · ${metrics == null ? '自动识别系统' : _platformName(metrics.platform)} · 只读 · 每 5 秒采样',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: colors.onSurfaceVariant,
                   ),
@@ -122,17 +122,35 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
                         children: [
                           _MetricCard(
                             width: cardWidth,
-                            title: '系统负载',
+                            title: metrics.platform == SshRemotePlatform.windows
+                                ? 'CPU 使用率'
+                                : '系统负载',
                             icon: Icons.speed_rounded,
-                            value: metrics.load1 == null
+                            value: metrics.platform == SshRemotePlatform.windows
+                                ? metrics.cpuPercent == null
+                                      ? '不可用'
+                                      : '${metrics.cpuPercent!.toStringAsFixed(1)}%'
+                                : metrics.load1 == null
                                 ? '不可用'
                                 : metrics.load1!.toStringAsFixed(2),
-                            detail: metrics.load1 == null
+                            detail:
+                                metrics.platform == SshRemotePlatform.windows
+                                ? metrics.cpuPercent == null
+                                      ? 'Windows 未返回 CPU 使用率'
+                                      : '由 Windows 性能计数器提供'
+                                : metrics.load1 == null
                                 ? '内核未返回负载数据'
                                 : '1 分钟 · ${metrics.load5?.toStringAsFixed(2) ?? '—'} / '
                                       '${metrics.load15?.toStringAsFixed(2) ?? '—'}（5 / 15 分钟）',
                             trend: _sparkline(
-                              cache.history.map((m) => m.load1).toList(),
+                              cache.history
+                                  .map(
+                                    (m) =>
+                                        m.platform == SshRemotePlatform.windows
+                                        ? m.cpuPercent
+                                        : m.load1,
+                                  )
+                                  .toList(),
                             ),
                           ),
                           _MetricCard(
@@ -154,7 +172,9 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
                           ),
                           _MetricCard(
                             width: cardWidth,
-                            title: '根文件系统 /',
+                            title: metrics.platform == SshRemotePlatform.windows
+                                ? '系统盘 ${metrics.diskLabel ?? ''}'
+                                : '根文件系统 /',
                             icon: Icons.storage_rounded,
                             value: _diskValue(metrics),
                             detail: metrics.diskPercent == null
@@ -177,7 +197,10 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
                               value: _formatRate(
                                 trafficRate?.receivedBytesPerSecond,
                               ),
-                              detail: '所有非 lo 接口 · RX',
+                              detail:
+                                  metrics.platform == SshRemotePlatform.windows
+                                  ? '所有网卡 · RX'
+                                  : '所有非 lo 接口 · RX',
                               trend: _sparkline(cache.receiveRates),
                             ),
                             _MetricCard(
@@ -187,7 +210,10 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
                               value: _formatRate(
                                 trafficRate?.transmittedBytesPerSecond,
                               ),
-                              detail: '所有非 lo 接口 · TX',
+                              detail:
+                                  metrics.platform == SshRemotePlatform.windows
+                                  ? '所有网卡 · TX'
+                                  : '所有非 lo 接口 · TX',
                               trend: _sparkline(cache.transmitRates),
                             ),
                           ],
@@ -215,7 +241,9 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
                   ],
                   const SizedBox(height: 10),
                   Text(
-                    '趋势共享底部监控栏的数据，保留最近 2 分钟；关闭 SSH 标签后清除。网络速度统计所有非 lo 接口，虚拟网桥可能造成重复计数。负载值需结合远端 CPU 核心数判断。',
+                    metrics.platform == SshRemotePlatform.windows
+                        ? '趋势共享底部监控栏的数据，保留最近 2 分钟；关闭 SSH 标签后清除。Windows 指标通过 PowerShell/CIM 只读采集；网卡统计可能包含虚拟适配器。'
+                        : '趋势共享底部监控栏的数据，保留最近 2 分钟；关闭 SSH 标签后清除。网络速度统计所有非 lo 接口，虚拟网桥可能造成重复计数。负载值需结合远端 CPU 核心数判断。',
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       color: colors.onSurfaceVariant,
                     ),
@@ -248,6 +276,11 @@ class _SshRemoteMonitorDialogState extends State<SshRemoteMonitorDialog> {
     if (used == null || total == null) return '不可用';
     return '${_formatBytes(used * 1024)} / ${_formatBytes(total * 1024)}';
   }
+
+  String _platformName(SshRemotePlatform platform) => switch (platform) {
+    SshRemotePlatform.linux => 'Linux',
+    SshRemotePlatform.windows => 'Windows',
+  };
 
   String _sparkline(List<double?> values) {
     const bars = '▁▂▃▄▅▆▇█';

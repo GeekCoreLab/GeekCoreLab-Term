@@ -1,22 +1,29 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
 
 const _monitorMarker = '__GEEKCORE_TERM_MONITOR_V1__';
 
-/// A bounded, read-only snapshot from a Linux SSH host.
+enum SshRemotePlatform { linux, windows }
+
+/// A bounded, read-only snapshot from a supported SSH host.
 class SshRemoteMetrics {
   const SshRemoteMetrics({
     required this.sampledAt,
+    this.platform = SshRemotePlatform.linux,
     this.load1,
     this.load5,
     this.load15,
+    this.cpuPercent,
     this.memoryTotalKiB,
     this.memoryAvailableKiB,
     this.diskTotalKiB,
     this.diskUsedKiB,
     this.diskAvailableKiB,
     this.diskPercent,
+    this.diskLabel,
     this.processCount,
     this.networkReceivedBytes,
     this.networkTransmittedBytes,
@@ -24,15 +31,18 @@ class SshRemoteMetrics {
   });
 
   final DateTime sampledAt;
+  final SshRemotePlatform platform;
   final double? load1;
   final double? load5;
   final double? load15;
+  final double? cpuPercent;
   final int? memoryTotalKiB;
   final int? memoryAvailableKiB;
   final int? diskTotalKiB;
   final int? diskUsedKiB;
   final int? diskAvailableKiB;
   final int? diskPercent;
+  final String? diskLabel;
   final int? processCount;
   final int? networkReceivedBytes;
   final int? networkTransmittedBytes;
@@ -88,12 +98,15 @@ class SshRemoteMetrics {
     double? load1;
     double? load5;
     double? load15;
+    double? cpuPercent;
+    var platform = SshRemotePlatform.linux;
     int? memoryTotal;
     int? memoryAvailable;
     int? diskTotal;
     int? diskUsed;
     int? diskAvailable;
     int? diskPercent;
+    String? diskLabel;
     int? processCount;
     var networkReceivedBytes = 0;
     var networkTransmittedBytes = 0;
@@ -105,14 +118,27 @@ class SshRemoteMetrics {
       if (fields.isEmpty) continue;
       switch (fields.first) {
         case 'UNSUPPORTED':
-          throw const FormatException('远端主机未提供 Linux /proc 监控接口；当前监控只支持 Linux');
+          throw const FormatException('远端主机未提供 Linux /proc 监控接口');
+        case 'OS' when fields.length >= 2:
+          platform = switch (fields[1].toLowerCase()) {
+            'windows' => SshRemotePlatform.windows,
+            _ => SshRemotePlatform.linux,
+          };
         case 'LOAD' when fields.length >= 4:
           load1 = double.tryParse(fields[1]);
           load5 = double.tryParse(fields[2]);
           load15 = double.tryParse(fields[3]);
+        case 'CPU' when fields.length >= 2:
+          cpuPercent = double.tryParse(fields[1]);
         case 'MEM' when fields.length >= 3:
           memoryTotal = int.tryParse(fields[1]);
           memoryAvailable = int.tryParse(fields[2]);
+        case 'DISK' when fields.length >= 6:
+          diskLabel = fields[1];
+          diskTotal = int.tryParse(fields[2]);
+          diskUsed = int.tryParse(fields[3]);
+          diskAvailable = int.tryParse(fields[4]);
+          diskPercent = int.tryParse(fields[5].replaceAll('%', ''));
         case 'DISK' when fields.length >= 5:
           diskTotal = int.tryParse(fields[1]);
           diskUsed = int.tryParse(fields[2]);
@@ -148,6 +174,7 @@ class SshRemoteMetrics {
     }
 
     if (load1 == null &&
+        cpuPercent == null &&
         memoryTotal == null &&
         diskTotal == null &&
         !hasNetworkCounters) {
@@ -155,15 +182,18 @@ class SshRemoteMetrics {
     }
     return SshRemoteMetrics(
       sampledAt: sampledAt ?? DateTime.now(),
+      platform: platform,
       load1: load1,
       load5: load5,
       load15: load15,
+      cpuPercent: cpuPercent,
       memoryTotalKiB: memoryTotal,
       memoryAvailableKiB: memoryAvailable,
       diskTotalKiB: diskTotal,
       diskUsedKiB: diskUsed,
       diskAvailableKiB: diskAvailable,
       diskPercent: diskPercent,
+      diskLabel: diskLabel,
       processCount: processCount,
       networkReceivedBytes: hasNetworkCounters ? networkReceivedBytes : null,
       networkTransmittedBytes: hasNetworkCounters
@@ -198,9 +228,15 @@ class SshRemoteProcessMetric {
   final double memoryPercent;
 }
 
-/// Collects bounded Linux metrics using a fixed read-only shell script.
+/// Collects bounded Linux or Windows metrics using fixed read-only scripts.
 class SshRemoteMonitor {
   const SshRemoteMonitor();
+
+  static const windowsProbeCommand =
+      'cmd.exe /d /c echo __GEEKCORE_TERM_WINDOWS__';
+
+  static final Expando<Future<SshRemotePlatform>> _platformByClient =
+      Expando<Future<SshRemotePlatform>>('sshRemoteMonitorPlatform');
 
   static const networkCounterAwkProgram = r'''NR > 2 {
   separator = match($0, /:[[:space:]]+[0-9]/)
@@ -234,11 +270,99 @@ fi
     networkCounterAwkProgram,
   );
 
+  static const windowsSampleScript = r'''
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Write-Output '__GEEKCORE_TERM_MONITOR_V1__'
+Write-Output "OS`twindows"
+$os = $null
+try {
+  $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+  $memoryTotalKiB = [int64]$os.TotalVisibleMemorySize
+  $memoryAvailableKiB = [int64]$os.FreePhysicalMemory
+  if ($memoryTotalKiB -gt 0 -and $memoryAvailableKiB -ge 0) {
+    Write-Output ("MEM`t{0}`t{1}" -f $memoryTotalKiB, $memoryAvailableKiB)
+  }
+} catch {}
+try {
+  $systemDrive = [string]$env:SystemDrive
+  $disk = Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop |
+    Where-Object { $_.DeviceID -eq $systemDrive } | Select-Object -First 1
+  if ($null -ne $disk -and [int64]$disk.Size -gt 0) {
+    $totalKiB = [int64][Math]::Floor([double]$disk.Size / 1024)
+    $freeKiB = [int64][Math]::Floor([double]$disk.FreeSpace / 1024)
+    $usedKiB = [Math]::Max(0, $totalKiB - $freeKiB)
+    $diskPercent = [int][Math]::Round($usedKiB * 100.0 / $totalKiB)
+    Write-Output ("DISK`t{0}`t{1}`t{2}`t{3}`t{4}" -f $systemDrive, $totalKiB, $usedKiB, $freeKiB, $diskPercent)
+  }
+} catch {}
+try {
+  $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+    Measure-Object -Property LoadPercentage -Average
+  if ($null -ne $cpu.Average) {
+    $cpuText = ([double]$cpu.Average).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
+    Write-Output ("CPU`t{0}" -f $cpuText)
+  }
+} catch {}
+try {
+  $processes = @(Get-Process -ErrorAction Stop)
+  Write-Output ("COUNT`t{0}" -f $processes.Count)
+} catch {}
+try {
+  if ($memoryTotalKiB -gt 0) {
+    $topProcesses = @(Get-CimInstance -ClassName Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop |
+      Where-Object { [int]$_.IDProcess -gt 0 } |
+      Sort-Object -Property PercentProcessorTime -Descending |
+      Select-Object -First 5)
+    foreach ($process in $topProcesses) {
+      $processId = [int]$process.IDProcess
+      $cpuPercent = [Math]::Min(100.0, [double]$process.PercentProcessorTime / [Math]::Max(1, [Environment]::ProcessorCount))
+      $memoryPercent = [double]$process.WorkingSetPrivate / ($memoryTotalKiB * 1024.0) * 100.0
+      $cpuText = $cpuPercent.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
+      $memoryText = $memoryPercent.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
+      $name = ([string]$process.Name) -replace "[`r`n`t]", ' '
+      Write-Output ("PROC`t{0}`t{1}`t{2}`t{3}" -f $processId, $cpuText, $memoryText, $name)
+    }
+  }
+} catch {}
+try {
+  foreach ($adapter in @(Get-NetAdapterStatistics -ErrorAction Stop)) {
+    $name = ([string]$adapter.Name) -replace "[`r`n`t]", ' '
+    Write-Output ("NET`t{0}`t{1}`t{2}" -f $name, [uint64]$adapter.ReceivedBytes, [uint64]$adapter.SentBytes)
+  }
+} catch {}
+''';
+
+  static final String windowsSampleCommand =
+      'powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand '
+      '${_encodePowerShell(windowsSampleScript)}';
+
+  static String _encodePowerShell(String script) {
+    final units = script.codeUnits;
+    final bytes = Uint8List(units.length * 2);
+    for (var index = 0; index < units.length; index++) {
+      bytes[index * 2] = units[index] & 0xff;
+      bytes[index * 2 + 1] = (units[index] >> 8) & 0xff;
+    }
+    return base64Encode(bytes);
+  }
+
   Future<SshRemoteMetrics> sample(SSHClient client) async {
     if (client.isClosed) throw StateError('SSH 会话已断开');
-    final result = await client
-        .runWithResult(sampleCommand)
-        .timeout(const Duration(seconds: 12));
+    var platformFuture = _platformByClient[client];
+    if (platformFuture == null) {
+      platformFuture = _detectPlatform(client);
+      _platformByClient[client] = platformFuture;
+    }
+    final platform = await platformFuture;
+    final command = platform == SshRemotePlatform.windows
+        ? windowsSampleCommand
+        : sampleCommand;
+    final result = await _runWithTimeout(
+      client,
+      command,
+      const Duration(seconds: 12),
+    );
     final stdout = utf8.decode(result.stdout, allowMalformed: true);
     final stderr = utf8.decode(result.stderr, allowMalformed: true).trim();
     if (stdout.contains('\nUNSUPPORTED\t')) {
@@ -250,5 +374,86 @@ fi
       );
     }
     return SshRemoteMetrics.parse(stdout);
+  }
+
+  Future<SshRemotePlatform> _detectPlatform(SSHClient client) async {
+    final result = await _runWithTimeout(
+      client,
+      windowsProbeCommand,
+      const Duration(seconds: 5),
+    );
+    final stdout = utf8.decode(result.stdout, allowMalformed: true);
+    final hasWindowsMarker = const LineSplitter()
+        .convert(stdout)
+        .any((line) => line.trim() == '__GEEKCORE_TERM_WINDOWS__');
+    return hasWindowsMarker
+        ? SshRemotePlatform.windows
+        : SshRemotePlatform.linux;
+  }
+
+  Future<SSHRunResult> _runWithTimeout(
+    SSHClient client,
+    String command,
+    Duration timeout,
+  ) async {
+    final stopwatch = Stopwatch()..start();
+    final sessionFuture = client.execute(command);
+    late final SSHSession session;
+    try {
+      session = await sessionFuture.timeout(timeout);
+    } on TimeoutException {
+      unawaited(
+        sessionFuture.then<void>(
+          (lateSession) => lateSession.close(),
+          onError: (Object _) {},
+        ),
+      );
+      rethrow;
+    }
+    final remaining = timeout - stopwatch.elapsed;
+    if (remaining <= Duration.zero) {
+      session.close();
+      throw TimeoutException('远端监控命令超时', timeout);
+    }
+    try {
+      return await _collectSession(session).timeout(
+        remaining,
+        onTimeout: () {
+          session.close();
+          throw TimeoutException('远端监控命令超时', timeout);
+        },
+      );
+    } catch (_) {
+      session.close();
+      rethrow;
+    }
+  }
+
+  Future<SSHRunResult> _collectSession(SSHSession session) async {
+    final stdoutFuture = _collectBytes(session.stdout);
+    final stderrFuture = _collectBytes(session.stderr);
+    final streams = await Future.wait<Uint8List>([
+      stdoutFuture,
+      stderrFuture,
+    ], eagerError: true);
+    await session.done;
+    final combinedOutput = BytesBuilder(copy: false)
+      ..add(streams[0])
+      ..add(streams[1]);
+    return SSHRunResult(
+      output: combinedOutput.takeBytes(),
+      stdout: streams[0],
+      stderr: streams[1],
+      exitCode: session.exitCode,
+      exitSignal: session.exitSignal,
+    );
+  }
+
+  Future<Uint8List> _collectBytes(Stream<Uint8List> stream) async {
+    final output = BytesBuilder(copy: false);
+    await for (final chunk in stream) {
+      output.add(chunk);
+    }
+    return output.takeBytes();
   }
 }

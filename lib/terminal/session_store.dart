@@ -6,7 +6,7 @@ import 'remote_transfer_queue_store.dart';
 import 'terminal_macro.dart';
 import 'terminal_input_recording.dart';
 
-enum SessionProtocol { serial, telnet, ssh }
+enum SessionProtocol { serial, telnet, ssh, sftp }
 
 enum TerminalSplitMode {
   none,
@@ -165,8 +165,9 @@ class SshJumpHost {
   }
 
   factory SshJumpHost.fromSession(SessionRecord record) {
-    if (record.protocol != SessionProtocol.ssh) {
-      throw ArgumentError.value(record.protocol, 'record', '必须是 SSH 会话');
+    if (record.protocol != SessionProtocol.ssh &&
+        record.protocol != SessionProtocol.sftp) {
+      throw ArgumentError.value(record.protocol, 'record', '必须使用 SSH 传输');
     }
     if (record.jumpHost != null) {
       throw ArgumentError.value(record.name, 'record', '不支持多层 SSH 跳转');
@@ -237,20 +238,21 @@ class SessionRecord {
       '${protocol.name}:${address.trim().toLowerCase()}:$port',
     SessionProtocol.serial =>
       '${protocol.name}:${address.trim().toLowerCase()}:$port:$dataBits:$parity:$stopBits:$flowControl',
-    SessionProtocol.ssh =>
+    SessionProtocol.ssh || SessionProtocol.sftp =>
       '${protocol.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}',
   };
 
   String get endpointLabel => switch (protocol) {
     SessionProtocol.serial => '$address · $port baud',
     SessionProtocol.telnet => '$address:$port',
-    SessionProtocol.ssh =>
+    SessionProtocol.ssh || SessionProtocol.sftp =>
       jumpHost == null
           ? '$address:$port'
           : '$address:$port · 经 ${jumpHost!.name}',
   };
 
-  String get credentialKey => protocol == SessionProtocol.ssh
+  String get credentialKey =>
+      protocol == SessionProtocol.ssh || protocol == SessionProtocol.sftp
       ? 'ssh:${address.trim().toLowerCase()}:$port${sshConfigAlias == null ? '' : ':config:${sshConfigAlias!.toLowerCase()}'}'
       : endpointKey;
 

@@ -134,8 +134,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       _showMessage('浏览器版本不支持本机 SSH 隧道监听');
       return;
     }
-    if (client == null || tab.sshSession == null) {
-      _showMessage('先连接 SSH 会话，再管理隧道');
+    if (client == null) {
+      _showMessage('先连接 SSH/SFTP 会话，再管理隧道');
       return;
     }
     await showDialog<void>(
@@ -1001,6 +1001,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       _ConnectionKind.telnet =>
         'Telnet ${connection.address}:${connection.port}',
       _ConnectionKind.ssh => 'SSH ${connection.address}:${connection.port}',
+      _ConnectionKind.sftp => 'SFTP ${connection.address}:${connection.port}',
     };
     final tab = _TerminalTab(
       id: id,
@@ -1078,6 +1079,18 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           record.port,
         ),
         SessionProtocol.ssh => _TerminalConnection.ssh(
+          record.address,
+          record.port,
+          sessionTitle: record.name,
+          username: record.username,
+          identityFile: record.identityFile,
+          sshConfigAlias: record.sshConfigAlias,
+          jumpHost: record.jumpHost,
+          webSocketUrl: record.webSocketUrl,
+          portKnockActions: record.portKnockActions,
+          authenticationMode: record.authenticationMode,
+        ),
+        SessionProtocol.sftp => _TerminalConnection.sftp(
           record.address,
           record.port,
           sessionTitle: record.name,
@@ -1243,7 +1256,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           _showMessage('删除会话失败：$error', isError: true);
           return;
         }
-        if (record.protocol == SessionProtocol.ssh) {
+        if ((record.protocol == SessionProtocol.ssh ||
+                record.protocol == SessionProtocol.sftp) &&
+            !updated.any(
+              (item) => item.credentialKey == record.credentialKey,
+            )) {
           try {
             await _sshCredentialStore.delete(record.credentialKey);
           } catch (error) {
@@ -1333,6 +1350,12 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           mode: _ConnectionDialogMode.addSession,
         );
         return;
+      case _NewSessionAction.sftp:
+        await _showConnectionDialog(
+          initialProtocol: _ConnectionKind.sftp,
+          mode: _ConnectionDialogMode.addSession,
+        );
+        return;
       case _NewSessionAction.quickConnect:
         await _showConnectionDialog(
           initialProtocol: kIsWeb
@@ -1363,7 +1386,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         mode: mode,
         savedSshSessions: [
           for (final record in _savedSessions)
-            if (record.protocol == SessionProtocol.ssh &&
+            if ((record.protocol == SessionProtocol.ssh ||
+                    record.protocol == SessionProtocol.sftp) &&
                 record.jumpHost == null)
               record,
         ],
@@ -1556,13 +1580,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
     try {
       final connection = tab.connection;
-      if (kIsWeb && connection.kind != _ConnectionKind.ssh) {
+      if (kIsWeb && !connection.kind.usesSshTransport) {
         throw UnsupportedError('浏览器版本仅支持通过 WebSocket 网关连接 SSH');
       }
-      if (connection.kind == _ConnectionKind.ssh) {
+      if (connection.kind.usesSshTransport) {
         await _openSshSession(tab, connection);
         if (tab.isClosed) return;
-        if (tab.sshSession == null || tab.sshClient == null) {
+        if (tab.sshClient == null ||
+            tab.sshClient!.isClosed ||
+            (connection.kind == _ConnectionKind.ssh &&
+                tab.sshSession == null)) {
           tab.starting = false;
           if (tab.id == _activeTabId) {
             _sidebarSection = _SidebarSection.sessions;
@@ -1570,7 +1597,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           _refresh(tab);
           return;
         }
-        if (tab.id == _activeTabId) {
+        if (tab.id == _activeTabId && connection.kind == _ConnectionKind.ssh) {
           _sidebarSection = _SidebarSection.files;
         }
         tab.starting = false;
@@ -1578,7 +1605,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         _refresh(tab);
         _notifySessionProgress(
           tab,
-          'SSH 登录成功',
+          connection.kind == _ConnectionKind.sftp ? 'SFTP 登录成功' : 'SSH 登录成功',
           tabStatus: connection.connectedStatus,
         );
         return;
@@ -1603,7 +1630,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           cols: tab.columns,
           rows: tab.rows,
         ),
-        _ConnectionKind.ssh => throw StateError('SSH 会话应使用 SSH 客户端启动'),
+        _ConnectionKind.ssh ||
+        _ConnectionKind.sftp => throw StateError('SSH/SFTP 会话应使用 SSH 客户端启动'),
       };
       if (tab.isClosed) {
         unawaited(closeTerminalSession(sessionId: sessionId));
@@ -1628,19 +1656,18 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       _refresh(tab);
     } catch (error) {
       if (tab.isClosed) return;
-      if (tab.connection.kind == _ConnectionKind.ssh &&
-          tab.id == _activeTabId) {
+      if (tab.connection.kind.usesSshTransport && tab.id == _activeTabId) {
         _sidebarSection = _SidebarSection.sessions;
       }
       tab.starting = false;
       tab.status = '${tab.connection.displayName}连接失败';
       tab.errorMessage = error.toString();
       _writeTerminalOutput(tab, '\r\n[启动失败] $error\r\n');
-      if (tab.connection.kind == _ConnectionKind.ssh) {
+      if (tab.connection.kind.usesSshTransport) {
         await _closeSshJumpClient(tab);
         _notifySessionProgress(
           tab,
-          'SSH 登录失败：$error',
+          '${tab.connection.kind == _ConnectionKind.sftp ? 'SFTP' : 'SSH'} 登录失败：$error',
           isError: true,
           tabStatus: 'SSH 登录失败',
         );
@@ -1878,8 +1905,57 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       throw StateError('SSH 认证未完成');
     }
     tab.sshClient = authenticatedClient;
-    _notifySessionProgress(tab, '认证成功，正在打开终端...');
     try {
+      if (connection.kind == _ConnectionKind.sftp) {
+        _notifySessionProgress(tab, '认证成功，正在打开 SFTP 文件浏览...');
+        final sftpClient = await authenticatedClient.sftp().timeout(
+          const Duration(seconds: 15),
+        );
+        try {
+          await sftpClient.stat('.').timeout(const Duration(seconds: 15));
+        } finally {
+          await sftpClient.close();
+        }
+        if (rememberCredentials) {
+          try {
+            await _sshCredentialStore.write(
+              connection.credentialKey,
+              SshCredentials(
+                username: username,
+                password: password,
+                privateKeyPem: trimmedPrivateKey.isEmpty
+                    ? null
+                    : trimmedPrivateKey,
+                privateKeyPassphrase: privateKeyPassphrase,
+              ),
+            );
+          } catch (error) {
+            _showMessage('SFTP 已连接，但凭据保存失败：$error', isError: true);
+          }
+        }
+        unawaited(_recordConnection(connection));
+        unawaited(
+          authenticatedClient.done.then<void>((_) {
+            if (!mounted ||
+                tab.isClosed ||
+                !identical(tab.sshClient, authenticatedClient)) {
+              return;
+            }
+            tab.sshClient = null;
+            tab.status = 'SFTP 连接已断开';
+            tab.errorMessage = 'SSH 传输已关闭，请重新连接后继续浏览文件。';
+            unawaited(_closeSshJumpClient(tab));
+            unawaited(_closeTunnels(tab));
+            if (tab.id == _activeTabId) {
+              _sidebarSection = _SidebarSection.sessions;
+            }
+            _refresh(tab);
+          }),
+        );
+        return;
+      }
+
+      _notifySessionProgress(tab, '认证成功，正在打开终端...');
       final remoteSession = await authenticatedClient.shell(
         pty: SSHPtyConfig(width: tab.columns, height: tab.rows),
         environment: sshTerminalEnvironment(),
@@ -2676,7 +2752,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     if (tab == null) return colors.onSurfaceVariant;
     if (tab.errorMessage != null) return colors.error;
     if (tab.starting || tab.restarting) return colors.tertiary;
-    return tab.isConnected ? colors.primary : colors.onSurfaceVariant;
+    final transportConnected =
+        tab.isConnected ||
+        (tab.connection.kind == _ConnectionKind.sftp &&
+            tab.sshClient?.isClosed == false);
+    return transportConnected ? colors.primary : colors.onSurfaceVariant;
   }
 
   Future<void> _disposeTab(_TerminalTab tab) async {
@@ -2800,6 +2880,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       case _CompactToolbarAction.ssh:
                         unawaited(_handleNewSession(_NewSessionAction.ssh));
                         break;
+                      case _CompactToolbarAction.sftp:
+                        unawaited(_handleNewSession(_NewSessionAction.sftp));
+                        break;
                       case _CompactToolbarAction.serial:
                         unawaited(_handleNewSession(_NewSessionAction.serial));
                         break;
@@ -2874,6 +2957,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                           child: Text('连接 SSH…'),
                         ),
                       const PopupMenuItem(
+                        value: _CompactToolbarAction.sftp,
+                        child: Text('连接 SFTP…'),
+                      ),
+                      const PopupMenuItem(
                         value: _CompactToolbarAction.serial,
                         child: Text('连接串口…'),
                       ),
@@ -2887,7 +2974,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                         value: _CompactToolbarAction.tunnels,
                         child: Text('SSH 隧道…'),
                       ),
-                    if (activeTab?.sshClient != null)
+                    if (activeTab?.connection.kind == _ConnectionKind.ssh &&
+                        activeTab?.sshClient != null)
                       const PopupMenuItem(
                         value: _CompactToolbarAction.monitor,
                         child: Text('远程监控…'),
@@ -3010,6 +3098,12 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   onPressed: () =>
                       unawaited(_handleNewSession(_NewSessionAction.ssh)),
                 ),
+                _ToolbarAction(
+                  icon: Icons.folder_open_rounded,
+                  label: 'SFTP',
+                  onPressed: () =>
+                      unawaited(_handleNewSession(_NewSessionAction.sftp)),
+                ),
                 if (!kIsWeb)
                   IconButton(
                     tooltip: activeTab?.tunnels.isNotEmpty == true
@@ -3024,7 +3118,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       child: const Icon(Icons.account_tree_outlined),
                     ),
                   ),
-                if (activeTab?.sshClient != null)
+                if (activeTab?.connection.kind == _ConnectionKind.ssh &&
+                    activeTab?.sshClient != null)
                   IconButton(
                     tooltip: '远程监控',
                     onPressed: () =>
@@ -3269,6 +3364,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     _TerminalTab? tab,
     ColorScheme colors, {
     double width = 260,
+    bool standalone = false,
   }) {
     Widget placeholder({
       required String title,
@@ -3290,10 +3386,24 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               ),
               const SizedBox(height: 16),
               FilledButton.icon(
-                onPressed: () =>
-                    unawaited(_handleNewSession(_NewSessionAction.ssh)),
-                icon: const Icon(Icons.lock_open_rounded, size: 18),
-                label: const Text('新建 SSH'),
+                onPressed: () => unawaited(
+                  _handleNewSession(
+                    tab?.connection.kind == _ConnectionKind.sftp
+                        ? _NewSessionAction.sftp
+                        : _NewSessionAction.ssh,
+                  ),
+                ),
+                icon: Icon(
+                  tab?.connection.kind == _ConnectionKind.sftp
+                      ? Icons.folder_open_rounded
+                      : Icons.lock_open_rounded,
+                  size: 18,
+                ),
+                label: Text(
+                  tab?.connection.kind == _ConnectionKind.sftp
+                      ? '新建 SFTP'
+                      : '新建 SSH',
+                ),
               ),
             ],
           ),
@@ -3307,15 +3417,22 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         description: '打开 SSH 会话后，可浏览、上传和下载远端文件。',
       );
     }
-    if (tab.connection.kind != _ConnectionKind.ssh) {
+    if (!tab.connection.kind.usesSshTransport) {
       return placeholder(
         title: '当前不是 SSH 会话',
         description: 'SFTP 和 SCP 使用 SSH 连接。切换到 SSH 标签后即可管理远端文件。',
       );
     }
-    if (tab.sshSession == null || tab.sshClient == null) {
+    if (tab.connection.kind == _ConnectionKind.sftp && !standalone) {
+      return placeholder(title: '独立 SFTP 会话', description: '文件管理器已显示在当前工作区。');
+    }
+    if (tab.sshClient == null ||
+        (tab.connection.kind == _ConnectionKind.ssh &&
+            tab.sshSession == null)) {
       return placeholder(
-        title: 'SSH 尚未连接',
+        title: tab.connection.kind == _ConnectionKind.sftp
+            ? 'SFTP 尚未连接'
+            : 'SSH 尚未连接',
         description: tab.status.isEmpty ? '连接 SSH 后即可打开远端文件列表。' : tab.status,
       );
     }
@@ -3326,7 +3443,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         key: ValueKey('remote-files-${tab.id}'),
         client: tab.sshClient!,
         sessionIdentity:
-            '${tab.connection.endpointKey}:${tab.sshClient!.username}',
+            '${tab.connection.remoteFileEndpointKey}:${tab.sshClient!.username}',
         sessionTitle: tab.title,
         initialPath: tab.remoteDirectory,
         refreshToken: tab.remoteRefreshToken,
@@ -3706,6 +3823,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       SessionProtocol.serial => Icons.usb_rounded,
       SessionProtocol.telnet => Icons.lan_rounded,
       SessionProtocol.ssh => Icons.lock_open_rounded,
+      SessionProtocol.sftp => Icons.folder_open_rounded,
     };
     return ListTile(
       dense: true,
@@ -4290,7 +4408,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       child: Row(
                         children: [
                           Icon(
-                            Icons.terminal_rounded,
+                            tab.connection.kind == _ConnectionKind.sftp
+                                ? Icons.folder_open_rounded
+                                : Icons.terminal_rounded,
                             size: 14,
                             color: tab.id == _activeTabId
                                 ? colors.primary
@@ -4359,7 +4479,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               child: Row(
                 children: [
                   Icon(
-                    Icons.terminal_rounded,
+                    tab.connection.kind == _ConnectionKind.sftp
+                        ? Icons.folder_open_rounded
+                        : Icons.terminal_rounded,
                     size: 16,
                     color: selected ? colors.primary : colors.onSurfaceVariant,
                   ),
@@ -4423,6 +4545,36 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   Widget _buildTerminalPane(_TerminalTab tab, ColorScheme colors) {
+    if (tab.connection.kind == _ConnectionKind.sftp) {
+      return SizedBox.expand(
+        key: ValueKey(tab.id),
+        child: Column(
+          children: [
+            if (tab.errorMessage != null)
+              MaterialBanner(
+                content: Text(tab.errorMessage!),
+                leading: Icon(Icons.error_outline, color: colors.error),
+                actions: [
+                  TextButton(
+                    onPressed: () => setState(() => tab.errorMessage = null),
+                    child: const Text('关闭'),
+                  ),
+                ],
+              ),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) => _buildFileSidebar(
+                  tab,
+                  colors,
+                  width: constraints.maxWidth,
+                  standalone: true,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     final terminalTheme = widget.settings.terminalTheme;
     final isActiveSsh =
         tab.id == _activeTabId &&
@@ -4569,6 +4721,12 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             subtitle: '连接远程主机',
             icon: Icons.lock_outline_rounded,
             onTap: () => unawaited(_handleNewSession(_NewSessionAction.ssh)),
+          ),
+          (
+            title: 'SFTP',
+            subtitle: '仅浏览和传输文件',
+            icon: Icons.folder_open_rounded,
+            onTap: () => unawaited(_handleNewSession(_NewSessionAction.sftp)),
           ),
           (
             title: '串口',
@@ -4758,7 +4916,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               const SizedBox(height: 6),
               if (recent.isEmpty)
                 Text(
-                  '成功连接过的串口、Telnet 和 SSH 会显示在这里。',
+                  '成功连接过的串口、Telnet、SSH 和 SFTP 会显示在这里。',
                   style: TextStyle(color: colors.onSurfaceVariant),
                 )
               else
@@ -4771,6 +4929,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                         SessionProtocol.serial => Icons.usb_rounded,
                         SessionProtocol.telnet => Icons.lan_rounded,
                         SessionProtocol.ssh => Icons.lock_open_rounded,
+                        SessionProtocol.sftp => Icons.folder_open_rounded,
                       }, color: colors.primary),
                       title: Text(record.name),
                       subtitle: Text(record.endpointLabel),
@@ -4898,7 +5057,15 @@ class _ToolbarAction extends StatelessWidget {
   );
 }
 
-enum _NewSessionAction { local, serial, telnet, ssh, quickConnect, addSession }
+enum _NewSessionAction {
+  local,
+  serial,
+  telnet,
+  ssh,
+  sftp,
+  quickConnect,
+  addSession,
+}
 
 enum _SshConfigImportSource { defaultConfig, chooseFile }
 
@@ -4915,13 +5082,22 @@ enum _SessionSidebarAction {
   exportBackup,
 }
 
-enum _ConnectionKind { local, serial, telnet, ssh }
+enum _ConnectionKind {
+  local,
+  serial,
+  telnet,
+  ssh,
+  sftp;
+
+  bool get usesSshTransport => this == ssh || this == sftp;
+}
 
 enum _SshAuthMethod { key, password }
 
 enum _CompactToolbarAction {
   localTerminal,
   ssh,
+  sftp,
   sidebarSessions,
   sidebarFiles,
   sidebarAssistant,
@@ -5024,6 +5200,27 @@ class _TerminalConnection {
        stopBits = 1,
        flowControl = 'none';
 
+  const _TerminalConnection.sftp(
+    this.address,
+    this.port, {
+    this.username = '',
+    this.password,
+    this.rememberCredentials = false,
+    this.webSocketUrl = '',
+    this.portKnockActions = const [],
+    this.authenticationMode = SshAuthenticationMode.automatic,
+    this.privateKeyPem,
+    this.privateKeyPassphrase,
+    this.sessionTitle,
+    this.identityFile,
+    this.sshConfigAlias,
+    this.jumpHost,
+  }) : kind = _ConnectionKind.sftp,
+       dataBits = 8,
+       parity = 'none',
+       stopBits = 1,
+       flowControl = 'none';
+
   final _ConnectionKind kind;
   final String address;
   // Serial uses this for baud rate; Telnet uses the TCP port.
@@ -5051,6 +5248,8 @@ class _TerminalConnection {
     _ConnectionKind.telnet => 'Telnet $address:$port',
     _ConnectionKind.ssh =>
       'SSH $address:$port${jumpHost == null ? '' : ' · ${jumpHost!.name}'}',
+    _ConnectionKind.sftp =>
+      'SFTP $address:$port${jumpHost == null ? '' : ' · ${jumpHost!.name}'}',
   };
 
   String get openingStatus => switch (kind) {
@@ -5061,6 +5260,10 @@ class _TerminalConnection {
       jumpHost == null
           ? '正在连接 SSH $address:$port'
           : '正在经 ${jumpHost!.name} 连接 SSH $address:$port',
+    _ConnectionKind.sftp =>
+      jumpHost == null
+          ? '正在连接 SFTP $address:$port'
+          : '正在经 ${jumpHost!.name} 连接 SFTP $address:$port',
   };
 
   String get connectedStatus => switch (kind) {
@@ -5069,6 +5272,8 @@ class _TerminalConnection {
     _ConnectionKind.telnet => 'Telnet 已连接 · $address:$port',
     _ConnectionKind.ssh =>
       'SSH 已连接 · $address:$port${jumpHost == null ? '' : ' · 经 ${jumpHost!.name}'}',
+    _ConnectionKind.sftp =>
+      'SFTP 已连接 · $address:$port${jumpHost == null ? '' : ' · 经 ${jumpHost!.name}'}',
   };
 
   SessionProtocol? get sessionProtocol => switch (kind) {
@@ -5076,6 +5281,7 @@ class _TerminalConnection {
     _ConnectionKind.serial => SessionProtocol.serial,
     _ConnectionKind.telnet => SessionProtocol.telnet,
     _ConnectionKind.ssh => SessionProtocol.ssh,
+    _ConnectionKind.sftp => SessionProtocol.sftp,
   };
 
   String get credentialKey =>
@@ -5089,10 +5295,13 @@ class _TerminalConnection {
       '${kind.name}:${address.trim().toLowerCase()}:$port:$dataBits:$parity:$stopBits:$flowControl',
     _ConnectionKind.telnet =>
       '${kind.name}:${address.trim().toLowerCase()}:$port',
-    _ConnectionKind.ssh =>
+    _ConnectionKind.ssh || _ConnectionKind.sftp =>
       '${kind.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}',
     _ConnectionKind.local => kind.name,
   };
+
+  String get remoteFileEndpointKey =>
+      '${_ConnectionKind.ssh.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}';
 }
 
 class _ConnectionDialogResult {
@@ -5172,12 +5381,10 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
   void initState() {
     super.initState();
     _selectedProtocol = widget.initialProtocol;
-    _portController.text = _selectedProtocol == _ConnectionKind.ssh
-        ? '22'
-        : '23';
-    _portsFuture = kIsWeb
-        ? Future.value(const <SerialPortEntry>[])
-        : listSerialPorts();
+    _portController.text = _selectedProtocol.usesSshTransport ? '22' : '23';
+    _portsFuture = _selectedProtocol == _ConnectionKind.serial && !kIsWeb
+        ? listSerialPorts()
+        : Future.value(const <SerialPortEntry>[]);
   }
 
   @override
@@ -5240,6 +5447,22 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
         sessionTitle: sessionTitle,
         jumpHost: jumpHost,
       ),
+      _ConnectionKind.sftp => _TerminalConnection.sftp(
+        _hostController.text.trim(),
+        int.parse(_portController.text.trim()),
+        username: _usernameController.text.trim(),
+        password: _passwordController.text,
+        privateKeyPem: _privateKeyController.text.trim().isEmpty
+            ? null
+            : _privateKeyController.text,
+        privateKeyPassphrase: _privateKeyPassphraseController.text,
+        rememberCredentials: _rememberCredentials,
+        webSocketUrl: _webSocketUrlController.text.trim(),
+        portKnockActions: _portKnockActions,
+        authenticationMode: _authenticationMode,
+        sessionTitle: sessionTitle,
+        jumpHost: jumpHost,
+      ),
       _ConnectionKind.local => const _TerminalConnection.local(),
     };
     Navigator.of(context).pop(
@@ -5271,25 +5494,32 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
     final colors = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      child: ListTile(
-        selected: selected,
-        selectedTileColor: colors.primaryContainer.withValues(alpha: 0.65),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
-        leading: Icon(icon, color: selected ? colors.primary : null),
-        title: Text(title),
-        subtitle: Text(subtitle),
-        onTap: () {
-          setState(() {
-            if (protocol == _ConnectionKind.ssh &&
-                _portController.text == '23') {
-              _portController.text = '22';
-            } else if (protocol == _ConnectionKind.telnet &&
-                _portController.text == '22') {
-              _portController.text = '23';
-            }
-            _selectedProtocol = protocol;
-          });
-        },
+      child: Material(
+        color: Colors.transparent,
+        child: ListTile(
+          selected: selected,
+          selectedTileColor: colors.primaryContainer.withValues(alpha: 0.65),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+          leading: Icon(icon, color: selected ? colors.primary : null),
+          title: Text(title),
+          subtitle: Text(subtitle),
+          onTap: () {
+            setState(() {
+              if (protocol.usesSshTransport && _portController.text == '23') {
+                _portController.text = '22';
+              } else if (protocol == _ConnectionKind.telnet &&
+                  _portController.text == '22') {
+                _portController.text = '23';
+              }
+              _selectedProtocol = protocol;
+              if (protocol == _ConnectionKind.serial) {
+                _portsFuture = kIsWeb
+                    ? Future.value(const <SerialPortEntry>[])
+                    : listSerialPorts();
+              }
+            });
+          },
+        ),
       ),
     );
   }
@@ -5301,9 +5531,11 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
       children: [
         TextFormField(
           controller: _hostController,
-          autofocus: _selectedProtocol == _ConnectionKind.ssh,
-          decoration: const InputDecoration(
-            labelText: 'SSH 主机名或 IP 地址',
+          autofocus: _selectedProtocol.usesSshTransport,
+          decoration: InputDecoration(
+            labelText: _selectedProtocol == _ConnectionKind.sftp
+                ? 'SFTP 服务器（SSH 主机）'
+                : 'SSH 主机名或 IP 地址',
             hintText: '192.168.1.10',
             prefixIcon: Icon(Icons.dns_rounded),
           ),
@@ -5321,8 +5553,10 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
               child: TextFormField(
                 controller: _portController,
                 keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
-                  labelText: 'SSH 端口',
+                decoration: InputDecoration(
+                  labelText: _selectedProtocol == _ConnectionKind.sftp
+                      ? 'SSH/SFTP 端口'
+                      : 'SSH 端口',
                   hintText: '22',
                   prefixIcon: Icon(Icons.numbers_rounded),
                 ),
@@ -5910,6 +6144,12 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
                             title: 'SSH',
                             subtitle: '加密远程终端',
                           ),
+                          _buildProtocolItem(
+                            protocol: _ConnectionKind.sftp,
+                            icon: Icons.folder_open_rounded,
+                            title: 'SFTP',
+                            subtitle: '仅文件浏览和传输，不启动 Shell',
+                          ),
                           if (!kIsWeb)
                             _buildProtocolItem(
                               protocol: _ConnectionKind.serial,
@@ -5935,6 +6175,7 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
                                 _ConnectionKind.serial => '串口连接',
                                 _ConnectionKind.telnet => 'Telnet 连接',
                                 _ConnectionKind.ssh => 'SSH 连接',
+                                _ConnectionKind.sftp => 'SFTP 文件会话',
                                 _ConnectionKind.local => '本地终端',
                               }, style: Theme.of(context).textTheme.titleLarge),
                               const SizedBox(height: 20),
@@ -5943,7 +6184,7 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
                               else if (_selectedProtocol ==
                                   _ConnectionKind.telnet)
                                 _buildTelnetFields(),
-                              if (_selectedProtocol == _ConnectionKind.ssh)
+                              if (_selectedProtocol.usesSshTransport)
                                 _buildSshFields(),
                             ],
                           ),

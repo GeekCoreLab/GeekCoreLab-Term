@@ -32,7 +32,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('快速开始'), findsOneWidget);
-    for (final title in ['本地终端', 'SSH', '串口', 'Telnet']) {
+    for (final title in ['本地终端', 'SSH', 'SFTP', '串口', 'Telnet']) {
       expect(find.byKey(ValueKey('home-quick-$title')), findsOneWidget);
     }
     await tester.tap(find.byTooltip('更多工具'));
@@ -75,6 +75,33 @@ void main() {
     expect(find.byTooltip('录制键盘输入'), findsOneWidget);
     expect(find.byTooltip('录制宏管理'), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('SFTP quick start opens a file-only connection form', (
+    tester,
+  ) async {
+    final settings = await AppSettingsController.load();
+    addTearDown(settings.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: settings.themeData,
+        home: LocalTerminalPage(settings: settings),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('home-quick-SFTP')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('SFTP 文件会话'), findsOneWidget);
+    expect(find.text('仅文件浏览和传输，不启动 Shell'), findsOneWidget);
+    expect(find.text('SFTP 服务器（SSH 主机）'), findsOneWidget);
+    expect(find.text('SSH/SFTP 端口'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    expect(find.text('Geekcore Term'), findsNWidgets(2));
   });
 
   testWidgets('restores the saved split layout without opening sessions', (
