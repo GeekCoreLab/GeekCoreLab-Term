@@ -35,9 +35,11 @@ import 'package:geekcore_term/terminal/terminal_transcript.dart';
 import 'package:geekcore_term/terminal/terminal_assistant.dart';
 import 'package:geekcore_term/terminal/terminal_assistant_panel.dart';
 import 'package:geekcore_term/terminal/terminal_input_targets.dart';
+import 'package:geekcore_term/terminal/terminal_keyword_highlights.dart';
 import 'package:geekcore_term/terminal/terminal_shortcuts.dart';
 import 'package:geekcore_term/terminal/terminal_tab_order.dart';
 import 'package:geekcore_term/terminal/terminal_link.dart';
+import 'package:geekcore_term/terminal/startup_session_group.dart';
 import 'package:geekcore_term/terminal/terminal_macro.dart';
 import 'package:geekcore_term/terminal/terminal_input_recording.dart';
 import 'package:geekcore_term/terminal/terminal_recorded_macro_dialog.dart';
@@ -75,6 +77,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   int? _activeTabId;
   TerminalSplitMode _splitMode = TerminalSplitMode.none;
   bool _layoutInteractionStarted = false;
+  bool _startupGroupLaunchStarted = false;
+  bool _startupGroupLaunchInProgress = false;
+  bool _startupGroupLaunchCancelled = false;
   final List<int> _splitTabIds = [];
   bool _broadcastSplitInput = false;
   final Set<int> _multiExecTabIds = {};
@@ -116,20 +121,34 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               .where((group) => group.isNotEmpty),
         }.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
       });
+      final startupGroup = widget.settings.startupSessionGroup;
+      if (startupGroup != null) {
+        unawaited(_launchStartupSessionGroup(saved, startupGroup));
+      }
     } catch (error) {
       if (mounted) _showMessage('读取会话记录失败：$error', isError: true);
     }
   }
 
   Future<void> _openSettings() async {
+    await _recordsReady;
+    if (!mounted) return;
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
         builder: (_) => AppSettingsPage(
           settings: widget.settings,
           onClearAppData: _clearAppData,
+          sessionGroups: _sessionGroups,
         ),
       ),
     );
+    if (!mounted) return;
+    final rules = widget.settings.terminalKeywordRules;
+    for (final tab in _tabs) {
+      if (!tab.isClosed) {
+        tab.keywordHighlighter.refreshNow(tab.terminal, rules);
+      }
+    }
   }
 
   Future<void> _openSshTunnelManager(_TerminalTab tab) async {
@@ -871,6 +890,12 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   void _writeTerminalOutput(_TerminalTab tab, String value) {
     tab.terminal.write(value);
+    if (!tab.isClosed) {
+      tab.keywordHighlighter.schedule(
+        tab.terminal,
+        widget.settings.terminalKeywordRules,
+      );
+    }
     if (!tab.isClosed) tab.assistant.observe(value);
     final result = tab.transcript.append(value);
     if (result == TranscriptAppendResult.limitReached && !tab.isClosed) {
@@ -909,6 +934,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
       for (final tab in tabs) {
         tab.focusNode.dispose();
+        tab.keywordHighlighter.dispose();
         tab.terminalController.dispose();
         tab.scrollController.dispose();
         tab.remoteMonitorCache.dispose();
@@ -1059,7 +1085,48 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     _addConnectionTab(const _TerminalConnection.local());
   }
 
-  void _addConnectionTab(_TerminalConnection connection) {
+  Future<void> _launchStartupSessionGroup(
+    List<SessionRecord> savedSessions,
+    String group,
+  ) async {
+    if (_startupGroupLaunchStarted) return;
+    _startupGroupLaunchStarted = true;
+    if (!mounted || _layoutInteractionStarted || _tabs.isNotEmpty) return;
+
+    final sessions = sessionsForStartupGroup(savedSessions, group);
+    if (sessions.isEmpty) {
+      _showMessage('启动分类“$group”中没有已保存的会话');
+      return;
+    }
+    _startupGroupLaunchInProgress = true;
+    try {
+      _showMessage('正在按保存顺序启动“$group”分类（${sessions.length} 个会话）');
+      await startStartupSessionsInOrder(
+        sessions,
+        (record) async {
+          final tab = _addConnectionTab(
+            _connectionFromRecord(record),
+            startImmediately: false,
+            fromStartupGroup: true,
+          );
+          await _startSession(tab);
+        },
+        shouldContinue: () =>
+            mounted && !_clearingAppData && !_startupGroupLaunchCancelled,
+      );
+    } finally {
+      _startupGroupLaunchInProgress = false;
+    }
+  }
+
+  _TerminalTab _addConnectionTab(
+    _TerminalConnection connection, {
+    bool startImmediately = true,
+    bool fromStartupGroup = false,
+  }) {
+    if (_startupGroupLaunchInProgress && !fromStartupGroup) {
+      _startupGroupLaunchCancelled = true;
+    }
     final tab = _createTabState(connection);
     _layoutInteractionStarted = true;
     setState(() {
@@ -1092,7 +1159,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       _activeTabId = tab.id;
     });
     _focusTab(tab);
-    unawaited(_startSession(tab));
+    if (startImmediately) unawaited(_startSession(tab));
+    return tab;
   }
 
   _TerminalConnection _connectionFromRecord(SessionRecord record) =>
@@ -1598,6 +1666,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       tab.focusNode.dispose();
+      tab.keywordHighlighter.dispose();
       tab.terminalController.dispose();
       tab.scrollController.dispose();
       tab.remoteMonitorCache.dispose();
@@ -2870,6 +2939,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.inputRecorder.clear();
       tab.inputFlushTimer?.cancel();
       tab.focusNode.dispose();
+      tab.keywordHighlighter.dispose();
       tab.terminalController.dispose();
       tab.scrollController.dispose();
       tab.remoteMonitorCache.dispose();
@@ -3894,56 +3964,59 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       SessionProtocol.ssh => Icons.lock_open_rounded,
       SessionProtocol.sftp => Icons.folder_open_rounded,
     };
-    return ListTile(
-      dense: true,
-      visualDensity: const VisualDensity(vertical: -1),
-      contentPadding: const EdgeInsets.only(left: 10, right: 2),
-      leading: Icon(protocolIcon, size: 19, color: colors.primary),
-      title: Text(
-        record.name,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-      ),
-      subtitle: Text(
-        record.endpointLabel,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(fontSize: 11, color: colors.onSurfaceVariant),
-      ),
-      onTap: () => _addConnectionTab(_connectionFromRecord(record)),
-      trailing: PopupMenuButton<_RecordAction>(
-        tooltip: '会话操作',
-        onSelected: (action) =>
-            unawaited(_handleRecordAction(record, action, saved)),
-        itemBuilder: (context) => [
-          if (!saved)
-            const PopupMenuItem(
-              value: _RecordAction.save,
-              child: Text('保存到会话记录'),
-            ),
-          if (saved)
-            const PopupMenuItem(
-              value: _RecordAction.rename,
-              child: Text('重命名'),
-            ),
-          if (saved)
-            const PopupMenuItem(
-              value: _RecordAction.delete,
-              child: Text('删除会话'),
-            ),
-          if (saved)
-            const PopupMenuItem(
-              value: _RecordAction.moveGroup,
-              child: Text('移动到分类…'),
-            ),
-          if (!saved)
-            const PopupMenuItem(
-              value: _RecordAction.removeRecent,
-              child: Text('从最近连接移除'),
-            ),
-        ],
-        icon: const Icon(Icons.more_vert_rounded, size: 19),
+    return Material(
+      color: Colors.transparent,
+      child: ListTile(
+        dense: true,
+        visualDensity: const VisualDensity(vertical: -1),
+        contentPadding: const EdgeInsets.only(left: 10, right: 2),
+        leading: Icon(protocolIcon, size: 19, color: colors.primary),
+        title: Text(
+          record.name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+        ),
+        subtitle: Text(
+          record.endpointLabel,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 11, color: colors.onSurfaceVariant),
+        ),
+        onTap: () => _addConnectionTab(_connectionFromRecord(record)),
+        trailing: PopupMenuButton<_RecordAction>(
+          tooltip: '会话操作',
+          onSelected: (action) =>
+              unawaited(_handleRecordAction(record, action, saved)),
+          itemBuilder: (context) => [
+            if (!saved)
+              const PopupMenuItem(
+                value: _RecordAction.save,
+                child: Text('保存到会话记录'),
+              ),
+            if (saved)
+              const PopupMenuItem(
+                value: _RecordAction.rename,
+                child: Text('重命名'),
+              ),
+            if (saved)
+              const PopupMenuItem(
+                value: _RecordAction.delete,
+                child: Text('删除会话'),
+              ),
+            if (saved)
+              const PopupMenuItem(
+                value: _RecordAction.moveGroup,
+                child: Text('移动到分类…'),
+              ),
+            if (!saved)
+              const PopupMenuItem(
+                value: _RecordAction.removeRecent,
+                child: Text('从最近连接移除'),
+              ),
+          ],
+          icon: const Icon(Icons.more_vert_rounded, size: 19),
+        ),
       ),
     );
   }
@@ -7478,6 +7551,8 @@ class _TerminalTab {
   final TerminalTranscript transcript = TerminalTranscript();
   final TerminalAssistantAnalyzer assistant = TerminalAssistantAnalyzer();
   final TerminalInputRecorder inputRecorder = TerminalInputRecorder();
+  late final TerminalKeywordHighlighter keywordHighlighter =
+      TerminalKeywordHighlighter(terminalController);
   final SshRemoteMonitorCache remoteMonitorCache = SshRemoteMonitorCache();
   late final Terminal terminal;
   Uri? pendingExternalLink;

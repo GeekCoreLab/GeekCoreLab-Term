@@ -1,6 +1,11 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
+    show PlatformInt64;
 import 'package:geekcore_term/settings/app_settings.dart';
+import 'package:geekcore_term/src/rust/frb_generated.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
 import 'package:geekcore_term/terminal/terminal_page.dart';
 import 'package:shared_preferences_platform_interface/in_memory_shared_preferences_async.dart';
@@ -122,4 +127,79 @@ void main() {
     expect(find.text('此窗格尚未连接'), findsNWidgets(2));
     expect(find.text('连接会话'), findsNWidgets(2));
   });
+
+  testWidgets('startup group opens saved sessions sequentially and by group', (
+    tester,
+  ) async {
+    await SessionStore().saveSaved([
+      _telnetRecord('first', '10.0.0.1', group: 'ops'),
+      _telnetRecord('other', '10.0.1.1', group: 'dev'),
+      _telnetRecord('second', '10.0.0.2', group: 'ops'),
+    ]);
+    final settings = await AppSettingsController.load();
+    addTearDown(settings.dispose);
+    await settings.setStartupSessionGroup('ops');
+    final api = _MockRustLibApi();
+    RustLib.initMock(api: api);
+    addTearDown(RustLib.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: settings.themeData,
+        home: LocalTerminalPage(settings: settings),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(api.startedTelnetHosts, ['10.0.0.1', '10.0.0.2']);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+  });
+}
+
+SessionRecord _telnetRecord(String id, String host, {required String group}) =>
+    SessionRecord(
+      id: id,
+      name: id,
+      protocol: SessionProtocol.telnet,
+      address: host,
+      port: 23,
+      group: group,
+      lastConnectedAt: DateTime.utc(2026),
+    );
+
+class _MockRustLibApi implements RustLibApi {
+  final List<String> startedTelnetHosts = [];
+
+  @override
+  Future<PlatformInt64> crateApiTerminalStartTelnetSession({
+    required String host,
+    required int port,
+    required int cols,
+    required int rows,
+  }) async {
+    startedTelnetHosts.add(host);
+    return startedTelnetHosts.length;
+  }
+
+  @override
+  Future<void> crateApiTerminalCloseTerminalSession({
+    required PlatformInt64 sessionId,
+  }) async {}
+
+  @override
+  Stream<Uint8List> crateApiTerminalReadTerminalOutput({
+    required PlatformInt64 sessionId,
+  }) => const Stream.empty();
+
+  @override
+  Future<void> crateApiTerminalResizeTerminalSession({
+    required PlatformInt64 sessionId,
+    required int cols,
+    required int rows,
+  }) async {}
+
+  @override
+  noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

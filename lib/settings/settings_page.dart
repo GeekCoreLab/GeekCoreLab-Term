@@ -6,17 +6,20 @@ import 'package:flutter/services.dart';
 
 import 'app_settings.dart';
 import '../terminal/terminal_shortcuts.dart';
+import '../terminal/terminal_keyword_highlights.dart';
 import 'window_state.dart';
 
 class AppSettingsPage extends StatefulWidget {
   const AppSettingsPage({
     required this.settings,
     required this.onClearAppData,
+    this.sessionGroups = const [],
     super.key,
   });
 
   final AppSettingsController settings;
   final Future<void> Function() onClearAppData;
+  final List<String> sessionGroups;
 
   @override
   State<AppSettingsPage> createState() => _AppSettingsPageState();
@@ -99,6 +102,15 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
     }
   }
 
+  Future<void> _saveStartupSessionGroup(String? group) async {
+    try {
+      await widget.settings.setStartupSessionGroup(group);
+      if (mounted) setState(() {});
+    } catch (error) {
+      if (mounted) _showMessage('保存启动会话分类失败：$error', isError: true);
+    }
+  }
+
   Future<void> _editTerminalShortcut(TerminalShortcutAction action) async {
     final current = widget.settings.terminalShortcuts[action]!;
     final binding = await showDialog<TerminalShortcutBinding>(
@@ -123,6 +135,48 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
     }
   }
 
+  Future<void> _addTerminalKeywordRule() async {
+    if (widget.settings.terminalKeywordRules.length >=
+        maxTerminalKeywordRules) {
+      _showMessage('关键字规则最多 $maxTerminalKeywordRules 条', isError: true);
+      return;
+    }
+    final rule = await showDialog<TerminalKeywordRule>(
+      context: context,
+      builder: (_) => const _TerminalKeywordRuleDialog(),
+    );
+    if (rule == null || !mounted) return;
+    if (widget.settings.terminalKeywordRules.any(
+      (existing) =>
+          existing.keyword.toLowerCase() == rule.keyword.toLowerCase(),
+    )) {
+      _showMessage('关键字“${rule.keyword}”已存在', isError: true);
+      return;
+    }
+    try {
+      await widget.settings.setTerminalKeywordRules([
+        ...widget.settings.terminalKeywordRules,
+        rule,
+      ]);
+      if (mounted) setState(() {});
+    } catch (error) {
+      if (mounted) _showMessage('保存关键字规则失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _removeTerminalKeywordRule(TerminalKeywordRule rule) async {
+    try {
+      await widget.settings.setTerminalKeywordRules(
+        widget.settings.terminalKeywordRules
+            .where((item) => item != rule)
+            .toList(),
+      );
+      if (mounted) setState(() {});
+    } catch (error) {
+      if (mounted) _showMessage('删除关键字规则失败：$error', isError: true);
+    }
+  }
+
   Future<void> _confirmClearAppData() async {
     final accepted = await showDialog<bool>(
       context: context,
@@ -130,7 +184,7 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
         icon: const Icon(Icons.delete_forever_outlined),
         title: const Text('清除应用数据？'),
         content: const Text(
-          '这会删除已保存和最近连接、SSH 登录凭据与主机信任、主题和窗口设置、终端布局、主密码，并关闭当前打开的会话。此操作无法撤销。',
+          '这会删除已保存和最近连接、SSH 登录凭据与主机信任、终端主题和关键字高亮、启动会话组、窗口设置、终端布局、主密码，并关闭当前打开的会话。此操作无法撤销。',
         ),
         actions: [
           TextButton(
@@ -180,6 +234,14 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
     final colors = Theme.of(context).colorScheme;
     final fontSize = _terminalFontSizeDraft ?? settings.terminalFontSize;
     final fontFamily = _terminalFontFamilyDraft ?? settings.terminalFontFamily;
+    final sessionGroups = widget.sessionGroups
+        .where((group) => group.trim().isNotEmpty)
+        .toSet()
+        .toList();
+    final startupSessionGroup =
+        sessionGroups.contains(settings.startupSessionGroup)
+        ? settings.startupSessionGroup
+        : null;
     final clearButton = OutlinedButton.icon(
       onPressed: _clearing ? null : _confirmClearAppData,
       style: OutlinedButton.styleFrom(
@@ -327,6 +389,56 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
                 ),
                 const SizedBox(height: 16),
                 _SettingsSection(
+                  icon: Icons.highlight_alt_rounded,
+                  title: '终端关键字高亮',
+                  subtitle: '按字面匹配终端缓冲区文本，不修改远端 ANSI 输出',
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (settings.terminalKeywordRules.isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Text(
+                            '尚未添加规则；新增后会应用到当前打开的终端和后续输出。',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ),
+                      for (final rule in settings.terminalKeywordRules)
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: CircleAvatar(
+                            radius: 9,
+                            backgroundColor: rule.color,
+                          ),
+                          title: Text(rule.keyword),
+                          subtitle: Text(
+                            rule.caseSensitive ? '区分大小写' : '不区分大小写',
+                          ),
+                          trailing: IconButton(
+                            tooltip: '删除“${rule.keyword}”规则',
+                            onPressed: _clearing
+                                ? null
+                                : () => unawaited(
+                                    _removeTerminalKeywordRule(rule),
+                                  ),
+                            icon: const Icon(Icons.delete_outline_rounded),
+                          ),
+                        ),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: OutlinedButton.icon(
+                          onPressed: _clearing
+                              ? null
+                              : () => unawaited(_addTerminalKeywordRule()),
+                          icon: const Icon(Icons.add_rounded),
+                          label: const Text('添加关键字'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _SettingsSection(
                   icon: Icons.timer_outlined,
                   title: 'SSH 连接保活',
                   subtitle: '定期发送 SSH 保活请求，帮助维持空闲连接',
@@ -352,6 +464,47 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
                               unawaited(_saveSshKeepAliveSeconds(seconds));
                             }
                           },
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _SettingsSection(
+                  icon: Icons.folder_special_outlined,
+                  title: '启动会话组',
+                  subtitle: '下次启动时自动打开已保存会话；默认关闭',
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (sessionGroups.isEmpty) ...[
+                        Text(
+                          '先在侧栏创建会话分类并保存会话，再选择启动分类。',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        const SizedBox(height: 12),
+                      ],
+                      DropdownButtonFormField<String>(
+                        key: ValueKey(startupSessionGroup ?? ''),
+                        initialValue: startupSessionGroup ?? '',
+                        decoration: const InputDecoration(
+                          labelText: '启动时打开',
+                          border: OutlineInputBorder(),
+                        ),
+                        items: [
+                          const DropdownMenuItem(
+                            value: '',
+                            child: Text('关闭自动启动'),
+                          ),
+                          for (final group in sessionGroups)
+                            DropdownMenuItem(value: group, child: Text(group)),
+                        ],
+                        onChanged: _clearing
+                            ? null
+                            : (group) => unawaited(
+                                _saveStartupSessionGroup(
+                                  group == null || group.isEmpty ? null : group,
+                                ),
+                              ),
+                      ),
+                    ],
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -824,6 +977,111 @@ class _MasterPasswordDialogState extends State<_MasterPasswordDialog> {
                 ? '移除主密码'
                 : '保存',
           ),
+        ),
+      ],
+    );
+  }
+}
+
+class _TerminalKeywordRuleDialog extends StatefulWidget {
+  const _TerminalKeywordRuleDialog();
+
+  @override
+  State<_TerminalKeywordRuleDialog> createState() =>
+      _TerminalKeywordRuleDialogState();
+}
+
+class _TerminalKeywordRuleDialogState
+    extends State<_TerminalKeywordRuleDialog> {
+  static const _colors = <(int, String)>[
+    (0x70EF4444, '红'),
+    (0x70F97316, '橙'),
+    (0x70EAB308, '黄'),
+    (0x704ADE80, '绿'),
+    (0x7060A5FA, '蓝'),
+    (0x70C084FC, '紫'),
+  ];
+
+  final _keywordController = TextEditingController();
+  int _colorValue = _colors.first.$1;
+  bool _caseSensitive = false;
+
+  @override
+  void dispose() {
+    _keywordController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final keyword = _keywordController.text.trim();
+    if (keyword.isEmpty) return;
+    Navigator.pop(
+      context,
+      TerminalKeywordRule(
+        keyword: keyword,
+        colorValue: _colorValue,
+        caseSensitive: _caseSensitive,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('添加终端关键字'),
+      content: SizedBox(
+        width: 440,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _keywordController,
+              autofocus: true,
+              maxLength: 128,
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => _submit(),
+              decoration: const InputDecoration(
+                labelText: '关键字或短语',
+                hintText: '例如 ERROR、timeout、连接失败',
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text('高亮颜色', style: Theme.of(context).textTheme.labelLarge),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final (value, label) in _colors)
+                  ChoiceChip(
+                    selected: _colorValue == value,
+                    avatar: CircleAvatar(
+                      radius: 8,
+                      backgroundColor: Color(value),
+                    ),
+                    label: Text(label),
+                    onSelected: (_) => setState(() => _colorValue = value),
+                  ),
+              ],
+            ),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('区分大小写'),
+              value: _caseSensitive,
+              onChanged: (value) => setState(() => _caseSensitive = value),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: _keywordController.text.trim().isEmpty ? null : _submit,
+          child: const Text('添加'),
         ),
       ],
     );

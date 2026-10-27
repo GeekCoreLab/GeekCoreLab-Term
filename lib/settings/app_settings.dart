@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xterm/xterm.dart';
 
 import '../terminal/terminal_shortcuts.dart';
+import '../terminal/terminal_keyword_highlights.dart';
 
 enum AppThemeStyle { light, emerald, ocean, graphite }
 
@@ -103,6 +104,8 @@ class AppSettingsController extends ChangeNotifier {
     required this._rememberWindowBounds,
     required this._windowBounds,
     required this._terminalShortcuts,
+    required List<TerminalKeywordRule> terminalKeywordRules,
+    required this._startupSessionGroup,
     required String? passwordSalt,
     required String? passwordVerifier,
   }) : // The constructor uses a public named parameter for the private field.
@@ -112,6 +115,7 @@ class AppSettingsController extends ChangeNotifier {
        _terminalFontFamily = terminalFontFamily,
        // ignore: prefer_initializing_formals
        _sshKeepAliveSeconds = sshKeepAliveSeconds,
+       _terminalKeywordRules = List.unmodifiable(terminalKeywordRules),
        _passwordSalt = passwordSalt,
        _passwordVerifier = passwordVerifier,
        _isLocked = passwordSalt != null && passwordVerifier != null;
@@ -130,6 +134,10 @@ class AppSettingsController extends ChangeNotifier {
   static const _windowHeightKey = 'geekcore_term.settings.window_height.v1';
   static const _terminalShortcutsKey =
       'geekcore_term.settings.terminal_shortcuts.v1';
+  static const _terminalKeywordRulesKey =
+      'geekcore_term.settings.terminal_keyword_rules.v1';
+  static const _startupSessionGroupKey =
+      'geekcore_term.settings.startup_session_group.v1';
   static const _passwordSaltKey = 'geekcore_term.settings.password_salt.v1';
   static const _passwordVerifierKey =
       'geekcore_term.settings.password_verifier.v1';
@@ -143,6 +151,8 @@ class AppSettingsController extends ChangeNotifier {
   TerminalFontFamily _terminalFontFamily;
   int _sshKeepAliveSeconds;
   Map<TerminalShortcutAction, TerminalShortcutBinding> _terminalShortcuts;
+  List<TerminalKeywordRule> _terminalKeywordRules;
+  String? _startupSessionGroup;
   bool _rememberWindowBounds;
   WindowBounds? _windowBounds;
   String? _passwordSalt;
@@ -167,6 +177,12 @@ class AppSettingsController extends ChangeNotifier {
     final terminalShortcuts = _parseTerminalShortcuts(
       await preferences.getString(_terminalShortcutsKey),
     );
+    final terminalKeywordRules = _parseTerminalKeywordRules(
+      await preferences.getString(_terminalKeywordRulesKey),
+    );
+    final startupSessionGroup = await preferences.getString(
+      _startupSessionGroupKey,
+    );
     final bounds =
         left == null || top == null || width == null || height == null
         ? null
@@ -186,6 +202,8 @@ class AppSettingsController extends ChangeNotifier {
           await preferences.getBool(_rememberWindowKey) ?? true,
       windowBounds: bounds?.isUsable == true ? bounds : null,
       terminalShortcuts: terminalShortcuts,
+      terminalKeywordRules: terminalKeywordRules,
+      startupSessionGroup: startupSessionGroup,
       passwordSalt: salt,
       passwordVerifier: verifier,
     );
@@ -197,6 +215,9 @@ class AppSettingsController extends ChangeNotifier {
   int get sshKeepAliveSeconds => _sshKeepAliveSeconds;
   Map<TerminalShortcutAction, TerminalShortcutBinding> get terminalShortcuts =>
       Map.unmodifiable(_terminalShortcuts);
+  List<TerminalKeywordRule> get terminalKeywordRules =>
+      List.unmodifiable(_terminalKeywordRules);
+  String? get startupSessionGroup => _startupSessionGroup;
   bool get rememberWindowBounds => _rememberWindowBounds;
   WindowBounds? get windowBounds => _windowBounds;
   bool get hasMasterPassword =>
@@ -342,6 +363,64 @@ class AppSettingsController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> setTerminalKeywordRules(List<TerminalKeywordRule> rules) async {
+    if (rules.length > maxTerminalKeywordRules) {
+      throw ArgumentError.value(
+        rules.length,
+        'rules',
+        '关键字规则最多 $maxTerminalKeywordRules 条',
+      );
+    }
+    final seen = <String>{};
+    final normalizedRules = <TerminalKeywordRule>[];
+    for (final rule in rules) {
+      final keyword = rule.keyword.trim();
+      if (keyword.isEmpty ||
+          keyword.runes.length > 128 ||
+          keyword.contains('\n') ||
+          keyword.contains('\r') ||
+          rule.colorValue < 0 ||
+          rule.colorValue > 0xFFFFFFFF) {
+        throw ArgumentError.value(rule, 'rule', '关键字规则无效');
+      }
+      if (!seen.add(keyword.toLowerCase())) {
+        throw ArgumentError.value(rule, 'rule', '关键字不能重复');
+      }
+      normalizedRules.add(
+        TerminalKeywordRule(
+          keyword: keyword,
+          colorValue: rule.colorValue,
+          caseSensitive: rule.caseSensitive,
+        ),
+      );
+    }
+    await _preferences.setString(
+      _terminalKeywordRulesKey,
+      jsonEncode(normalizedRules.map((rule) => rule.toJson()).toList()),
+    );
+    _terminalKeywordRules = List.unmodifiable(normalizedRules);
+    notifyListeners();
+  }
+
+  Future<void> setStartupSessionGroup(String? group) async {
+    final normalized = group?.trim();
+    if (normalized != null &&
+        (normalized.isEmpty ||
+            normalized.runes.length > 80 ||
+            normalized.contains('\n') ||
+            normalized.contains('\r'))) {
+      throw ArgumentError.value(group, 'group', '启动会话分类名称无效');
+    }
+    if (_startupSessionGroup == normalized) return;
+    if (normalized == null) {
+      await _preferences.remove(_startupSessionGroupKey);
+    } else {
+      await _preferences.setString(_startupSessionGroupKey, normalized);
+    }
+    _startupSessionGroup = normalized;
+    notifyListeners();
+  }
+
   Future<void> setRememberWindowBounds(bool remember) async {
     if (_rememberWindowBounds == remember) return;
     await _preferences.setBool(_rememberWindowKey, remember);
@@ -414,6 +493,8 @@ class AppSettingsController extends ChangeNotifier {
     _terminalFontFamily = TerminalFontFamily.system;
     _sshKeepAliveSeconds = 10;
     _terminalShortcuts = defaultTerminalShortcutBindings;
+    _terminalKeywordRules = const [];
+    _startupSessionGroup = null;
     _rememberWindowBounds = true;
     _windowBounds = null;
     _passwordSalt = null;
@@ -448,6 +529,27 @@ class AppSettingsController extends ChangeNotifier {
       return Map.of(defaultTerminalShortcutBindings);
     }
     return shortcuts;
+  }
+
+  static List<TerminalKeywordRule> _parseTerminalKeywordRules(String? encoded) {
+    if (encoded == null) return const [];
+    try {
+      final decoded = jsonDecode(encoded);
+      if (decoded is! List) return const [];
+      final rules = <TerminalKeywordRule>[];
+      final seen = <String>{};
+      for (final value in decoded) {
+        final rule = TerminalKeywordRule.tryParse(value);
+        if (rule == null || !seen.add(rule.keyword.trim().toLowerCase())) {
+          continue;
+        }
+        rules.add(rule);
+        if (rules.length == maxTerminalKeywordRules) break;
+      }
+      return List.unmodifiable(rules);
+    } on Object {
+      return const [];
+    }
   }
 }
 
