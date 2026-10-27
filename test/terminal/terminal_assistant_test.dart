@@ -112,6 +112,16 @@ void main() {
     expect(find.text('Could not resolve hostname'), findsOneWidget);
     expect(find.textContaining('不会自动执行'), findsOneWidget);
     expect(find.text('getent ahosts HOSTNAME'), findsOneWidget);
+    expect(find.text('排错命令本'), findsOneWidget);
+
+    // Expand troubleshoot command drawer
+    await tester.tap(find.text('排错命令本'));
+    await tester.pumpAndSettle();
+    expect(find.text('网络与端口排查'), findsOneWidget);
+    expect(find.text('服务与日志 (systemd)'), findsOneWidget);
+    expect(find.text('资源与进程 (CPU/内存/磁盘)'), findsOneWidget);
+    expect(find.text('系统环境与安全'), findsOneWidget);
+
     expect(tester.takeException(), isNull);
   });
 

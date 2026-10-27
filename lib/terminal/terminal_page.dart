@@ -3536,6 +3536,13 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                     onToggleInlineHints: (value) => unawaited(
                       widget.settings.setTerminalAssistantInlineHints(value),
                     ),
+                    onInsertCommand: (cmd) async {
+                      if (activeTab != null && activeTab.isConnected) {
+                        activeTab.focusNode.requestFocus();
+                        activeTab.terminal.paste(cmd);
+                        _showMessage('已将排错命令粘贴到终端；未自动发送 Enter');
+                      }
+                    },
                   ),
                 Expanded(child: terminalArea),
                 if (_assistantPanelOpen) ...[
@@ -3552,6 +3559,13 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                     onToggleInlineHints: (value) => unawaited(
                       widget.settings.setTerminalAssistantInlineHints(value),
                     ),
+                    onInsertCommand: (cmd) async {
+                      if (activeTab != null && activeTab.isConnected) {
+                        activeTab.focusNode.requestFocus();
+                        activeTab.terminal.paste(cmd);
+                        _showMessage('已将排错命令粘贴到终端；未自动发送 Enter');
+                      }
+                    },
                   ),
                 ],
               ],
@@ -4438,6 +4452,14 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               onToggleInlineHints: (value) => unawaited(
                 widget.settings.setTerminalAssistantInlineHints(value),
               ),
+              onInsertCommand: (cmd) async {
+                final tab = _activeTab;
+                if (tab != null && tab.isConnected) {
+                  tab.focusNode.requestFocus();
+                  tab.terminal.paste(cmd);
+                  _showMessage('已将排错命令粘贴到终端；未自动发送 Enter');
+                }
+              },
               width: width,
             ),
           };
