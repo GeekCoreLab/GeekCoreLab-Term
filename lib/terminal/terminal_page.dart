@@ -1200,7 +1200,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     tab.inputWriteQueue = tab.inputWriteQueue
         .then((_) async {
           if (sshSession != null) {
-            sshSession.stdin.add(Uint8List.fromList(data));
+            await sshSession.stdin.addStream(
+              Stream<Uint8List>.value(Uint8List.fromList(data)),
+            );
             await sshSession.flush();
           } else if (sessionId != null) {
             await writeTerminalInput(sessionId: sessionId, data: data);
