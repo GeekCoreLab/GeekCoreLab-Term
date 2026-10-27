@@ -36,6 +36,8 @@ import 'package:geekcore_term/terminal/terminal_assistant_panel.dart';
 import 'package:geekcore_term/terminal/terminal_input_targets.dart';
 import 'package:geekcore_term/terminal/terminal_shortcuts.dart';
 import 'package:geekcore_term/terminal/terminal_macro.dart';
+import 'package:geekcore_term/terminal/terminal_input_recording.dart';
+import 'package:geekcore_term/terminal/terminal_recorded_macro_dialog.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
 import 'package:geekcore_term/settings/settings_page.dart';
@@ -237,6 +239,247 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       );
     } catch (error) {
       _showMessage('读取命令宏失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _openTerminalRecordedMacroManager() async {
+    try {
+      await _recordsReady;
+      final macros = await _sessionStore.loadRecordedMacros();
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => TerminalRecordedMacroManagerDialog(
+          initialMacros: macros,
+          onSave: _sessionStore.saveRecordedMacros,
+          onRun: _reviewAndRunTerminalRecordedMacro,
+        ),
+      );
+    } catch (error) {
+      _showMessage('读取录制宏失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _toggleTerminalInputRecording(_TerminalTab tab) async {
+    final recorder = tab.inputRecorder;
+    if (recorder.isRecording) {
+      recorder.stop();
+      _refresh(tab);
+      if (!recorder.hasData) {
+        recorder.clear();
+        _showMessage('录制已停止，没有捕获到输入');
+        return;
+      }
+      await _saveRecordedInputMacro(tab);
+      return;
+    }
+    if (recorder.hasData) {
+      await _saveRecordedInputMacro(tab);
+      return;
+    }
+    if (tab.isClosed || !tab.isConnected) {
+      _showMessage('请先连接终端会话，再开始录制', isError: true);
+      return;
+    }
+
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('开始录制键盘输入？'),
+        content: const Text(
+          '录制会捕获键盘、中文输入和粘贴内容，包括可能输入的密码或令牌。保存的宏位于本机应用数据中且不会加密。请不要录入敏感信息。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('开始录制'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || accepted != true) return;
+    if (tab.isClosed || !tab.isConnected || recorder.hasData) {
+      _showMessage('会话状态已变化，未开始录制', isError: true);
+      return;
+    }
+    recorder.start();
+    _refresh(tab);
+    _showMessage('正在录制 ${tab.title} 的键盘输入；再次点击可停止并保存');
+  }
+
+  Future<bool> _saveRecordedInputMacro(_TerminalTab tab) async {
+    final recorder = tab.inputRecorder;
+    recorder.stop();
+    if (!recorder.hasData) {
+      recorder.clear();
+      _refresh(tab);
+      _showMessage('录制内容为空');
+      return true;
+    }
+
+    final draft = recorder.snapshot(id: 'recording-preview', name: '预览');
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => TerminalRecordedMacroNameDialog(
+        preview: draft.preview,
+        eventCount: draft.events.length,
+        totalBytes: draft.totalBytes,
+      ),
+    );
+    if (!mounted || tab.isClosed) return false;
+    if (name == null) {
+      _refresh(tab);
+      return false;
+    }
+
+    try {
+      await _recordsReady;
+      final macros = await _sessionStore.loadRecordedMacros();
+      final normalizedName = name.trim().toLowerCase();
+      if (macros.any((macro) => macro.name.toLowerCase() == normalizedName)) {
+        _showMessage('已存在同名录制宏，请使用其他名称', isError: true);
+        return false;
+      }
+      if (macros.length >= TerminalRecordedMacro.maxSavedMacros) {
+        _showMessage(
+          '最多保存 ${TerminalRecordedMacro.maxSavedMacros} 个录制宏；请先删除旧宏',
+          isError: true,
+        );
+        return false;
+      }
+      final idBase =
+          'recorded-${DateTime.now().microsecondsSinceEpoch}-tab-${tab.id}';
+      var id = idBase;
+      var suffix = 1;
+      while (macros.any((macro) => macro.id == id)) {
+        id = '$idBase-${suffix++}';
+      }
+      final macro = recorder.snapshot(id: id, name: name);
+      await _sessionStore.saveRecordedMacros([...macros, macro]);
+      recorder.clear();
+      _refresh(tab);
+      _showMessage('已保存录制宏“${macro.name}”');
+      return true;
+    } catch (error) {
+      _showMessage('保存录制宏失败：$error；录制内容仍保留', isError: true);
+      return false;
+    }
+  }
+
+  Future<void> _reviewAndRunTerminalRecordedMacro(
+    TerminalRecordedMacro macro,
+    TerminalRecordedMacroRunControl runControl,
+  ) async {
+    final source = _activeTab;
+    if (source == null || source.isClosed || !source.isConnected) {
+      _showMessage('请先连接一个终端会话', isError: true);
+      return;
+    }
+    final targetIds = terminalInputTargetIds(
+      sourceTabId: source.id,
+      connectedTabIds: _tabs
+          .where((tab) => tab.isConnected && !tab.isClosed)
+          .map((tab) => tab.id),
+      splitTabIds: _splitTabIds,
+      selectedTabIds: _multiExecTabIds,
+      broadcastSplitInput:
+          _broadcastSplitInput && _splitMode != TerminalSplitMode.none,
+    );
+    final targets = [
+      for (final tab in _tabs)
+        if (targetIds.contains(tab.id) && tab.isConnected && !tab.isClosed)
+          _TerminalMacroTarget.capture(tab),
+    ];
+    if (targets.isEmpty) {
+      _showMessage('没有可回放宏的已连接终端', isError: true);
+      return;
+    }
+
+    // Preserve already typed bytes before adding the recorded playback to each
+    // session's serialized input queue.
+    _flushInput(source);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => TerminalRecordedMacroReviewDialog(
+        macro: macro,
+        targetNames: targets.map((target) => target.displayName).toList(),
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+    if (targets.any((target) => !_isMacroTargetCurrent(target))) {
+      _showMessage('目标会话已断开或重连；未回放录制宏', isError: true);
+      return;
+    }
+
+    var abortRequested = false;
+    _TerminalRecordedMacroRunFailure? abortFailure;
+    final writes = <Future<void>>[];
+    for (final target in targets) {
+      final tab = target.tab;
+      final operation = tab.inputWriteQueue.then((_) async {
+        try {
+          await executeTerminalRecordedMacro(
+            macro: macro,
+            canContinue: (completedEvents) {
+              if (abortRequested) return false;
+              if (runControl.isCancelled) {
+                abortRequested = true;
+                abortFailure = _TerminalRecordedMacroRunFailure(
+                  target.displayName,
+                  completedEvents,
+                  '用户停止回放',
+                );
+                return false;
+              }
+              if (!_isMacroTargetCurrent(target)) {
+                abortRequested = true;
+                abortFailure = _TerminalRecordedMacroRunFailure(
+                  target.displayName,
+                  completedEvents,
+                  '会话已断开或重连',
+                );
+                return false;
+              }
+              return true;
+            },
+            write: (input) => _writeMacroInput(target, input),
+          );
+        } catch (error) {
+          if (!abortRequested) {
+            abortRequested = true;
+            final completedEvents = switch (error) {
+              TerminalRecordingStoppedException(:final completedEvents) =>
+                completedEvents,
+              TerminalRecordingWriteException(:final completedEvents) =>
+                completedEvents,
+              _ => 0,
+            };
+            final cause = error is TerminalRecordingWriteException
+                ? error.cause
+                : error;
+            abortFailure = _TerminalRecordedMacroRunFailure(
+              target.displayName,
+              completedEvents,
+              cause.toString(),
+            );
+          }
+        }
+      });
+      tab.inputWriteQueue = operation.catchError((Object _) {});
+      writes.add(operation);
+    }
+    await Future.wait(writes);
+    final failure = abortFailure;
+    if (failure != null) {
+      _showMessage('录制宏回放已中止：$failure', isError: true);
+    } else {
+      _showMessage(
+        '已向 ${targets.length} 个终端回放“${macro.name}”的 ${macro.events.length} 个输入片段',
+      );
     }
   }
 
@@ -576,6 +819,52 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
   }
 
+  Future<bool> _confirmRecordedMacroClose(_TerminalTab tab) async {
+    final recorder = tab.inputRecorder;
+    if (recorder.isRecording) recorder.stop();
+    if (!recorder.hasData) {
+      recorder.clear();
+      _refresh(tab);
+      return true;
+    }
+    _refresh(tab);
+    final action = await showDialog<_TranscriptCloseAction>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('保存录制宏？'),
+        content: const Text('此标签有未保存的键盘输入录制。内容可能包含密码或令牌；保存到本机应用数据前请检查。'),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(context, _TranscriptCloseAction.cancel),
+            child: const Text('取消关闭'),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(context, _TranscriptCloseAction.discard),
+            child: const Text('丢弃录制'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(context, _TranscriptCloseAction.save),
+            child: const Text('保存并关闭'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return false;
+    switch (action) {
+      case _TranscriptCloseAction.save:
+        return _saveRecordedInputMacro(tab);
+      case _TranscriptCloseAction.discard:
+        recorder.clear();
+        return true;
+      case _TranscriptCloseAction.cancel:
+      case null:
+        return false;
+    }
+  }
+
   void _writeTerminalOutput(_TerminalTab tab, String value) {
     tab.terminal.write(value);
     if (!tab.isClosed) tab.assistant.observe(value);
@@ -595,6 +884,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       for (final tab in tabs) {
         tab.isClosed = true;
         tab.transcript.clear();
+        tab.inputRecorder.clear();
         tab.inputFlushTimer?.cancel();
         tab.inputFlushTimer = null;
         tab.pendingInput.takeBytes();
@@ -720,6 +1010,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     tab.terminal = Terminal(
       maxLines: 10000,
       onOutput: (value) => _queueInput(tab, value),
+      onUserInput: (value) => _recordTerminalInput(tab, value),
       onResize: (columns, rows, pixelWidth, pixelHeight) {
         _handleResize(tab, columns, rows);
       },
@@ -1180,6 +1471,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.closing = false;
       return;
     }
+    if (!await _confirmRecordedMacroClose(tab)) {
+      tab.closing = false;
+      return;
+    }
     if (!mounted || tab.isClosed) return;
     final index = _tabs.indexOf(tab);
     if (index < 0) {
@@ -1195,6 +1490,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
 
     tab.isClosed = true;
+    tab.inputRecorder.clear();
     tab.inputFlushTimer?.cancel();
     tab.inputFlushTimer = null;
     tab.pendingInput.takeBytes();
@@ -2064,6 +2360,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   void _handleSshSessionExit(_TerminalTab tab, SSHClient client) {
     if (!identical(tab.sshClient, client)) return;
+    _stopInputRecordingOnDisconnect(tab);
     final session = tab.sshSession;
     final exitCode = session?.exitCode;
     final exitSignal = session?.exitSignal;
@@ -2128,6 +2425,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   Future<void> _restartSession(_TerminalTab tab) async {
     if (tab.isClosed || tab.starting || tab.restarting) return;
+    _stopInputRecordingOnDisconnect(tab);
     tab.assistant.reset();
     tab.restarting = true;
     tab.starting = true;
@@ -2148,6 +2446,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   Future<void> _stopSession(_TerminalTab tab) async {
+    _stopInputRecordingOnDisconnect(tab);
     tab.inputFlushTimer?.cancel();
     tab.inputFlushTimer = null;
     _flushInput(tab);
@@ -2198,6 +2497,28 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       const Duration(milliseconds: 12),
       () => _flushInput(tab),
     );
+  }
+
+  void _recordTerminalInput(_TerminalTab tab, String value) {
+    if (!tab.inputRecorder.isRecording) return;
+    if (!tab.inputRecorder.record(value)) {
+      final prefix = tab.id == _activeTabId ? '' : '会话${tab.title}：';
+      _showMessage('$prefix录制达到输入上限，已自动停止；请保存或丢弃这段录制', isError: true);
+      _refresh(tab);
+    }
+  }
+
+  void _stopInputRecordingOnDisconnect(_TerminalTab tab) {
+    if (!tab.inputRecorder.isRecording) return;
+    tab.inputRecorder.stop();
+    if (!tab.inputRecorder.hasData) {
+      tab.inputRecorder.clear();
+      _refresh(tab);
+      return;
+    }
+    _refresh(tab);
+    final prefix = tab.id == _activeTabId ? '' : '会话${tab.title}：';
+    _showMessage('$prefix会话断开，键盘录制已停止；可保存或丢弃录制内容', isError: true);
   }
 
   void _flushInput(_TerminalTab tab) {
@@ -2302,6 +2623,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   void _handleSessionExit(_TerminalTab tab, PlatformInt64 sessionId) {
     if (tab.sessionId == sessionId) {
+      _stopInputRecordingOnDisconnect(tab);
       tab.sessionId = null;
       tab.outputSubscription = null;
       tab.starting = false;
@@ -2396,6 +2718,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   void dispose() {
     for (final tab in _tabs) {
       tab.isClosed = true;
+      tab.inputRecorder.clear();
       tab.inputFlushTimer?.cancel();
       tab.focusNode.dispose();
       tab.terminalController.dispose();
@@ -2413,7 +2736,25 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     final activeTab = _activeTab;
-    final compactToolbar = MediaQuery.sizeOf(context).width < 1600;
+    final viewportWidth = MediaQuery.sizeOf(context).width;
+    final compactToolbar = viewportWidth < 1600;
+    final narrowToolbar = viewportWidth < 600;
+    final terminalArea = Column(
+      children: [
+        _buildTabBar(colors),
+        if (_hasInputBroadcast) _buildInputBroadcastBanner(colors),
+        Expanded(child: _buildTerminalWorkspace(colors)),
+        if (activeTab != null &&
+            activeTab.connection.kind == _ConnectionKind.ssh)
+          SshRemoteMonitorBar(
+            key: ValueKey('remote-monitor-${activeTab.id}'),
+            client: activeTab.sshClient,
+            cache: activeTab.remoteMonitorCache,
+            sessionTitle: activeTab.title,
+            onOpenDetails: () => unawaited(_openSshRemoteMonitor(activeTab)),
+          ),
+      ],
+    );
 
     return Scaffold(
       appBar: AppBar(
@@ -2424,27 +2765,41 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           children: [
             Icon(Icons.terminal_rounded),
             SizedBox(width: 9),
-            Text('Geekcore Term', style: TextStyle(fontSize: 17)),
+            Flexible(
+              child: Text(
+                'Geekcore Term',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 17),
+              ),
+            ),
           ],
         ),
         actions: compactToolbar
             ? [
-                if (!kIsWeb)
+                if (!kIsWeb && !narrowToolbar)
                   IconButton(
                     tooltip: '本地终端',
                     onPressed: _addLocalShellTab,
                     icon: const Icon(Icons.terminal_rounded),
                   ),
-                IconButton(
-                  tooltip: 'SSH',
-                  onPressed: () =>
-                      unawaited(_handleNewSession(_NewSessionAction.ssh)),
-                  icon: const Icon(Icons.lock_open_rounded),
-                ),
+                if (!narrowToolbar)
+                  IconButton(
+                    tooltip: 'SSH',
+                    onPressed: () =>
+                        unawaited(_handleNewSession(_NewSessionAction.ssh)),
+                    icon: const Icon(Icons.lock_open_rounded),
+                  ),
                 PopupMenuButton<_CompactToolbarAction>(
                   tooltip: '更多工具',
                   onSelected: (action) {
                     switch (action) {
+                      case _CompactToolbarAction.localTerminal:
+                        _addLocalShellTab();
+                        break;
+                      case _CompactToolbarAction.ssh:
+                        unawaited(_handleNewSession(_NewSessionAction.ssh));
+                        break;
                       case _CompactToolbarAction.serial:
                         unawaited(_handleNewSession(_NewSessionAction.serial));
                         break;
@@ -2470,6 +2825,25 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       case _CompactToolbarAction.macros:
                         unawaited(_openTerminalMacroManager());
                         break;
+                      case _CompactToolbarAction.inputRecording:
+                        if (activeTab != null) {
+                          unawaited(_toggleTerminalInputRecording(activeTab));
+                        }
+                        break;
+                      case _CompactToolbarAction.recordedMacros:
+                        unawaited(_openTerminalRecordedMacroManager());
+                        break;
+                      case _CompactToolbarAction.sidebarSessions:
+                        unawaited(_openMobileSidebar(_SidebarSection.sessions));
+                        break;
+                      case _CompactToolbarAction.sidebarFiles:
+                        unawaited(_openMobileSidebar(_SidebarSection.files));
+                        break;
+                      case _CompactToolbarAction.sidebarAssistant:
+                        unawaited(
+                          _openMobileSidebar(_SidebarSection.assistant),
+                        );
+                        break;
                       case _CompactToolbarAction.search:
                         unawaited(_openTerminalSearch());
                         break;
@@ -2489,6 +2863,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   },
                   itemBuilder: (context) => [
                     if (!kIsWeb) ...[
+                      if (narrowToolbar)
+                        const PopupMenuItem(
+                          value: _CompactToolbarAction.localTerminal,
+                          child: Text('本地终端'),
+                        ),
+                      if (narrowToolbar)
+                        const PopupMenuItem(
+                          value: _CompactToolbarAction.ssh,
+                          child: Text('连接 SSH…'),
+                        ),
                       const PopupMenuItem(
                         value: _CompactToolbarAction.serial,
                         child: Text('连接串口…'),
@@ -2522,6 +2906,40 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       child: Text('命令宏…'),
                     ),
                     PopupMenuItem(
+                      value: _CompactToolbarAction.inputRecording,
+                      enabled:
+                          activeTab != null &&
+                          (activeTab.isConnected ||
+                              activeTab.inputRecorder.isRecording ||
+                              activeTab.inputRecorder.hasData),
+                      child: Text(
+                        activeTab?.inputRecorder.isRecording == true
+                            ? '停止并保存键盘录制'
+                            : activeTab?.inputRecorder.hasData == true
+                            ? '保存键盘录制'
+                            : '录制键盘输入…',
+                      ),
+                    ),
+                    const PopupMenuItem(
+                      value: _CompactToolbarAction.recordedMacros,
+                      child: Text('录制宏管理…'),
+                    ),
+                    if (narrowToolbar) ...[
+                      const PopupMenuDivider(),
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.sidebarSessions,
+                        child: Text('会话面板'),
+                      ),
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.sidebarFiles,
+                        child: Text('文件面板'),
+                      ),
+                      const PopupMenuItem(
+                        value: _CompactToolbarAction.sidebarAssistant,
+                        child: Text('终端助手面板'),
+                      ),
+                    ],
+                    PopupMenuItem(
                       value: _CompactToolbarAction.search,
                       enabled: _tabs.isNotEmpty,
                       child: const Text('搜索终端输出…'),
@@ -2547,17 +2965,18 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   ),
                   icon: const Icon(Icons.bolt_rounded),
                 ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  child: Tooltip(
-                    message: activeTab?.status ?? '准备就绪',
-                    child: Icon(
-                      Icons.circle,
-                      size: 10,
-                      color: _statusColor(activeTab, colors),
+                if (!narrowToolbar)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    child: Tooltip(
+                      message: activeTab?.status ?? '准备就绪',
+                      child: Icon(
+                        Icons.circle,
+                        size: 10,
+                        color: _statusColor(activeTab, colors),
+                      ),
                     ),
                   ),
-                ),
                 IconButton(
                   tooltip: '设置',
                   onPressed: () => unawaited(_openSettings()),
@@ -2627,6 +3046,39 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   tooltip: '命令宏',
                   onPressed: () => unawaited(_openTerminalMacroManager()),
                   icon: const Icon(Icons.playlist_play_rounded),
+                ),
+                IconButton(
+                  tooltip: activeTab?.inputRecorder.isRecording == true
+                      ? '停止并保存键盘录制'
+                      : activeTab?.inputRecorder.hasData == true
+                      ? '保存键盘录制'
+                      : '录制键盘输入',
+                  onPressed:
+                      activeTab != null &&
+                          (activeTab.isConnected ||
+                              activeTab.inputRecorder.isRecording ||
+                              activeTab.inputRecorder.hasData)
+                      ? () =>
+                            unawaited(_toggleTerminalInputRecording(activeTab))
+                      : null,
+                  color: activeTab?.inputRecorder.isRecording == true
+                      ? colors.error
+                      : activeTab?.inputRecorder.hasData == true
+                      ? colors.primary
+                      : null,
+                  icon: Icon(
+                    activeTab?.inputRecorder.isRecording == true
+                        ? Icons.stop_circle_outlined
+                        : activeTab?.inputRecorder.hasData == true
+                        ? Icons.save_alt_rounded
+                        : Icons.fiber_manual_record_rounded,
+                  ),
+                ),
+                IconButton(
+                  tooltip: '录制宏管理',
+                  onPressed: () =>
+                      unawaited(_openTerminalRecordedMacroManager()),
+                  icon: const Icon(Icons.keyboard_alt_outlined),
                 ),
                 IconButton(
                   tooltip: '搜索终端输出 (Ctrl+F)',
@@ -2708,41 +3160,33 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                 const SizedBox(width: 14),
               ],
       ),
-      body: Row(
-        children: [
-          _buildSidebarRail(colors),
-          VerticalDivider(width: 1, thickness: 1, color: colors.outlineVariant),
-          if (_sidebarSection == _SidebarSection.sessions)
-            _buildSessionSidebar(colors),
-          if (_sidebarSection == _SidebarSection.files)
-            _buildFileSidebar(activeTab, colors),
-          if (_sidebarSection == _SidebarSection.assistant)
-            TerminalAssistantPanel(
-              analyzer: activeTab?.assistant,
-              sessionTitle: activeTab?.title,
-            ),
-          VerticalDivider(width: 1, thickness: 1, color: colors.outlineVariant),
-          Expanded(
-            child: Column(
+      body: narrowToolbar
+          ? terminalArea
+          : Row(
               children: [
-                _buildTabBar(colors),
-                if (_hasInputBroadcast) _buildInputBroadcastBanner(colors),
-                Expanded(child: _buildTerminalWorkspace(colors)),
-                if (activeTab != null &&
-                    activeTab.connection.kind == _ConnectionKind.ssh)
-                  SshRemoteMonitorBar(
-                    key: ValueKey('remote-monitor-${activeTab.id}'),
-                    client: activeTab.sshClient,
-                    cache: activeTab.remoteMonitorCache,
-                    sessionTitle: activeTab.title,
-                    onOpenDetails: () =>
-                        unawaited(_openSshRemoteMonitor(activeTab)),
+                _buildSidebarRail(colors),
+                VerticalDivider(
+                  width: 1,
+                  thickness: 1,
+                  color: colors.outlineVariant,
+                ),
+                if (_sidebarSection == _SidebarSection.sessions)
+                  _buildSessionSidebar(colors),
+                if (_sidebarSection == _SidebarSection.files)
+                  _buildFileSidebar(activeTab, colors),
+                if (_sidebarSection == _SidebarSection.assistant)
+                  TerminalAssistantPanel(
+                    analyzer: activeTab?.assistant,
+                    sessionTitle: activeTab?.title,
                   ),
+                VerticalDivider(
+                  width: 1,
+                  thickness: 1,
+                  color: colors.outlineVariant,
+                ),
+                Expanded(child: terminalArea),
               ],
             ),
-          ),
-        ],
-      ),
     );
   }
 
@@ -2821,12 +3265,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     );
   }
 
-  Widget _buildFileSidebar(_TerminalTab? tab, ColorScheme colors) {
+  Widget _buildFileSidebar(
+    _TerminalTab? tab,
+    ColorScheme colors, {
+    double width = 260,
+  }) {
     Widget placeholder({
       required String title,
       required String description,
     }) => SizedBox(
-      width: 260,
+      width: width,
       child: ColoredBox(
         color: colors.surfaceContainerLow,
         child: Padding(
@@ -2872,21 +3320,24 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       );
     }
 
-    return RemoteFileBrowser(
-      key: ValueKey('remote-files-${tab.id}'),
-      client: tab.sshClient!,
-      sessionIdentity:
-          '${tab.connection.endpointKey}:${tab.sshClient!.username}',
-      sessionTitle: tab.title,
-      initialPath: tab.remoteDirectory,
-      refreshToken: tab.remoteRefreshToken,
-      protocol: tab.fileTransferProtocol,
-      onDirectoryChanged: (path) => tab.remoteDirectory = path,
-      onProtocolChanged: (protocol) => setState(() {
-        tab.fileTransferProtocol = protocol;
-      }),
-      onMessage: (message, {isError}) =>
-          _showMessage(message, isError: isError ?? false),
+    return SizedBox(
+      width: width,
+      child: RemoteFileBrowser(
+        key: ValueKey('remote-files-${tab.id}'),
+        client: tab.sshClient!,
+        sessionIdentity:
+            '${tab.connection.endpointKey}:${tab.sshClient!.username}',
+        sessionTitle: tab.title,
+        initialPath: tab.remoteDirectory,
+        refreshToken: tab.remoteRefreshToken,
+        protocol: tab.fileTransferProtocol,
+        onDirectoryChanged: (path) => tab.remoteDirectory = path,
+        onProtocolChanged: (protocol) => setState(() {
+          tab.fileTransferProtocol = protocol;
+        }),
+        onMessage: (message, {isError}) =>
+            _showMessage(message, isError: isError ?? false),
+      ),
     );
   }
 
@@ -2978,7 +3429,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     tab.terminal.paste(path);
   }
 
-  Widget _buildSessionSidebar(ColorScheme colors) {
+  Widget _buildSessionSidebar(ColorScheme colors, {double width = 260}) {
     final query = _sessionSearch.trim().toLowerCase();
     bool matches(SessionRecord record) =>
         query.isEmpty ||
@@ -2997,7 +3448,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     final recent = _recentSessions.where(matches).toList();
 
     return SizedBox(
-      width: 260,
+      width: width,
       child: ColoredBox(
         color: colors.surfaceContainerLow,
         child: Column(
@@ -3558,6 +4009,98 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
   }
 
+  Future<void> _openMobileSidebar(_SidebarSection initialSection) async {
+    if (!mounted) return;
+    setState(() => _sidebarSection = initialSection);
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          final size = MediaQuery.sizeOf(context);
+          final colors = Theme.of(context).colorScheme;
+          void select(_SidebarSection section) {
+            setState(() => _sidebarSection = section);
+            setSheetState(() {});
+          }
+
+          final width = size.width;
+          final panel = switch (_sidebarSection) {
+            _SidebarSection.sessions => _buildSessionSidebar(
+              colors,
+              width: width,
+            ),
+            _SidebarSection.files => _buildFileSidebar(
+              _activeTab,
+              colors,
+              width: width,
+            ),
+            _SidebarSection.assistant => TerminalAssistantPanel(
+              analyzer: _activeTab?.assistant,
+              sessionTitle: _activeTab?.title,
+              width: width,
+            ),
+          };
+
+          return SafeArea(
+            top: false,
+            child: SizedBox(
+              width: width,
+              height: size.height * 0.8,
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 8, 6),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 34,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: colors.outlineVariant,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        ChoiceChip(
+                          label: const Text('会话'),
+                          selected: _sidebarSection == _SidebarSection.sessions,
+                          onSelected: (_) => select(_SidebarSection.sessions),
+                        ),
+                        const SizedBox(width: 6),
+                        ChoiceChip(
+                          label: const Text('文件'),
+                          selected: _sidebarSection == _SidebarSection.files,
+                          onSelected: (_) => select(_SidebarSection.files),
+                        ),
+                        const SizedBox(width: 6),
+                        ChoiceChip(
+                          label: const Text('助手'),
+                          selected:
+                              _sidebarSection == _SidebarSection.assistant,
+                          onSelected: (_) => select(_SidebarSection.assistant),
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          tooltip: '关闭侧栏',
+                          onPressed: () => Navigator.pop(context),
+                          icon: const Icon(Icons.close_rounded),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Expanded(child: panel),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Widget _buildTabBar(ColorScheme colors) {
     return Material(
       color: colors.surfaceContainerLow,
@@ -3753,6 +4296,17 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                                 ? colors.primary
                                 : colors.onSurfaceVariant,
                           ),
+                          if (tab.inputRecorder.isRecording) ...[
+                            const SizedBox(width: 5),
+                            Tooltip(
+                              message: '正在录制键盘输入',
+                              child: Icon(
+                                Icons.fiber_manual_record_rounded,
+                                size: 12,
+                                color: colors.error,
+                              ),
+                            ),
+                          ],
                           const SizedBox(width: 6),
                           Expanded(
                             child: Text(
@@ -3809,6 +4363,17 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                     size: 16,
                     color: selected ? colors.primary : colors.onSurfaceVariant,
                   ),
+                  if (tab.inputRecorder.isRecording) ...[
+                    const SizedBox(width: 5),
+                    Tooltip(
+                      message: '正在录制键盘输入',
+                      child: Icon(
+                        Icons.fiber_manual_record_rounded,
+                        size: 12,
+                        color: colors.error,
+                      ),
+                    ),
+                  ],
                   const SizedBox(width: 8),
                   Expanded(
                     child: Column(
@@ -3989,6 +4554,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   Widget _buildHomeWorkspace(ColorScheme colors) {
+    final compact = MediaQuery.sizeOf(context).width < 600;
     final recent = _recentSessions.take(6).toList();
     final quickActions =
         <({String title, String subtitle, IconData icon, VoidCallback onTap})>[
@@ -4019,7 +4585,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         ];
     return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.all(32),
+        padding: EdgeInsets.all(compact ? 20 : 32),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 760),
           child: Column(
@@ -4029,21 +4595,27 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                 children: [
                   Icon(Icons.terminal_rounded, size: 36, color: colors.primary),
                   const SizedBox(width: 14),
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        'Geekcore Term',
-                        style: TextStyle(
-                          fontSize: 24,
-                          fontWeight: FontWeight.w600,
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Geekcore Term',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
-                      Text(
-                        '选择连接方式开始，或从会话记录中重新打开常用连接。',
-                        style: TextStyle(color: colors.onSurfaceVariant),
-                      ),
-                    ],
+                        Text(
+                          '选择连接方式开始，或从会话记录中重新打开常用连接。',
+                          maxLines: compact ? 2 : 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: colors.onSurfaceVariant),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
               ),
@@ -4348,6 +4920,11 @@ enum _ConnectionKind { local, serial, telnet, ssh }
 enum _SshAuthMethod { key, password }
 
 enum _CompactToolbarAction {
+  localTerminal,
+  ssh,
+  sidebarSessions,
+  sidebarFiles,
+  sidebarAssistant,
   serial,
   telnet,
   tunnels,
@@ -4355,6 +4932,8 @@ enum _CompactToolbarAction {
   networkDiagnostics,
   snippets,
   macros,
+  inputRecording,
+  recordedMacros,
   search,
   transcript,
   reconnect,
@@ -6513,6 +7092,22 @@ class _TerminalMacroRunFailure {
       '目标“$targetName”停止，已完成 $completedCommands 条命令：$reason。当前行可能已部分发送。';
 }
 
+class _TerminalRecordedMacroRunFailure {
+  const _TerminalRecordedMacroRunFailure(
+    this.targetName,
+    this.completedEvents,
+    this.reason,
+  );
+
+  final String targetName;
+  final int completedEvents;
+  final String reason;
+
+  @override
+  String toString() =>
+      '目标“$targetName”停止，已发送 $completedEvents 个输入片段：$reason。最后一个输入片段可能已部分发送。';
+}
+
 class _TerminalTab {
   _TerminalTab({
     required this.id,
@@ -6532,6 +7127,7 @@ class _TerminalTab {
   final BytesBuilder pendingInput = BytesBuilder(copy: false);
   final TerminalTranscript transcript = TerminalTranscript();
   final TerminalAssistantAnalyzer assistant = TerminalAssistantAnalyzer();
+  final TerminalInputRecorder inputRecorder = TerminalInputRecorder();
   final SshRemoteMonitorCache remoteMonitorCache = SshRemoteMonitorCache();
   late final Terminal terminal;
 

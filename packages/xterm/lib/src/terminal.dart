@@ -47,6 +47,10 @@ class Terminal with Observable implements TerminalState, EscapeHandler {
   /// [keyInput], [mouseInput], or [paste].
   void Function(String data)? onOutput;
 
+  /// Function called for keyboard or text input from the user before it is
+  /// forwarded through [onOutput]. Terminal-generated replies are excluded.
+  void Function(String data)? onUserInput;
+
   /// Function that is called when the dimensions of the terminal change.
   void Function(int width, int height, int pixelWidth, int pixelHeight)?
       onResize;
@@ -76,6 +80,7 @@ class Terminal with Observable implements TerminalState, EscapeHandler {
     this.onTitleChange,
     this.onIconChange,
     this.onOutput,
+    this.onUserInput,
     this.onResize,
     this.platform = TerminalTargetPlatform.unknown,
     this.inputHandler = defaultInputHandler,
@@ -254,7 +259,7 @@ class Terminal with Observable implements TerminalState, EscapeHandler {
     );
 
     if (output != null) {
-      onOutput?.call(output);
+      _emitUserInput(output);
       return true;
     }
 
@@ -277,14 +282,14 @@ class Terminal with Observable implements TerminalState, EscapeHandler {
       // a(97) ~ z(122)
       if (charCode >= Ascii.a && charCode <= Ascii.z) {
         final output = charCode - Ascii.a + 1;
-        onOutput?.call(String.fromCharCode(output));
+        _emitUserInput(String.fromCharCode(output));
         return true;
       }
 
       // [(91) ~ _(95)
       if (charCode >= Ascii.openBracket && charCode <= Ascii.underscore) {
         final output = charCode - Ascii.openBracket + 27;
-        onOutput?.call(String.fromCharCode(output));
+        _emitUserInput(String.fromCharCode(output));
         return true;
       }
     }
@@ -293,7 +298,7 @@ class Terminal with Observable implements TerminalState, EscapeHandler {
       if (charCode >= Ascii.a && charCode <= Ascii.z) {
         final code = charCode - Ascii.a + 65;
         final input = [0x1b, code];
-        onOutput?.call(String.fromCharCodes(input));
+        _emitUserInput(String.fromCharCodes(input));
         return true;
       }
     }
@@ -308,7 +313,7 @@ class Terminal with Observable implements TerminalState, EscapeHandler {
   /// - [charInput]
   /// - [paste]
   void textInput(String text) {
-    onOutput?.call(text);
+    _emitUserInput(text);
   }
 
   /// Similar to [textInput], except that when the program tells the terminal
@@ -320,10 +325,15 @@ class Terminal with Observable implements TerminalState, EscapeHandler {
   /// - [textInput]
   void paste(String text) {
     if (_bracketedPasteMode) {
-      onOutput?.call(_emitter.bracketedPaste(text));
+      _emitUserInput(_emitter.bracketedPaste(text));
     } else {
       textInput(text);
     }
+  }
+
+  void _emitUserInput(String data) {
+    onUserInput?.call(data);
+    onOutput?.call(data);
   }
 
   // Handle a mouse event and return true if it was handled.

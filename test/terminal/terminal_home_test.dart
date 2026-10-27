@@ -35,6 +35,35 @@ void main() {
     for (final title in ['本地终端', 'SSH', '串口', 'Telnet']) {
       expect(find.byKey(ValueKey('home-quick-$title')), findsOneWidget);
     }
+    await tester.tap(find.byTooltip('更多工具'));
+    await tester.pumpAndSettle();
+    expect(find.text('录制键盘输入…'), findsOneWidget);
+    expect(find.text('录制宏管理…'), findsOneWidget);
+    await tester.tap(find.text('录制宏管理…'));
+    await tester.pumpAndSettle();
+    expect(find.text('录制宏'), findsOneWidget);
+    await tester.tap(find.text('关闭'));
+    await tester.pumpAndSettle();
+
+    tester.view.physicalSize = const Size(360, 640);
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    await tester.tap(find.byTooltip('更多工具'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('会话面板'));
+    await tester.pumpAndSettle();
+    expect(find.text('会话记录'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.tap(find.text('助手'));
+    await tester.pumpAndSettle();
+    expect(find.text('终端助手'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.tap(find.text('文件'));
+    await tester.pumpAndSettle();
+    expect(find.text('SFTP / SCP 文件'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.tap(find.byTooltip('关闭侧栏'));
+    await tester.pumpAndSettle();
 
     tester.view.physicalSize = const Size(1280, 800);
     await tester.pumpAndSettle();
@@ -43,6 +72,9 @@ void main() {
     tester.view.physicalSize = const Size(1600, 900);
     await tester.pumpAndSettle();
     expect(find.text('快速连接'), findsOneWidget);
+    expect(find.byTooltip('录制键盘输入'), findsOneWidget);
+    expect(find.byTooltip('录制宏管理'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('restores the saved split layout without opening sessions', (

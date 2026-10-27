@@ -8,6 +8,7 @@ import 'package:geekcore_term/terminal/remote_file_transfer.dart';
 import 'package:geekcore_term/terminal/remote_transfer_queue.dart';
 import 'package:geekcore_term/terminal/remote_transfer_queue_store.dart';
 import 'package:geekcore_term/terminal/terminal_macro.dart';
+import 'package:geekcore_term/terminal/terminal_input_recording.dart';
 
 void main() {
   group('SessionRecord', () {
@@ -224,16 +225,33 @@ void main() {
       name: '健康检查',
       script: 'hostname\nuptime\ndf -h /',
     );
+    final recordedMacro = TerminalRecordedMacro(
+      id: 'recorded-hostname',
+      name: '录制 hostname',
+      events: [
+        TerminalRecordedInputEvent(bytes: utf8.encode('hostname'), delayMs: 0),
+        TerminalRecordedInputEvent(bytes: [0x0D], delayMs: 75),
+      ],
+    );
 
     await store.saveGroups(const ['Production', 'Lab']);
     await store.saveCommandSnippets(const [snippet]);
     await store.saveTerminalMacros([macro]);
+    await expectLater(
+      store.saveRecordedMacros(
+        List.filled(TerminalRecordedMacro.maxSavedMacros + 1, recordedMacro),
+      ),
+      throwsArgumentError,
+    );
+    await store.saveRecordedMacros([recordedMacro]);
 
     expect(await store.loadGroups(), ['Production', 'Lab']);
     expect(await store.loadCommandSnippets(), [snippet]);
     expect(await store.loadTerminalMacros(), [macro]);
+    expect(await store.loadRecordedMacros(), [recordedMacro]);
     await store.clear();
     expect(await store.loadTerminalMacros(), isEmpty);
+    expect(await store.loadRecordedMacros(), isEmpty);
   });
 
   test('SessionStore restores and clears the terminal split layout', () async {

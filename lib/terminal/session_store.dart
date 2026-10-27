@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'remote_transfer_queue_store.dart';
 import 'terminal_macro.dart';
+import 'terminal_input_recording.dart';
 
 enum SessionProtocol { serial, telnet, ssh }
 
@@ -394,6 +395,7 @@ class SessionStore {
   static const _groupsKey = 'geekcore_term.session_groups.v1';
   static const _snippetsKey = 'geekcore_term.command_snippets.v1';
   static const _macrosKey = 'geekcore_term.command_macros.v1';
+  static const _recordedMacrosKey = 'geekcore_term.recorded_macros.v1';
   static const _sshHostKeysKey = 'geekcore_term.ssh_host_keys.v1';
   static const _terminalSplitModeKey = 'geekcore_term.terminal_split_mode.v1';
 
@@ -440,6 +442,20 @@ class SessionStore {
     return macros;
   }
 
+  Future<List<TerminalRecordedMacro>> loadRecordedMacros() async {
+    final encodedMacros =
+        await _preferences.getStringList(_recordedMacrosKey) ?? const [];
+    final macros = <TerminalRecordedMacro>[];
+    for (final encoded in encodedMacros) {
+      try {
+        macros.add(TerminalRecordedMacro.fromJson(encoded));
+      } on Object {
+        // Ignore one malformed recording without losing the rest of the list.
+      }
+    }
+    return macros;
+  }
+
   Future<void> saveSaved(List<SessionRecord> records) =>
       _save(_savedKey, records);
 
@@ -468,12 +484,25 @@ class SessionStore {
     ),
   );
 
+  Future<void> saveRecordedMacros(List<TerminalRecordedMacro> macros) async {
+    if (macros.length > TerminalRecordedMacro.maxSavedMacros) {
+      throw ArgumentError('录制宏不能超过 ${TerminalRecordedMacro.maxSavedMacros} 个');
+    }
+    await _enqueueWrite(
+      () => _preferences.setStringList(
+        _recordedMacrosKey,
+        macros.map((macro) => jsonEncode(macro.toJson())).toList(),
+      ),
+    );
+  }
+
   Future<void> clear() => _enqueueWrite(() async {
     await _preferences.remove(_savedKey);
     await _preferences.remove(_recentKey);
     await _preferences.remove(_groupsKey);
     await _preferences.remove(_snippetsKey);
     await _preferences.remove(_macrosKey);
+    await _preferences.remove(_recordedMacrosKey);
     await _preferences.remove(_sshHostKeysKey);
     await _preferences.remove(_terminalSplitModeKey);
     await _preferences.remove(RemoteTransferQueueStore.storageKey);

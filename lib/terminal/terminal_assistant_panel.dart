@@ -7,21 +7,28 @@ class TerminalAssistantPanel extends StatelessWidget {
   const TerminalAssistantPanel({
     required this.analyzer,
     required this.sessionTitle,
+    this.width = 260,
     super.key,
   });
 
   final TerminalAssistantAnalyzer? analyzer;
   final String? sessionTitle;
+  final double width;
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     return SizedBox(
-      width: 260,
+      width: width,
       child: ColoredBox(
         color: colors.surfaceContainerLow,
         child: analyzer == null
-            ? _emptyPanel(context, '终端助手', '打开终端后，本地助手会分析新输出中的常见故障线索。')
+            ? _emptyPanel(
+                context,
+                '终端助手',
+                '打开终端后，本地助手会分析新输出中的常见故障线索。',
+                width: width,
+              )
             : ListenableBuilder(
                 listenable: analyzer!,
                 builder: (context, _) {
@@ -73,6 +80,7 @@ class TerminalAssistantPanel extends StatelessWidget {
                                 context,
                                 '暂未发现线索',
                                 '只分析后续终端文本，不重扫全部历史。匹配是启发式提示，也可能来自命令回显，不能证明当前主机状态。',
+                                width: width,
                               )
                             : ListView.separated(
                                 padding: const EdgeInsets.all(10),
@@ -99,10 +107,15 @@ class TerminalAssistantPanel extends StatelessWidget {
     );
   }
 
-  Widget _emptyPanel(BuildContext context, String title, String description) {
+  Widget _emptyPanel(
+    BuildContext context,
+    String title,
+    String description, {
+    required double width,
+  }) {
     final colors = Theme.of(context).colorScheme;
     return SizedBox(
-      width: 260,
+      width: width,
       child: ColoredBox(
         color: colors.surfaceContainerLow,
         child: Padding(
