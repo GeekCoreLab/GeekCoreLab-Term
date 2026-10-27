@@ -19,6 +19,7 @@ import 'package:geekcore_term/terminal/ssh_config.dart';
 import 'package:geekcore_term/terminal/ssh_config_file.dart';
 import 'package:geekcore_term/terminal/ssh_config_import_dialog.dart';
 import 'package:geekcore_term/terminal/ssh_identity_file.dart';
+import 'package:geekcore_term/terminal/ssh_terminal_environment.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
@@ -822,6 +823,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     try {
       final remoteSession = await authenticatedClient.shell(
         pty: SSHPtyConfig(width: tab.columns, height: tab.rows),
+        environment: sshTerminalEnvironment(),
       );
       if (tab.isClosed) {
         remoteSession.close();
