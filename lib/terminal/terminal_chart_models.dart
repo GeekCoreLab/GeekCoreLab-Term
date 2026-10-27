@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:xterm/xterm.dart';
 
 /// Represents a parsed disk filesystem entry from `df -h`
 class DfFsEntry {
@@ -100,7 +101,14 @@ class DockerContainerEntry {
   final String ports;
   final String names;
 
-  bool get isRunning => status.toLowerCase().startsWith('up');
+  bool get isRunning {
+    final s = status.trim().toLowerCase();
+    return s.startsWith('up') ||
+        s.contains('up ') ||
+        s.contains('running') ||
+        s.contains('healthy') ||
+        s.contains('运行中');
+  }
 }
 
 /// A captured command block with its range in terminal buffer lines and parsed data
@@ -112,6 +120,8 @@ class CapturedCommandBlock {
     required this.startBufferLine,
     required this.endBufferLine,
     required this.rawOutput,
+    this.startAnchor,
+    this.endAnchor,
     this.dfEntries = const [],
     this.freeStats,
     this.dockerEntries = const [],
@@ -122,12 +132,26 @@ class CapturedCommandBlock {
   final CommandChartType type;
   final int startBufferLine;
   int endBufferLine;
+  final CellAnchor? startAnchor;
+  final CellAnchor? endAnchor;
   final String rawOutput;
   final List<DfFsEntry> dfEntries;
   final FreeMemStats? freeStats;
   final List<DockerContainerEntry> dockerEntries;
 
   bool isRenderMode = true;
+  bool? isFullscreenOverride;
+
+  int get currentStartLine =>
+      (startAnchor != null && startAnchor!.attached) ? startAnchor!.y : startBufferLine;
+
+  int get currentEndLine =>
+      (endAnchor != null && endAnchor!.attached) ? endAnchor!.y : endBufferLine;
+
+  void dispose() {
+    startAnchor?.dispose();
+    endAnchor?.dispose();
+  }
 }
 
 /// Parser for terminal commands and outputs to build GUI charts
@@ -300,81 +324,70 @@ class TerminalCommandChartParser {
     final lines = text.split(RegExp(r'\r?\n'));
     final results = <DockerContainerEntry>[];
     int headerIndex = -1;
-    String headerLine = '';
 
     for (var i = 0; i < lines.length; i++) {
       final line = _stripAnsi(lines[i]);
       if (_dockerHeaderRegex.hasMatch(line) ||
           (line.contains('CONTAINER ID') && line.contains('IMAGE') && line.contains('STATUS'))) {
         headerIndex = i;
-        headerLine = line;
         break;
       }
     }
 
     if (headerIndex == -1) return results;
 
-    // Use column offsets from header if available, or regex fallback
-    final idStart = headerLine.indexOf('CONTAINER ID');
-    final imgStart = headerLine.indexOf('IMAGE');
-    final cmdStart = headerLine.indexOf('COMMAND');
-    final crtStart = headerLine.indexOf('CREATED');
-    final sttStart = headerLine.indexOf('STATUS');
-    final prtStart = headerLine.indexOf('PORTS');
-    final namStart = headerLine.indexOf('NAMES');
-
-    final canSlice = idStart != -1 &&
-        imgStart != -1 &&
-        cmdStart != -1 &&
-        crtStart != -1 &&
-        sttStart != -1 &&
-        prtStart != -1 &&
-        namStart != -1;
+    final statusTokenRegex = RegExp(
+      r'^(Up\b|Exited\b|Created\b|Restarting\b|Paused\b|Dead\b|Removal\b)',
+      caseSensitive: false,
+    );
 
     for (var i = headerIndex + 1; i < lines.length; i++) {
-      final raw = _stripAnsi(lines[i]);
-      if (raw.trim().isEmpty) continue;
+      final raw = _stripAnsi(lines[i]).trim();
+      if (raw.isEmpty) continue;
 
-      if (canSlice && raw.length >= sttStart) {
-        String slice(int start, int next) {
-          if (start >= raw.length) return '';
-          final end = (next > 0 && next < raw.length) ? next : raw.length;
-          return raw.substring(start, end).trim();
-        }
-
-        final id = slice(idStart, imgStart);
-        final img = slice(imgStart, cmdStart);
-        final cmd = slice(cmdStart, crtStart);
-        final crt = slice(crtStart, sttStart);
-        final stt = slice(sttStart, prtStart);
-        final prt = slice(prtStart, namStart);
-        final nam = namStart < raw.length ? raw.substring(namStart).trim() : '';
-
-        if (id.isNotEmpty) {
-          results.add(DockerContainerEntry(
-            containerId: id,
-            image: img,
-            command: cmd,
-            created: crt,
-            status: stt,
-            ports: prt,
-            names: nam,
-          ));
-          continue;
-        }
+      // Skip lines that look like a shell prompt at the end of output
+      if (!RegExp(r'^[0-9a-f]{8,64}\s+').hasMatch(raw)) {
+        continue;
       }
 
-      // Fallback split by 2 or more spaces
-      final parts = raw.trim().split(RegExp(r'\s{2,}'));
-      if (parts.length >= 4) {
+      // Split by 2 or more spaces (docker ps pads columns with at least 2-3 spaces)
+      final parts = raw.split(RegExp(r'\s{2,}'));
+      if (parts.length >= 5) {
+        final id = parts[0].trim();
+        final img = parts[1].trim();
+        final cmd = parts[2].trim();
+
+        // Find which column holds STATUS (typically index 4, or scan for Up/Exited/Created/etc.)
+        var statusIdx = 4;
+        for (var j = 3; j < parts.length; j++) {
+          if (statusTokenRegex.hasMatch(parts[j].trim())) {
+            statusIdx = j;
+            break;
+          }
+        }
+
+        final crt = statusIdx > 3 ? parts.sublist(3, statusIdx).join(' ').trim() : parts[3].trim();
+        final stt = statusIdx < parts.length ? parts[statusIdx].trim() : '';
+
+        String prt = '';
+        String nam = '';
+        final remaining = statusIdx + 1 < parts.length ? parts.sublist(statusIdx + 1) : <String>[];
+        if (remaining.length == 1) {
+          // If PORTS was empty in `docker ps`, the single remaining column is NAMES
+          nam = remaining[0].trim();
+        } else if (remaining.length >= 2) {
+          prt = remaining.sublist(0, remaining.length - 1).join(', ').trim();
+          nam = remaining.last.trim();
+        }
+
         results.add(DockerContainerEntry(
-          containerId: parts[0],
-          image: parts.length > 1 ? parts[1] : '',
-          command: parts.length > 2 ? parts[2] : '',
-          created: parts.length > 3 ? parts[3] : '',
-          status: parts.length > 4 ? parts[4] : '',
-          ports: parts.length > 5 ? parts[5] : '',
-          names: parts.length > 6 ? parts[6] : (parts.length > 5 ? parts[5] : ''),
+          containerId: id,
+          image: img,
+          command: cmd,
+          created: crt,
+          status: stt,
+          ports: prt,
+          names: nam,
         ));
       }
     }

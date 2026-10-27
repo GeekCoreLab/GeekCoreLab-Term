@@ -224,9 +224,13 @@ class IndexAwareCircularBuffer<T extends IndexedItem> {
   /// instead just adjusts the start index and length.
   void trimStart(int count) {
     if (count > _length) count = _length;
+    for (var i = 0; i < count; i++) {
+      _dropChild(i);
+    }
     _startIndex += count;
     _startIndex %= _array.length;
     _length -= count;
+    _absoluteStartIndex += count;
   }
 
   /// Replaces all elements in the list with [replacement].

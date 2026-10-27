@@ -217,7 +217,7 @@ class RenderTerminal extends RenderBox with RelayoutWhenSystemFontsChangeMixin {
 
     _updateScrollOffset();
 
-    if (_stickToBottom) {
+    if (_stickToBottom || _scrollOffset > _maxScrollExtent) {
       _offset.correctBy(_maxScrollExtent - _scrollOffset);
     }
 

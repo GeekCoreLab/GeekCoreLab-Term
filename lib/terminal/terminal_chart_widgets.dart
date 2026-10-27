@@ -6,16 +6,25 @@ class TerminalDfChartWidget extends StatelessWidget {
   const TerminalDfChartWidget({
     required this.entries,
     required this.onClose,
+    this.maxHeight,
+    this.isFullscreen = false,
+    this.onToggleFullscreen,
     super.key,
   });
 
   final List<DfFsEntry> entries;
   final VoidCallback? onClose;
+  final double? maxHeight;
+  final bool isFullscreen;
+  final VoidCallback? onToggleFullscreen;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
+    final listMaxHeight = maxHeight != null
+        ? (maxHeight! - 48.0).clamp(40.0, 2000.0)
+        : 280.0;
 
     return Material(
       color: Colors.transparent,
@@ -32,19 +41,20 @@ class TerminalDfChartWidget extends StatelessWidget {
             ),
           ],
         ),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisSize: MainAxisSize.min,
           children: [
             Row(
               children: [
-                Icon(Icons.pie_chart_outline_rounded, size: 16, color: colors.primary),
-                const SizedBox(width: 8),
+                Icon(Icons.pie_chart_outline_rounded, size: 15, color: colors.primary),
+                const SizedBox(width: 6),
                 Text(
                   '磁盘空间分析 (df -h)',
                   style: theme.textTheme.titleSmall?.copyWith(
                     fontWeight: FontWeight.w600,
+                    fontSize: 13,
                     color: colors.onSurface,
                   ),
                 ),
@@ -56,11 +66,22 @@ class TerminalDfChartWidget extends StatelessWidget {
                     fontSize: 11,
                   ),
                 ),
+                if (onToggleFullscreen != null) ...[
+                  const SizedBox(width: 6),
+                  _ChartCardFullscreenButton(
+                    isFullscreen: isFullscreen,
+                    onToggle: onToggleFullscreen!,
+                  ),
+                ],
+                if (onClose != null) ...[
+                  const SizedBox(width: 4),
+                  _ChartCardCloseButton(onClose: onClose!),
+                ],
               ],
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 280),
+              constraints: BoxConstraints(maxHeight: listMaxHeight),
               child: SingleChildScrollView(
                 child: Column(
                   children: entries.map((e) => _buildEntryRow(context, e)).toList(),
@@ -92,13 +113,15 @@ class TerminalDfChartWidget extends StatelessWidget {
               Expanded(
                 flex: 3,
                 child: Text(
-                  entry.mountedOn.isEmpty ? entry.filesystem : entry.mountedOn,
+                  isFullscreen && entry.mountedOn.isNotEmpty
+                      ? '${entry.mountedOn}  (${entry.filesystem})'
+                      : (entry.mountedOn.isEmpty ? entry.filesystem : entry.mountedOn),
                   style: const TextStyle(
                     fontFamily: 'monospace',
                     fontWeight: FontWeight.bold,
                     fontSize: 12,
                   ),
-                  overflow: TextOverflow.ellipsis,
+                  overflow: isFullscreen ? TextOverflow.visible : TextOverflow.ellipsis,
                 ),
               ),
               const SizedBox(width: 8),
@@ -152,11 +175,17 @@ class TerminalFreeChartWidget extends StatelessWidget {
   const TerminalFreeChartWidget({
     required this.stats,
     required this.onClose,
+    this.maxHeight,
+    this.isFullscreen = false,
+    this.onToggleFullscreen,
     super.key,
   });
 
   final FreeMemStats stats;
   final VoidCallback? onClose;
+  final double? maxHeight;
+  final bool isFullscreen;
+  final VoidCallback? onToggleFullscreen;
 
   @override
   Widget build(BuildContext context) {
@@ -186,85 +215,46 @@ class TerminalFreeChartWidget extends StatelessWidget {
             ),
           ],
         ),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.memory_rounded, size: 16, color: colors.primary),
-                const SizedBox(width: 8),
-                Text(
-                  '内存与交换空间 (free -h)',
-                  style: theme.textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: colors.onSurface,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.memory_rounded, size: 15, color: colors.primary),
+                  const SizedBox(width: 6),
+                  Text(
+                    '内存与交换空间 (free -h)',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                      color: colors.onSurface,
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            // Physical Memory
-            Row(
-              children: [
-                const Text(
-                  '物理内存 (Mem)',
-                  style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12),
-                ),
-                const Spacer(),
-                Text(
-                  '${stats.usedMem} / ${stats.totalMem} ($memPct%)',
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 11,
-                    color: colors.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(3),
-              child: LinearProgressIndicator(
-                value: stats.memUsageRatio,
-                backgroundColor: colors.surfaceContainerHighest,
-                valueColor: AlwaysStoppedAnimation<Color>(memColor),
-                minHeight: 7,
+                  const Spacer(),
+                  if (onToggleFullscreen != null) ...[
+                    _ChartCardFullscreenButton(
+                      isFullscreen: isFullscreen,
+                      onToggle: onToggleFullscreen!,
+                    ),
+                    const SizedBox(width: 4),
+                  ],
+                  if (onClose != null) _ChartCardCloseButton(onClose: onClose!),
+                ],
               ),
-            ),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  '空闲: ${stats.freeMem}',
-                  style: TextStyle(fontSize: 10, color: colors.onSurfaceVariant),
-                ),
-                if (stats.buffCacheMem.isNotEmpty)
-                  Text(
-                    '缓存: ${stats.buffCacheMem}',
-                    style: TextStyle(fontSize: 10, color: colors.onSurfaceVariant),
-                  ),
-                if (stats.availableMem.isNotEmpty)
-                  Text(
-                    '可用: ${stats.availableMem}',
-                    style: TextStyle(fontSize: 10, color: colors.onSurfaceVariant),
-                  ),
-              ],
-            ),
-            if (stats.totalSwap.isNotEmpty && stats.totalSwap != '0B' && stats.totalSwap != '0') ...[
-              const SizedBox(height: 10),
-              // Swap
+              const SizedBox(height: 6),
+              // Physical Memory
               Row(
                 children: [
                   const Text(
-                    '交换空间 (Swap)',
-                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12),
+                    '物理内存 (Mem)',
+                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 11),
                   ),
                   const Spacer(),
                   Text(
-                    '${stats.usedSwap} / ${stats.totalSwap} ($swapPct%)',
+                    '${stats.usedMem} / ${stats.totalMem} ($memPct%)',
                     style: TextStyle(
                       fontFamily: 'monospace',
                       fontSize: 11,
@@ -273,30 +263,81 @@ class TerminalFreeChartWidget extends StatelessWidget {
                   ),
                 ],
               ),
-              const SizedBox(height: 4),
+              const SizedBox(height: 3),
               ClipRRect(
                 borderRadius: BorderRadius.circular(3),
                 child: LinearProgressIndicator(
-                  value: stats.swapUsageRatio,
+                  value: stats.memUsageRatio,
                   backgroundColor: colors.surfaceContainerHighest,
-                  valueColor: AlwaysStoppedAnimation<Color>(
-                    stats.swapUsageRatio > 0.5 ? colors.error : const Color(0xFF55A9E8),
-                  ),
-                  minHeight: 7,
+                  valueColor: AlwaysStoppedAnimation<Color>(memColor),
+                  minHeight: 6,
                 ),
               ),
-              const SizedBox(height: 4),
+              const SizedBox(height: 3),
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   Text(
-                    '空闲: ${stats.freeSwap}',
+                    '空闲: ${stats.freeMem}',
                     style: TextStyle(fontSize: 10, color: colors.onSurfaceVariant),
                   ),
+                  if (stats.buffCacheMem.isNotEmpty)
+                    Text(
+                      '缓存: ${stats.buffCacheMem}',
+                      style: TextStyle(fontSize: 10, color: colors.onSurfaceVariant),
+                    ),
+                  if (stats.availableMem.isNotEmpty)
+                    Text(
+                      '可用: ${stats.availableMem}',
+                      style: TextStyle(fontSize: 10, color: colors.onSurfaceVariant),
+                    ),
                 ],
               ),
+              if (stats.totalSwap.isNotEmpty && stats.totalSwap != '0B' && stats.totalSwap != '0') ...[
+                const SizedBox(height: 6),
+                // Swap
+                Row(
+                  children: [
+                    const Text(
+                      '交换空间 (Swap)',
+                      style: TextStyle(fontWeight: FontWeight.w600, fontSize: 11),
+                    ),
+                    const Spacer(),
+                    Text(
+                      '${stats.usedSwap} / ${stats.totalSwap} ($swapPct%)',
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11,
+                        color: colors.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 3),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(3),
+                  child: LinearProgressIndicator(
+                    value: stats.swapUsageRatio,
+                    backgroundColor: colors.surfaceContainerHighest,
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      stats.swapUsageRatio > 0.5 ? colors.error : const Color(0xFF55A9E8),
+                    ),
+                    minHeight: 6,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      '空闲: ${stats.freeSwap}',
+                      style: TextStyle(fontSize: 10, color: colors.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
@@ -308,17 +349,26 @@ class TerminalDockerPsChartWidget extends StatelessWidget {
   const TerminalDockerPsChartWidget({
     required this.entries,
     required this.onClose,
+    this.maxHeight,
+    this.isFullscreen = false,
+    this.onToggleFullscreen,
     super.key,
   });
 
   final List<DockerContainerEntry> entries;
   final VoidCallback? onClose;
+  final double? maxHeight;
+  final bool isFullscreen;
+  final VoidCallback? onToggleFullscreen;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
     final runningCount = entries.where((e) => e.isRunning).length;
+    final listMaxHeight = maxHeight != null
+        ? (maxHeight! - 48.0).clamp(40.0, 2000.0)
+        : 280.0;
 
     return Material(
       color: Colors.transparent,
@@ -335,19 +385,20 @@ class TerminalDockerPsChartWidget extends StatelessWidget {
             ),
           ],
         ),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisSize: MainAxisSize.min,
           children: [
             Row(
               children: [
-                Icon(Icons.directions_boat_rounded, size: 16, color: colors.primary),
-                const SizedBox(width: 8),
+                Icon(Icons.directions_boat_rounded, size: 15, color: colors.primary),
+                const SizedBox(width: 6),
                 Text(
                   'Docker 容器 (docker ps)',
                   style: theme.textTheme.titleSmall?.copyWith(
                     fontWeight: FontWeight.w600,
+                    fontSize: 13,
                     color: colors.onSurface,
                   ),
                 ),
@@ -367,12 +418,23 @@ class TerminalDockerPsChartWidget extends StatelessWidget {
                     ),
                   ),
                 ),
+                if (onToggleFullscreen != null) ...[
+                  const SizedBox(width: 6),
+                  _ChartCardFullscreenButton(
+                    isFullscreen: isFullscreen,
+                    onToggle: onToggleFullscreen!,
+                  ),
+                ],
+                if (onClose != null) ...[
+                  const SizedBox(width: 4),
+                  _ChartCardCloseButton(onClose: onClose!),
+                ],
               ],
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             if (entries.isEmpty)
               Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
+                padding: const EdgeInsets.symmetric(vertical: 6),
                 child: Text(
                   '当前没有运行中的容器',
                   style: TextStyle(
@@ -383,7 +445,7 @@ class TerminalDockerPsChartWidget extends StatelessWidget {
               )
             else
               ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 280),
+                constraints: BoxConstraints(maxHeight: listMaxHeight),
                 child: SingleChildScrollView(
                   child: Column(
                     children: entries.map((e) => _buildContainerRow(context, e)).toList(),
@@ -413,56 +475,72 @@ class TerminalDockerPsChartWidget extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: statusColor,
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: statusColor,
+                  ),
                 ),
               ),
               const SizedBox(width: 6),
               Expanded(
+                flex: 3,
                 child: Text(
-                  entry.names.isNotEmpty ? entry.names : entry.containerId,
+                  isFullscreen && entry.names.isNotEmpty
+                      ? '${entry.names}  (${entry.containerId})'
+                      : (entry.names.isNotEmpty ? entry.names : entry.containerId),
                   style: const TextStyle(
                     fontFamily: 'monospace',
                     fontWeight: FontWeight.bold,
                     fontSize: 12,
                   ),
-                  overflow: TextOverflow.ellipsis,
+                  overflow: isFullscreen ? TextOverflow.visible : TextOverflow.ellipsis,
                 ),
               ),
               const SizedBox(width: 8),
-              Text(
-                entry.image,
-                style: TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 11,
-                  color: colors.onSurfaceVariant,
+              Flexible(
+                flex: 2,
+                child: Text(
+                  entry.image,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    color: colors.onSurfaceVariant,
+                  ),
+                  textAlign: TextAlign.right,
+                  overflow: isFullscreen ? TextOverflow.visible : TextOverflow.ellipsis,
                 ),
-                overflow: TextOverflow.ellipsis,
               ),
             ],
           ),
           const SizedBox(height: 4),
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(
+                flex: 2,
                 child: Text(
-                  entry.status,
+                  isFullscreen && entry.created.isNotEmpty
+                      ? '${entry.status} · 创建于 ${entry.created}'
+                      : entry.status,
                   style: TextStyle(
                     fontFamily: 'monospace',
                     fontSize: 10,
                     color: isUp ? colors.onSurface : colors.error,
                   ),
-                  overflow: TextOverflow.ellipsis,
+                  overflow: isFullscreen ? TextOverflow.visible : TextOverflow.ellipsis,
                 ),
               ),
               if (entry.ports.isNotEmpty) ...[
                 const SizedBox(width: 8),
                 Expanded(
+                  flex: 3,
                   child: Text(
                     entry.ports,
                     style: TextStyle(
@@ -471,13 +549,82 @@ class TerminalDockerPsChartWidget extends StatelessWidget {
                       color: colors.primary,
                     ),
                     textAlign: TextAlign.right,
-                    overflow: TextOverflow.ellipsis,
+                    overflow: isFullscreen ? TextOverflow.visible : TextOverflow.ellipsis,
                   ),
                 ),
               ],
             ],
           ),
+          if (isFullscreen && entry.command.isNotEmpty) ...[
+            const SizedBox(height: 3),
+            Text(
+              '启动命令: ${entry.command}',
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 10,
+                color: colors.onSurfaceVariant.withValues(alpha: 0.85),
+              ),
+            ),
+          ],
         ],
+      ),
+    );
+  }
+}
+
+/// Fullscreen / Compact toggle button inside chart card headers
+class _ChartCardFullscreenButton extends StatelessWidget {
+  const _ChartCardFullscreenButton({
+    required this.isFullscreen,
+    required this.onToggle,
+  });
+
+  final bool isFullscreen;
+  final VoidCallback onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onToggle,
+      borderRadius: BorderRadius.circular(4),
+      child: Tooltip(
+        message: isFullscreen ? '收起为紧凑视图' : '展开全屏查看完整信息',
+        child: Padding(
+          padding: const EdgeInsets.all(2),
+          child: Icon(
+            isFullscreen ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded,
+            size: 15,
+            color: colors.onSurfaceVariant,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Close / Switch-to-raw button inside chart card headers
+class _ChartCardCloseButton extends StatelessWidget {
+  const _ChartCardCloseButton({required this.onClose});
+
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onClose,
+      borderRadius: BorderRadius.circular(4),
+      child: Tooltip(
+        message: '切回原始输出 (Raw)',
+        child: Padding(
+          padding: const EdgeInsets.all(2),
+          child: Icon(
+            Icons.close_rounded,
+            size: 15,
+            color: colors.onSurfaceVariant,
+          ),
+        ),
       ),
     );
   }

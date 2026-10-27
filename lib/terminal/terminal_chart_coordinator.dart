@@ -10,7 +10,9 @@ class TerminalChartCoordinator extends ChangeNotifier {
     required this.terminal,
     required this.scrollController,
     TerminalController? terminalController,
-  }) : _terminalController = terminalController;
+  }) : _terminalController = terminalController {
+    terminal.addListener(_onTerminalChanged);
+  }
 
   final Terminal terminal;
   final ScrollController scrollController;
@@ -28,6 +30,7 @@ class TerminalChartCoordinator extends ChangeNotifier {
   String? _pendingCommand;
   CommandChartType? _pendingType;
   int? _pendingStartLine;
+  CellAnchor? _pendingStartAnchor;
   final StringBuffer _outputBuffer = StringBuffer();
   Timer? _idleFinishTimer;
 
@@ -35,8 +38,43 @@ class TerminalChartCoordinator extends ChangeNotifier {
     r'(?:^|[\r\n])(?:\[?[a-zA-Z0-9_.\-]+@[a-zA-Z0-9_.\-]+[^#$%>\]]*\]?[#$%>]|[\w.\-]+(?:[#$%>])|[#$%>])\s*$',
   );
 
+  void _onTerminalChanged() {
+    if (_blocks.isEmpty) return;
+    // If any block's anchors detached or shifted (e.g. due to scrolling at bottom of buffer),
+    // keep hidden line indices in sync.
+    var needsNotify = false;
+    for (var i = _blocks.length - 1; i >= 0; i--) {
+      final b = _blocks[i];
+      if ((b.startAnchor != null && !b.startAnchor!.attached) ||
+          (b.endAnchor != null && !b.endAnchor!.attached)) {
+        b.dispose();
+        _blocks.removeAt(i);
+        needsNotify = true;
+      }
+    }
+    _updateHiddenLines();
+    if (needsNotify) {
+      notifyListeners();
+    }
+  }
+
+  CellAnchor? _createLineAnchor(int lineY) {
+    try {
+      final lines = terminal.buffer.lines;
+      if (lineY >= 0 && lineY < lines.length) {
+        return lines[lineY].createAnchor(0);
+      }
+    } catch (_) {}
+    return null;
+  }
+
   /// Called when user inputs characters into terminal
   void notifyUserInput(String input) {
+    if (input == '\x0c') {
+      // Ctrl+L clears screen -> clear active chart blocks
+      clear();
+      return;
+    }
     if (input.contains('\r') || input.contains('\n')) {
       final beforeEnter = input.split(RegExp(r'[\r\n]')).first;
       _inputBuffer += beforeEnter;
@@ -44,6 +82,12 @@ class TerminalChartCoordinator extends ChangeNotifier {
       final bufferLineText = _getCurrentCursorLineText();
       final candidate = _extractCommandFromPromptLine(bufferLineText);
       final typedCmd = _inputBuffer.trim();
+
+      if (_isClearCommand(candidate) || _isClearCommand(typedCmd)) {
+        _inputBuffer = '';
+        clear();
+        return;
+      }
 
       // Prefer the buffer line if it matches a chart command (handles Tab completion, history, backspace),
       // otherwise fallback to _inputBuffer
@@ -68,6 +112,11 @@ class TerminalChartCoordinator extends ChangeNotifier {
     }
   }
 
+  static bool _isClearCommand(String cmd) {
+    final lower = cmd.trim().toLowerCase();
+    return lower == 'clear' || lower == 'reset' || lower == 'cls';
+  }
+
   String _getCurrentCursorLineText() {
     try {
       final y = terminal.buffer.absoluteCursorY;
@@ -80,8 +129,8 @@ class TerminalChartCoordinator extends ChangeNotifier {
 
   static String _extractCommandFromPromptLine(String line) {
     if (line.isEmpty) return '';
-    // Strip common prompt prefixes like `[user@host dir]$ `, `user@host:~# `, `PS ...> `, `$ `, `# `, `% `
-    final match = RegExp(r'^(?:.*?[#$%>]\s+)(.+)$').firstMatch(line);
+    // Strip common prompt prefixes like `[user@host dir]$ `, `user@host:~# `, `PS ...> `, `$ `, `# `, `% `, `❯ `
+    final match = RegExp(r'^(?:.*?[#$%>❯➜]\s+)(.+)$').firstMatch(line);
     if (match != null) {
       return match.group(1)!.trim();
     }
@@ -95,6 +144,8 @@ class TerminalChartCoordinator extends ChangeNotifier {
       _pendingCommand = trimmed;
       _pendingType = type;
       _pendingStartLine = terminal.buffer.absoluteCursorY;
+      _pendingStartAnchor?.dispose();
+      _pendingStartAnchor = _createLineAnchor(_pendingStartLine!);
       _outputBuffer.clear();
       _idleFinishTimer?.cancel();
     }
@@ -102,6 +153,15 @@ class TerminalChartCoordinator extends ChangeNotifier {
 
   /// Called as raw output text arrives from terminal stream
   void observeOutput(String chunk) {
+    // Check if output contains screen clear sequences: ESC[2J, ESC[3J, ESC[H+ESC[J, or ESC c
+    if (chunk.contains('\x1b[2J') ||
+        chunk.contains('\x1b[3J') ||
+        chunk.contains('\x1bc') ||
+        chunk.contains('\x1b[H\x1b[J')) {
+      clear();
+      return;
+    }
+
     final stripped = chunk.replaceAll(RegExp(r'\x1b\[[0-9;?=]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)|\x1b[()][AB012]'), '');
 
     if (_pendingCommand == null) {
@@ -112,11 +172,17 @@ class TerminalChartCoordinator extends ChangeNotifier {
         if (trimmed.isEmpty) continue;
 
         final cmdCandidate = _extractCommandFromPromptLine(trimmed);
+        if (_isClearCommand(cmdCandidate)) {
+          clear();
+          return;
+        }
         final cmdType = TerminalCommandChartParser.matchCommandType(cmdCandidate);
         if (cmdType != null) {
           _pendingCommand = cmdCandidate;
           _pendingType = cmdType;
           _pendingStartLine = _findCommandBufferLine(cmdType) ?? math.max(0, terminal.buffer.absoluteCursorY - 1);
+          _pendingStartAnchor?.dispose();
+          _pendingStartAnchor = _createLineAnchor(_pendingStartLine!);
           _outputBuffer.clear();
           _outputBuffer.write(stripped);
           _checkAndScheduleFinish(stripped);
@@ -132,6 +198,8 @@ class TerminalChartCoordinator extends ChangeNotifier {
             CommandChartType.dockerPs => 'docker ps',
           };
           _pendingStartLine = _findCommandBufferLine(headerType) ?? math.max(0, terminal.buffer.absoluteCursorY - 2);
+          _pendingStartAnchor?.dispose();
+          _pendingStartAnchor = _createLineAnchor(_pendingStartLine!);
           _outputBuffer.clear();
           _outputBuffer.write(stripped);
           _checkAndScheduleFinish(stripped);
@@ -148,7 +216,7 @@ class TerminalChartCoordinator extends ChangeNotifier {
   int? _findCommandBufferLine(CommandChartType type) {
     try {
       final curY = terminal.buffer.absoluteCursorY;
-      final minSearch = math.max(0, curY - 30);
+      final minSearch = math.max(0, curY - 250);
       for (var y = curY; y >= minSearch; y--) {
         if (y >= terminal.buffer.lines.length) continue;
         final text = terminal.buffer.lines[y].getText().trim();
@@ -158,8 +226,8 @@ class TerminalChartCoordinator extends ChangeNotifier {
           return y;
         }
       }
-      // Second pass: find header line and return 1 line above it
-      for (var y = minSearch; y <= curY; y++) {
+      // Second pass: find latest header line and return 1 line above it
+      for (var y = curY; y >= minSearch; y--) {
         if (y >= terminal.buffer.lines.length) continue;
         final text = terminal.buffer.lines[y].getText().trim();
         if (TerminalCommandChartParser.detectOutputHeader(text) == type) {
@@ -221,12 +289,32 @@ class TerminalChartCoordinator extends ChangeNotifier {
     if (_pendingCommand == null) return;
     final cmd = _pendingCommand!;
     final type = _pendingType ?? TerminalCommandChartParser.matchCommandType(cmd);
-    final start = _pendingStartLine ??
-        (type != null ? _findCommandBufferLine(type) : null) ??
-        math.max(0, terminal.buffer.absoluteCursorY - 1);
-    final end = math.max(start, terminal.buffer.absoluteCursorY);
+
+    int start;
+    if (_pendingStartAnchor != null && _pendingStartAnchor!.attached) {
+      start = _pendingStartAnchor!.y;
+    } else {
+      start = (type != null ? _findCommandBufferLine(type) : null) ??
+          _pendingStartLine ??
+          math.max(0, terminal.buffer.absoluteCursorY - 1);
+    }
+
+    // Verify start line: if a more accurate command line exists in the buffer near or after anchor, prefer it
+    if (type != null) {
+      final foundStart = _findCommandBufferLine(type);
+      if (foundStart != null &&
+          (_pendingStartAnchor == null ||
+              !_pendingStartAnchor!.attached ||
+              foundStart >= start - 2)) {
+        start = foundStart;
+      }
+    }
+
+    final end = math.max(start + 1, terminal.buffer.absoluteCursorY);
     final output = _outputBuffer.toString();
 
+    _pendingStartAnchor?.dispose();
+    _pendingStartAnchor = null;
     _pendingCommand = null;
     _pendingType = null;
     _pendingStartLine = null;
@@ -234,59 +322,67 @@ class TerminalChartCoordinator extends ChangeNotifier {
 
     if (type == null) return;
 
+    CapturedCommandBlock? newBlock;
+
     if (type == CommandChartType.df) {
       final entries = TerminalCommandChartParser.parseDf(output);
       if (entries.isNotEmpty) {
-        final block = CapturedCommandBlock(
+        newBlock = CapturedCommandBlock(
           id: 'df-${DateTime.now().millisecondsSinceEpoch}',
           command: cmd,
           type: type,
           startBufferLine: start,
           endBufferLine: end,
+          startAnchor: _createLineAnchor(start),
+          endAnchor: _createLineAnchor(end),
           rawOutput: output,
           dfEntries: entries,
         );
-        _blocks.add(block);
-        if (_blocks.length > 20) _blocks.removeAt(0);
-        _updateHiddenLines();
-        notifyListeners();
       }
     } else if (type == CommandChartType.free) {
       final stats = TerminalCommandChartParser.parseFree(output);
       if (stats != null) {
-        final block = CapturedCommandBlock(
+        newBlock = CapturedCommandBlock(
           id: 'free-${DateTime.now().millisecondsSinceEpoch}',
           command: cmd,
           type: type,
           startBufferLine: start,
           endBufferLine: end,
+          startAnchor: _createLineAnchor(start),
+          endAnchor: _createLineAnchor(end),
           rawOutput: output,
           freeStats: stats,
         );
-        _blocks.add(block);
-        if (_blocks.length > 20) _blocks.removeAt(0);
-        _updateHiddenLines();
-        notifyListeners();
       }
     } else if (type == CommandChartType.dockerPs) {
       final dockerEntries = TerminalCommandChartParser.parseDockerPs(output);
       final hasHeader = TerminalCommandChartParser.detectOutputHeader(output) == CommandChartType.dockerPs ||
           output.contains('CONTAINER ID');
       if (dockerEntries.isNotEmpty || hasHeader) {
-        final block = CapturedCommandBlock(
+        newBlock = CapturedCommandBlock(
           id: 'docker-${DateTime.now().millisecondsSinceEpoch}',
           command: cmd,
           type: type,
           startBufferLine: start,
           endBufferLine: end,
+          startAnchor: _createLineAnchor(start),
+          endAnchor: _createLineAnchor(end),
           rawOutput: output,
           dockerEntries: dockerEntries,
         );
-        _blocks.add(block);
-        if (_blocks.length > 20) _blocks.removeAt(0);
-        _updateHiddenLines();
-        notifyListeners();
       }
+    }
+
+    if (newBlock != null) {
+      // Only keep the latest command chart! Previous blocks revert to raw terminal text and scroll normally.
+      for (final old in _blocks) {
+        old.dispose();
+      }
+      _blocks
+        ..clear()
+        ..add(newBlock);
+      _updateHiddenLines();
+      notifyListeners();
     }
   }
 
@@ -296,14 +392,22 @@ class TerminalChartCoordinator extends ChangeNotifier {
     final hidden = <int>{};
     for (final block in _blocks) {
       if (block.isRenderMode) {
+        final start = block.currentStartLine;
+        final end = block.currentEndLine;
         // Hide the raw command output lines between the command line and the prompt
-        // startBufferLine is the command typed line; startBufferLine + 1 to endBufferLine - 1 is the output
-        for (var line = block.startBufferLine + 1; line < block.endBufferLine; line++) {
+        for (var line = start + 1; line < end; line++) {
           hidden.add(line);
         }
       }
     }
-    controller.setHiddenLineIndices(hidden);
+    if (!_setsEqual(controller.hiddenLineIndices, hidden)) {
+      controller.setHiddenLineIndices(hidden);
+    }
+  }
+
+  static bool _setsEqual(Set<int> a, Set<int> b) {
+    if (a.length != b.length) return false;
+    return a.containsAll(b);
   }
 
   void toggleBlockMode(CapturedCommandBlock block) {
@@ -312,9 +416,19 @@ class TerminalChartCoordinator extends ChangeNotifier {
     notifyListeners();
   }
 
+  void toggleBlockFullscreen(CapturedCommandBlock block, {required bool currentlyFullscreen}) {
+    block.isFullscreenOverride = !currentlyFullscreen;
+    notifyListeners();
+  }
+
   void clear() {
     _idleFinishTimer?.cancel();
     _idleFinishTimer = null;
+    _pendingStartAnchor?.dispose();
+    _pendingStartAnchor = null;
+    for (final b in _blocks) {
+      b.dispose();
+    }
     _blocks.clear();
     _pendingCommand = null;
     _pendingType = null;
@@ -327,7 +441,12 @@ class TerminalChartCoordinator extends ChangeNotifier {
 
   @override
   void dispose() {
+    terminal.removeListener(_onTerminalChanged);
     _idleFinishTimer?.cancel();
+    _pendingStartAnchor?.dispose();
+    for (final b in _blocks) {
+      b.dispose();
+    }
     super.dispose();
   }
 }
