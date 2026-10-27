@@ -24,6 +24,16 @@ void _validateTimeout(Duration timeout) {
   }
 }
 
+const maxTcpPortScanRange = 1024;
+const maxTcpPortScanConcurrency = 24;
+
+void _validateScanTimeout(Duration timeout) {
+  if (timeout < const Duration(milliseconds: 250) ||
+      timeout > const Duration(seconds: 5)) {
+    throw const FormatException('扫描超时必须在 250 毫秒到 5 秒之间');
+  }
+}
+
 Future<List<String>> lookupNetworkHost(
   String host, {
   Duration timeout = const Duration(seconds: 5),
@@ -44,4 +54,35 @@ Future<TcpProbeResult> probeTcpPort(
   }
   _validateTimeout(timeout);
   return platform.probeTcpPort(host.trim(), port, timeout: timeout);
+}
+
+Future<TcpPortScanResult> scanTcpPorts(
+  String host, {
+  required int startPort,
+  required int endPort,
+  Duration timeout = const Duration(milliseconds: 500),
+  int concurrency = maxTcpPortScanConcurrency,
+  TcpPortScanCancellation? cancellation,
+  void Function(int scannedPorts, int totalPorts)? onProgress,
+}) {
+  _validateHost(host);
+  if (startPort < 1 || endPort > 65535 || startPort > endPort) {
+    throw const FormatException('扫描端口范围必须位于 1 到 65535 之间');
+  }
+  if (endPort - startPort + 1 > maxTcpPortScanRange) {
+    throw FormatException('单次最多扫描 $maxTcpPortScanRange 个连续端口');
+  }
+  _validateScanTimeout(timeout);
+  if (concurrency < 1 || concurrency > maxTcpPortScanConcurrency) {
+    throw FormatException('并发数必须在 1 到 $maxTcpPortScanConcurrency 之间');
+  }
+  return platform.scanTcpPorts(
+    host.trim(),
+    startPort: startPort,
+    endPort: endPort,
+    timeout: timeout,
+    concurrency: concurrency,
+    cancellation: cancellation,
+    onProgress: onProgress,
+  );
 }
