@@ -426,9 +426,7 @@ class RenderTerminal extends RenderBox with RelayoutWhenSystemFontsChangeMixin {
     final effectFirstLine = firstLine.clamp(0, lines.length - 1);
     final effectLastLine = lastLine.clamp(0, lines.length - 1);
 
-    final hiddenLines = _controller.hiddenLineIndices;
     for (var i = effectFirstLine; i <= effectLastLine; i++) {
-      if (hiddenLines.contains(i)) continue;
       _painter.paintLine(
         canvas,
         offset.translate(0, (i * charHeight + _lineOffset).truncateToDouble()),

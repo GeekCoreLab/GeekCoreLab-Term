@@ -105,7 +105,7 @@ Swap:          2.0Gi       256Mi       1.7Gi
   });
 
   group('TerminalChartCoordinator', () {
-    test('captures and finishes a command block when prompt returns and hides lines', () {
+    test('captures and finishes a command block when prompt returns', () {
       final terminal = Terminal();
       final scrollController = ScrollController();
       final terminalController = TerminalController();
@@ -132,13 +132,9 @@ Swap:          2.0Gi       256Mi       1.7Gi
       expect(block.dfEntries.length, equals(1));
       expect(block.isRenderMode, isTrue);
 
-      // Verify that hidden lines are set in controller during render mode
-      expect(terminalController.hiddenLineIndices, isNotEmpty);
-
       // Toggle mode back to raw
       coordinator.toggleBlockMode(block);
       expect(block.isRenderMode, isFalse);
-      expect(terminalController.hiddenLineIndices, isEmpty);
     });
   });
 }

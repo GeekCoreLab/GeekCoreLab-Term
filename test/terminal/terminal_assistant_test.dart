@@ -159,17 +159,16 @@ void main() {
       expect(out2, contains('已禁用'));
     });
 
-    test('flushes trailing partial lines like prompts asynchronously', () async {
+    test('passes non-whitelisted trailing partial lines like prompts immediately without delay', () async {
       final transformer = TerminalInlineHintTransformer();
       String flushed = '';
       transformer.onFlush = (text) => flushed += text;
 
+      // Prompts and ordinary input outside whitelisted status commands
+      // should return immediately to avoid blind typing or prompt lag.
       final immediate = transformer.transform('root@bt-main:~# ');
-      expect(immediate, isEmpty);
+      expect(immediate, 'root@bt-main:~# ');
       expect(flushed, isEmpty);
-
-      await Future<void>.delayed(const Duration(milliseconds: 30));
-      expect(flushed, 'root@bt-main:~# ');
     });
   });
 }

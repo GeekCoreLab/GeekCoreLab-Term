@@ -21,12 +21,12 @@ class TerminalDfChartWidget extends StatelessWidget {
       color: Colors.transparent,
       child: Container(
         decoration: BoxDecoration(
-          color: colors.surfaceContainerHighest.withValues(alpha: 0.95),
+          color: colors.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(8),
           border: Border.all(color: colors.outlineVariant.withValues(alpha: 0.6)),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withValues(alpha: 0.25),
+              color: Colors.black.withValues(alpha: 0.35),
               blurRadius: 10,
               offset: const Offset(0, 3),
             ),
@@ -175,12 +175,12 @@ class TerminalFreeChartWidget extends StatelessWidget {
       color: Colors.transparent,
       child: Container(
         decoration: BoxDecoration(
-          color: colors.surfaceContainerHighest.withValues(alpha: 0.95),
+          color: colors.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(8),
           border: Border.all(color: colors.outlineVariant.withValues(alpha: 0.6)),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withValues(alpha: 0.25),
+              color: Colors.black.withValues(alpha: 0.35),
               blurRadius: 10,
               offset: const Offset(0, 3),
             ),

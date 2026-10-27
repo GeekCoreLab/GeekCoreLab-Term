@@ -9,16 +9,10 @@ class TerminalChartCoordinator extends ChangeNotifier {
     required this.terminal,
     required this.scrollController,
     TerminalController? terminalController,
-  }) : _terminalController = terminalController;
+  });
 
   final Terminal terminal;
   final ScrollController scrollController;
-  TerminalController? _terminalController;
-  set terminalController(TerminalController? controller) {
-    if (_terminalController == controller) return;
-    _terminalController = controller;
-    _updateHiddenLines();
-  }
 
   final List<CapturedCommandBlock> _blocks = [];
   List<CapturedCommandBlock> get blocks => List.unmodifiable(_blocks);
@@ -114,7 +108,6 @@ class TerminalChartCoordinator extends ChangeNotifier {
         );
         _blocks.add(block);
         if (_blocks.length > 20) _blocks.removeAt(0);
-        _updateHiddenLines();
         notifyListeners();
       }
     } else if (type == CommandChartType.free) {
@@ -131,31 +124,13 @@ class TerminalChartCoordinator extends ChangeNotifier {
         );
         _blocks.add(block);
         if (_blocks.length > 20) _blocks.removeAt(0);
-        _updateHiddenLines();
         notifyListeners();
       }
     }
   }
 
-  void _updateHiddenLines() {
-    final controller = _terminalController;
-    if (controller == null) return;
-    final hidden = <int>{};
-    for (final block in _blocks) {
-      if (block.isRenderMode) {
-        // Hide the raw command output lines between the command line and the prompt
-        // startBufferLine is the command typed line; startBufferLine + 1 to endBufferLine - 1 is the output
-        for (var line = block.startBufferLine + 1; line < block.endBufferLine; line++) {
-          hidden.add(line);
-        }
-      }
-    }
-    controller.setHiddenLineIndices(hidden);
-  }
-
   void toggleBlockMode(CapturedCommandBlock block) {
     block.isRenderMode = !block.isRenderMode;
-    _updateHiddenLines();
     notifyListeners();
   }
 
@@ -165,7 +140,6 @@ class TerminalChartCoordinator extends ChangeNotifier {
     _pendingStartLine = null;
     _outputBuffer.clear();
     _inputBuffer = '';
-    _updateHiddenLines();
     notifyListeners();
   }
 }

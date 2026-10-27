@@ -387,6 +387,23 @@ class TerminalInlineHintTransformer {
   String transform(String chunk, {DateTime Function()? clock}) {
     if (chunk.isEmpty) return chunk;
 
+    // Fast-path: If neither whitelist is active nor does this chunk start a whitelisted command,
+    // pass text through directly without any buffering to ensure zero latency for prompts and typing.
+    final plainText = _stripAnsi(chunk);
+    if (!_isWhitelistedCommand) {
+      var triggered = false;
+      for (final pattern in _whitelistPatterns) {
+        if (pattern.hasMatch(plainText)) {
+          triggered = true;
+          _isWhitelistedCommand = true;
+          break;
+        }
+      }
+      if (!triggered && _lineBuffer.isEmpty) {
+        return chunk;
+      }
+    }
+
     _flushTimer?.cancel();
     _flushTimer = null;
 
