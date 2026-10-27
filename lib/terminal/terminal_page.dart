@@ -31,6 +31,7 @@ import 'package:geekcore_term/terminal/session_store.dart';
 import 'package:geekcore_term/terminal/terminal_search_dialog.dart';
 import 'package:geekcore_term/terminal/terminal_transcript.dart';
 import 'package:geekcore_term/terminal/terminal_input_targets.dart';
+import 'package:geekcore_term/terminal/terminal_shortcuts.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
 import 'package:geekcore_term/settings/settings_page.dart';
@@ -62,13 +63,14 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   bool _clearingAppData = false;
   int _nextTabId = 1;
   int? _activeTabId;
-  _TerminalSplitMode _splitMode = _TerminalSplitMode.none;
+  TerminalSplitMode _splitMode = TerminalSplitMode.none;
+  bool _layoutInteractionStarted = false;
   final List<int> _splitTabIds = [];
   bool _broadcastSplitInput = false;
   final Set<int> _multiExecTabIds = {};
 
   bool get _hasInputBroadcast =>
-      (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) ||
+      (_broadcastSplitInput && _splitMode != TerminalSplitMode.none) ||
       _multiExecTabIds.isNotEmpty;
 
   _TerminalTab? get _activeTab {
@@ -89,10 +91,14 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       final saved = await _sessionStore.loadSaved();
       final recent = await _sessionStore.loadRecent();
       final groups = await _sessionStore.loadGroups();
+      final splitMode = await _sessionStore.loadTerminalSplitMode();
       if (!mounted) return;
       setState(() {
         _savedSessions = saved;
         _recentSessions = recent;
+        if (!_layoutInteractionStarted && _tabs.isEmpty) {
+          _splitMode = splitMode;
+        }
         _sessionGroups = {
           ...groups,
           ...saved
@@ -219,7 +225,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       return true;
     }
     final targetIds = <int>{..._multiExecTabIds};
-    if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
+    if (_broadcastSplitInput && _splitMode != TerminalSplitMode.none) {
       targetIds.addAll(_splitTabIds);
     }
     if (_activeTabId case final activeId?) targetIds.add(activeId);
@@ -447,6 +453,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         setState(() {
           _tabs.clear();
           _activeTabId = null;
+          _splitMode = TerminalSplitMode.none;
+          _splitTabIds.clear();
+          _broadcastSplitInput = false;
+          _multiExecTabIds.clear();
+          _layoutInteractionStarted = true;
         });
       }
 
@@ -574,17 +585,32 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   void _addConnectionTab(_TerminalConnection connection) {
     final tab = _createTabState(connection);
+    _layoutInteractionStarted = true;
     setState(() {
       final activeId = _activeTabId;
       _tabs.add(tab);
-      if (_splitMode != _TerminalSplitMode.none) {
-        final slot = activeId == null ? -1 : _splitTabIds.indexOf(activeId);
-        if (slot >= 0) {
-          _splitTabIds[slot] = tab.id;
-        } else if (_splitTabIds.length < _splitMode.capacity) {
+      if (_splitMode != TerminalSplitMode.none) {
+        final emptySlot =
+            List<int>.generate(
+              _splitMode.capacity,
+              (index) => index,
+            ).firstWhere(
+              (index) =>
+                  index >= _splitTabIds.length ||
+                  !_tabs.any(
+                    (candidate) => candidate.id == _splitTabIds[index],
+                  ),
+              orElse: () => -1,
+            );
+        if (emptySlot >= 0 && emptySlot < _splitTabIds.length) {
+          _splitTabIds[emptySlot] = tab.id;
+        } else if (emptySlot >= 0) {
           _splitTabIds.add(tab.id);
         } else if (_splitTabIds.isNotEmpty) {
-          _splitTabIds[0] = tab.id;
+          final activeSlot = activeId == null
+              ? -1
+              : _splitTabIds.indexOf(activeId);
+          _splitTabIds[activeSlot < 0 ? 0 : activeSlot] = tab.id;
         }
       }
       _activeTabId = tab.id;
@@ -921,11 +947,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   void _activateTab(_TerminalTab tab) {
     if (tab.isClosed || !mounted) return;
     final isVisible =
-        _splitMode == _TerminalSplitMode.none || _splitTabIds.contains(tab.id);
+        _splitMode == TerminalSplitMode.none || _splitTabIds.contains(tab.id);
     if (_activeTabId == tab.id && isVisible) return;
 
     setState(() {
-      if (_splitMode != _TerminalSplitMode.none &&
+      if (_splitMode != TerminalSplitMode.none &&
           !_splitTabIds.contains(tab.id)) {
         final slot = _activeTabId == null
             ? -1
@@ -955,13 +981,15 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     _selectTab(_tabs[nextIndex]);
   }
 
-  Future<void> _setSplitMode(_TerminalSplitMode mode) async {
-    if (mode == _TerminalSplitMode.none) {
+  Future<void> _setSplitMode(TerminalSplitMode mode) async {
+    _layoutInteractionStarted = true;
+    if (mode == TerminalSplitMode.none) {
       setState(() {
         _splitMode = mode;
         _splitTabIds.clear();
         _broadcastSplitInput = false;
       });
+      unawaited(_saveTerminalSplitMode(mode));
       return;
     }
 
@@ -984,6 +1012,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         ..addAll(visibleIds);
       _activeTabId = primaryId ?? visibleIds.firstOrNull;
     });
+    unawaited(_saveTerminalSplitMode(mode));
     for (final tab in newTabs) {
       unawaited(_startSession(tab));
     }
@@ -1006,6 +1035,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
 
     final wasActive = tab.id == _activeTabId;
+    final splitModeBeforeClose = _splitMode;
     _TerminalTab? nextTab;
     if (wasActive && _tabs.length > 1) {
       nextTab = _tabs[index == _tabs.length - 1 ? index - 1 : index + 1];
@@ -1021,7 +1051,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       _tabs.removeAt(index);
       _multiExecTabIds.remove(tab.id);
       if (wasActive) _activeTabId = nextTab?.id;
-      if (_splitMode != _TerminalSplitMode.none) {
+      if (_splitMode != TerminalSplitMode.none) {
         final removedSlot = _splitTabIds.indexOf(tab.id);
         _splitTabIds.remove(tab.id);
         if (removedSlot >= 0 && _splitTabIds.length < _splitMode.capacity) {
@@ -1038,12 +1068,15 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           }
         }
         if (_splitTabIds.length < 2) {
-          _splitMode = _TerminalSplitMode.none;
+          _splitMode = TerminalSplitMode.none;
           _splitTabIds.clear();
           _broadcastSplitInput = false;
         }
       }
     });
+    if (_splitMode != splitModeBeforeClose) {
+      unawaited(_saveTerminalSplitMode(_splitMode));
+    }
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       tab.focusNode.dispose();
@@ -1053,6 +1086,14 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     });
     unawaited(_disposeTab(tab));
     if (nextTab != null) _focusTab(nextTab);
+  }
+
+  Future<void> _saveTerminalSplitMode(TerminalSplitMode mode) async {
+    try {
+      await _sessionStore.saveTerminalSplitMode(mode);
+    } catch (error) {
+      if (mounted) _showMessage('保存终端布局失败：$error', isError: true);
+    }
   }
 
   Future<void> _startSession(_TerminalTab tab) async {
@@ -2023,7 +2064,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       splitTabIds: _splitTabIds,
       selectedTabIds: _multiExecTabIds,
       broadcastSplitInput:
-          _broadcastSplitInput && _splitMode != _TerminalSplitMode.none,
+          _broadcastSplitInput && _splitMode != TerminalSplitMode.none,
     );
     final targets = _tabs.where((target) => targetIds.contains(target.id));
     for (final target in targets) {
@@ -3356,7 +3397,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   child: const Icon(Icons.groups_outlined, size: 19),
                 ),
               ),
-            if (_splitMode != _TerminalSplitMode.none)
+            if (_splitMode != TerminalSplitMode.none)
               IconButton(
                 tooltip: _broadcastSplitInput ? '关闭分屏输入广播' : '向所有分屏会话广播输入',
                 onPressed: () => setState(
@@ -3365,26 +3406,26 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                 color: _broadcastSplitInput ? colors.primary : null,
                 icon: const Icon(Icons.campaign_outlined, size: 19),
               ),
-            PopupMenuButton<_TerminalSplitMode>(
+            PopupMenuButton<TerminalSplitMode>(
               tooltip: '终端分屏',
               initialValue: _splitMode,
               onSelected: (mode) => unawaited(_setSplitMode(mode)),
               itemBuilder: (context) => const [
                 PopupMenuItem(
-                  value: _TerminalSplitMode.none,
+                  value: TerminalSplitMode.none,
                   child: Text('单终端'),
                 ),
                 PopupMenuDivider(),
                 PopupMenuItem(
-                  value: _TerminalSplitMode.vertical,
+                  value: TerminalSplitMode.vertical,
                   child: Text('左右两个终端'),
                 ),
                 PopupMenuItem(
-                  value: _TerminalSplitMode.horizontal,
+                  value: TerminalSplitMode.horizontal,
                   child: Text('上下两个终端'),
                 ),
                 PopupMenuItem(
-                  value: _TerminalSplitMode.quad,
+                  value: TerminalSplitMode.quad,
                   child: Text('四个终端'),
                 ),
               ],
@@ -3399,7 +3440,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   Widget _buildInputBroadcastBanner(ColorScheme colors) {
     final targetIds = <int>{..._multiExecTabIds};
-    if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
+    if (_broadcastSplitInput && _splitMode != TerminalSplitMode.none) {
       targetIds.addAll(_splitTabIds);
     }
     final names = _tabs
@@ -3439,8 +3480,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   Widget _buildTerminalWorkspace(ColorScheme colors) {
-    if (_tabs.isEmpty) return _buildHomeWorkspace(colors);
-    if (_splitMode == _TerminalSplitMode.none) {
+    if (_tabs.isEmpty && _splitMode == TerminalSplitMode.none) {
+      return _buildHomeWorkspace(colors);
+    }
+    if (_splitMode == TerminalSplitMode.none) {
       final activeIndex = _tabs.indexWhere((tab) => tab.id == _activeTabId);
       return IndexedStack(
         index: activeIndex < 0 ? 0 : activeIndex,
@@ -3457,9 +3500,24 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       if (index >= visibleTabs.length) {
         return Expanded(
           child: Center(
-            child: Text(
-              '打开一个会话即可填入此窗格',
-              style: TextStyle(color: colors.onSurfaceVariant),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.terminal_rounded, size: 28, color: colors.outline),
+                const SizedBox(height: 8),
+                Text(
+                  '此窗格尚未连接',
+                  style: TextStyle(color: colors.onSurfaceVariant),
+                ),
+                const SizedBox(height: 6),
+                FilledButton.tonalIcon(
+                  onPressed: () => unawaited(
+                    _handleNewSession(_NewSessionAction.quickConnect),
+                  ),
+                  icon: const Icon(Icons.add_rounded, size: 17),
+                  label: const Text('连接会话'),
+                ),
+              ],
             ),
           ),
         );
@@ -3519,10 +3577,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
 
     return switch (_splitMode) {
-      _TerminalSplitMode.none => _buildTerminalPane(visibleTabs.first, colors),
-      _TerminalSplitMode.vertical => Row(children: [paneAt(0), paneAt(1)]),
-      _TerminalSplitMode.horizontal => Column(children: [paneAt(0), paneAt(1)]),
-      _TerminalSplitMode.quad => Column(
+      TerminalSplitMode.none => _buildTerminalPane(visibleTabs.first, colors),
+      TerminalSplitMode.vertical => Row(children: [paneAt(0), paneAt(1)]),
+      TerminalSplitMode.horizontal => Column(children: [paneAt(0), paneAt(1)]),
+      TerminalSplitMode.quad => Column(
         children: [
           Expanded(child: Row(children: [paneAt(0), paneAt(1)])),
           Expanded(child: Row(children: [paneAt(2), paneAt(3)])),
@@ -3965,48 +4023,49 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     if (event is KeyUpEvent) return KeyEventResult.ignored;
 
     if (event is KeyDownEvent) {
-      final commandPressed = defaultTargetPlatform == TargetPlatform.macOS
+      final primaryPressed = defaultTargetPlatform == TargetPlatform.macOS
           ? HardwareKeyboard.instance.isMetaPressed
           : HardwareKeyboard.instance.isControlPressed;
       final shiftPressed = HardwareKeyboard.instance.isShiftPressed;
-      if (commandPressed &&
-          shiftPressed &&
-          event.logicalKey == LogicalKeyboardKey.keyT) {
+      final altPressed = HardwareKeyboard.instance.isAltPressed;
+      final shortcuts = widget.settings.terminalShortcuts;
+      bool matches(TerminalShortcutAction action) => shortcuts[action]!.matches(
+        event,
+        primaryPressed: primaryPressed,
+        shiftPressed: shiftPressed,
+        altPressed: altPressed,
+      );
+
+      if (matches(TerminalShortcutAction.newLocalTerminal)) {
         _addLocalShellTab();
         return KeyEventResult.handled;
       }
-      if (commandPressed &&
-          shiftPressed &&
-          event.logicalKey == LogicalKeyboardKey.keyQ) {
+      if (matches(TerminalShortcutAction.quickConnect)) {
         unawaited(_handleNewSession(_NewSessionAction.quickConnect));
         return KeyEventResult.handled;
       }
-      if (commandPressed &&
-          !shiftPressed &&
-          event.logicalKey == LogicalKeyboardKey.keyF) {
+      if (matches(TerminalShortcutAction.search)) {
         unawaited(_openTerminalSearch(tab));
         return KeyEventResult.handled;
       }
-      if (commandPressed &&
-          shiftPressed &&
-          event.logicalKey == LogicalKeyboardKey.keyC) {
+      if (matches(TerminalShortcutAction.copy)) {
         unawaited(_copyTerminalSelection(tab));
         return KeyEventResult.handled;
       }
-      if (commandPressed &&
-          shiftPressed &&
-          event.logicalKey == LogicalKeyboardKey.keyV) {
+      if (matches(TerminalShortcutAction.paste)) {
         unawaited(_pasteClipboard(tab));
         return KeyEventResult.handled;
       }
-      if (commandPressed &&
-          !shiftPressed &&
-          event.logicalKey == LogicalKeyboardKey.keyW) {
+      if (matches(TerminalShortcutAction.closeTab)) {
         unawaited(_closeTab(tab));
         return KeyEventResult.handled;
       }
-      if (commandPressed && event.logicalKey == LogicalKeyboardKey.tab) {
-        _selectAdjacentTab(shiftPressed ? -1 : 1);
+      if (matches(TerminalShortcutAction.nextTab)) {
+        _selectAdjacentTab(1);
+        return KeyEventResult.handled;
+      }
+      if (matches(TerminalShortcutAction.previousTab)) {
+        _selectAdjacentTab(-1);
         return KeyEventResult.handled;
       }
     }
@@ -4075,19 +4134,6 @@ enum _SshConfigImportSource { defaultConfig, chooseFile }
 enum _SidebarSection { sessions, files }
 
 enum _RecordAction { save, rename, delete, removeRecent, moveGroup }
-
-enum _TerminalSplitMode {
-  none,
-  vertical,
-  horizontal,
-  quad;
-
-  int get capacity => switch (this) {
-    _TerminalSplitMode.none => 1,
-    _TerminalSplitMode.vertical || _TerminalSplitMode.horizontal => 2,
-    _TerminalSplitMode.quad => 4,
-  };
-}
 
 enum _TranscriptCloseAction { save, discard, cancel }
 

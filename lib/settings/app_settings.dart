@@ -4,8 +4,11 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xterm/xterm.dart';
+
+import '../terminal/terminal_shortcuts.dart';
 
 enum AppThemeStyle { light, emerald, ocean, graphite }
 
@@ -99,6 +102,7 @@ class AppSettingsController extends ChangeNotifier {
     required int sshKeepAliveSeconds,
     required this._rememberWindowBounds,
     required this._windowBounds,
+    required this._terminalShortcuts,
     required String? passwordSalt,
     required String? passwordVerifier,
   }) : // The constructor uses a public named parameter for the private field.
@@ -124,6 +128,8 @@ class AppSettingsController extends ChangeNotifier {
   static const _windowTopKey = 'geekcore_term.settings.window_top.v1';
   static const _windowWidthKey = 'geekcore_term.settings.window_width.v1';
   static const _windowHeightKey = 'geekcore_term.settings.window_height.v1';
+  static const _terminalShortcutsKey =
+      'geekcore_term.settings.terminal_shortcuts.v1';
   static const _passwordSaltKey = 'geekcore_term.settings.password_salt.v1';
   static const _passwordVerifierKey =
       'geekcore_term.settings.password_verifier.v1';
@@ -136,6 +142,7 @@ class AppSettingsController extends ChangeNotifier {
   double _terminalFontSize;
   TerminalFontFamily _terminalFontFamily;
   int _sshKeepAliveSeconds;
+  Map<TerminalShortcutAction, TerminalShortcutBinding> _terminalShortcuts;
   bool _rememberWindowBounds;
   WindowBounds? _windowBounds;
   String? _passwordSalt;
@@ -157,6 +164,9 @@ class AppSettingsController extends ChangeNotifier {
     final sshKeepAliveSeconds = await preferences.getInt(
       _sshKeepAliveSecondsKey,
     );
+    final terminalShortcuts = _parseTerminalShortcuts(
+      await preferences.getString(_terminalShortcutsKey),
+    );
     final bounds =
         left == null || top == null || width == null || height == null
         ? null
@@ -175,6 +185,7 @@ class AppSettingsController extends ChangeNotifier {
       rememberWindowBounds:
           await preferences.getBool(_rememberWindowKey) ?? true,
       windowBounds: bounds?.isUsable == true ? bounds : null,
+      terminalShortcuts: terminalShortcuts,
       passwordSalt: salt,
       passwordVerifier: verifier,
     );
@@ -184,6 +195,8 @@ class AppSettingsController extends ChangeNotifier {
   double get terminalFontSize => _terminalFontSize;
   TerminalFontFamily get terminalFontFamily => _terminalFontFamily;
   int get sshKeepAliveSeconds => _sshKeepAliveSeconds;
+  Map<TerminalShortcutAction, TerminalShortcutBinding> get terminalShortcuts =>
+      Map.unmodifiable(_terminalShortcuts);
   bool get rememberWindowBounds => _rememberWindowBounds;
   WindowBounds? get windowBounds => _windowBounds;
   bool get hasMasterPassword =>
@@ -292,6 +305,43 @@ class AppSettingsController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> setTerminalShortcut(
+    TerminalShortcutAction action,
+    TerminalShortcutBinding binding,
+  ) async {
+    final key = LogicalKeyboardKey.findKeyByKeyId(binding.keyId);
+    if (key == null || isTerminalShortcutModifier(key)) {
+      throw ArgumentError.value(binding, 'binding', '快捷键组合无效');
+    }
+    for (final entry in _terminalShortcuts.entries) {
+      if (entry.key != action && entry.value == binding) {
+        throw ArgumentError.value(
+          binding,
+          'binding',
+          '此组合已用于“${entry.key.label}”',
+        );
+      }
+    }
+    final updated = Map<TerminalShortcutAction, TerminalShortcutBinding>.of(
+      _terminalShortcuts,
+    )..[action] = binding;
+    await _preferences.setString(
+      _terminalShortcutsKey,
+      jsonEncode({
+        for (final entry in updated.entries)
+          entry.key.name: entry.value.toJson(),
+      }),
+    );
+    _terminalShortcuts = updated;
+    notifyListeners();
+  }
+
+  Future<void> resetTerminalShortcuts() async {
+    await _preferences.remove(_terminalShortcutsKey);
+    _terminalShortcuts = defaultTerminalShortcutBindings;
+    notifyListeners();
+  }
+
   Future<void> setRememberWindowBounds(bool remember) async {
     if (_rememberWindowBounds == remember) return;
     await _preferences.setBool(_rememberWindowKey, remember);
@@ -363,12 +413,41 @@ class AppSettingsController extends ChangeNotifier {
     _terminalFontSize = 14;
     _terminalFontFamily = TerminalFontFamily.system;
     _sshKeepAliveSeconds = 10;
+    _terminalShortcuts = defaultTerminalShortcutBindings;
     _rememberWindowBounds = true;
     _windowBounds = null;
     _passwordSalt = null;
     _passwordVerifier = null;
     _isLocked = false;
     notifyListeners();
+  }
+
+  static Map<TerminalShortcutAction, TerminalShortcutBinding>
+  _parseTerminalShortcuts(String? encoded) {
+    final shortcuts = Map<TerminalShortcutAction, TerminalShortcutBinding>.of(
+      defaultTerminalShortcutBindings,
+    );
+    if (encoded == null) return shortcuts;
+    try {
+      final decoded = jsonDecode(encoded);
+      if (decoded is! Map<String, dynamic>) return shortcuts;
+      for (final entry in decoded.entries) {
+        final action = TerminalShortcutAction.values
+            .where((value) => value.name == entry.key)
+            .firstOrNull;
+        if (action == null) continue;
+        final binding = TerminalShortcutBinding.fromJson(entry.value);
+        final previous = shortcuts.remove(action);
+        if (shortcuts.values.contains(binding)) {
+          if (previous != null) shortcuts[action] = previous;
+          continue;
+        }
+        shortcuts[action] = binding;
+      }
+    } on Object {
+      return Map.of(defaultTerminalShortcutBindings);
+    }
+    return shortcuts;
   }
 }
 

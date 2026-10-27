@@ -6,6 +6,22 @@ import 'remote_transfer_queue_store.dart';
 
 enum SessionProtocol { serial, telnet, ssh }
 
+enum TerminalSplitMode {
+  none,
+  vertical,
+  horizontal,
+  quad;
+
+  int get capacity => switch (this) {
+    TerminalSplitMode.none => 1,
+    TerminalSplitMode.vertical || TerminalSplitMode.horizontal => 2,
+    TerminalSplitMode.quad => 4,
+  };
+
+  static TerminalSplitMode fromName(String? name) =>
+      values.where((mode) => mode.name == name).firstOrNull ?? none;
+}
+
 enum SshAuthenticationMode { automatic, passwordFirst, keyFirst }
 
 enum PortKnockProtocol { tcp, udp, icmp }
@@ -377,6 +393,7 @@ class SessionStore {
   static const _groupsKey = 'geekcore_term.session_groups.v1';
   static const _snippetsKey = 'geekcore_term.command_snippets.v1';
   static const _sshHostKeysKey = 'geekcore_term.ssh_host_keys.v1';
+  static const _terminalSplitModeKey = 'geekcore_term.terminal_split_mode.v1';
 
   final SharedPreferencesAsync _preferences;
   Future<void> _writeQueue = Future<void>.value();
@@ -387,6 +404,11 @@ class SessionStore {
 
   Future<List<String>> loadGroups() async =>
       await _preferences.getStringList(_groupsKey) ?? const [];
+
+  Future<TerminalSplitMode> loadTerminalSplitMode() async =>
+      TerminalSplitMode.fromName(
+        await _preferences.getString(_terminalSplitModeKey),
+      );
 
   Future<List<CommandSnippet>> loadCommandSnippets() async {
     final encodedSnippets =
@@ -411,6 +433,10 @@ class SessionStore {
   Future<void> saveGroups(List<String> groups) =>
       _enqueueWrite(() => _preferences.setStringList(_groupsKey, groups));
 
+  Future<void> saveTerminalSplitMode(TerminalSplitMode mode) => _enqueueWrite(
+    () => _preferences.setString(_terminalSplitModeKey, mode.name),
+  );
+
   Future<void> saveCommandSnippets(List<CommandSnippet> snippets) =>
       _enqueueWrite(
         () => _preferences.setStringList(
@@ -425,6 +451,7 @@ class SessionStore {
     await _preferences.remove(_groupsKey);
     await _preferences.remove(_snippetsKey);
     await _preferences.remove(_sshHostKeysKey);
+    await _preferences.remove(_terminalSplitModeKey);
     await _preferences.remove(RemoteTransferQueueStore.storageKey);
   });
 

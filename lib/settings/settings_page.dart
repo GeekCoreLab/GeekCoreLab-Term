@@ -2,8 +2,10 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'app_settings.dart';
+import '../terminal/terminal_shortcuts.dart';
 import 'window_state.dart';
 
 class AppSettingsPage extends StatefulWidget {
@@ -97,6 +99,30 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
     }
   }
 
+  Future<void> _editTerminalShortcut(TerminalShortcutAction action) async {
+    final current = widget.settings.terminalShortcuts[action]!;
+    final binding = await showDialog<TerminalShortcutBinding>(
+      context: context,
+      builder: (_) => _TerminalShortcutDialog(action: action, current: current),
+    );
+    if (binding == null || !mounted) return;
+    try {
+      await widget.settings.setTerminalShortcut(action, binding);
+      if (mounted) setState(() {});
+    } catch (error) {
+      if (mounted) _showMessage('保存快捷键失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _resetTerminalShortcuts() async {
+    try {
+      await widget.settings.resetTerminalShortcuts();
+      if (mounted) setState(() {});
+    } catch (error) {
+      if (mounted) _showMessage('恢复默认快捷键失败：$error', isError: true);
+    }
+  }
+
   Future<void> _confirmClearAppData() async {
     final accepted = await showDialog<bool>(
       context: context,
@@ -104,7 +130,7 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
         icon: const Icon(Icons.delete_forever_outlined),
         title: const Text('清除应用数据？'),
         content: const Text(
-          '这会删除已保存和最近连接、SSH 登录凭据与主机信任、主题和窗口设置、主密码，并关闭当前打开的会话。此操作无法撤销。',
+          '这会删除已保存和最近连接、SSH 登录凭据与主机信任、主题和窗口设置、终端布局、主密码，并关闭当前打开的会话。此操作无法撤销。',
         ),
         actions: [
           TextButton(
@@ -330,6 +356,47 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
                 ),
                 const SizedBox(height: 16),
                 _SettingsSection(
+                  icon: Icons.keyboard_command_key_rounded,
+                  title: '终端快捷键',
+                  subtitle: '按下新的 Ctrl/Command 组合；Alt 与 AltGr 保留给文字输入',
+                  child: Column(
+                    children: [
+                      for (final action in TerminalShortcutAction.values)
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(action.label),
+                          trailing: OutlinedButton(
+                            onPressed: _clearing
+                                ? null
+                                : () =>
+                                      unawaited(_editTerminalShortcut(action)),
+                            child: Text(
+                              widget.settings.terminalShortcuts[action]!.label(
+                                isMacOS:
+                                    defaultTargetPlatform ==
+                                    TargetPlatform.macOS,
+                              ),
+                            ),
+                          ),
+                          onTap: _clearing
+                              ? null
+                              : () => unawaited(_editTerminalShortcut(action)),
+                        ),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton.icon(
+                          onPressed: _clearing
+                              ? null
+                              : () => unawaited(_resetTerminalShortcuts()),
+                          icon: const Icon(Icons.restart_alt_rounded, size: 18),
+                          label: const Text('恢复默认快捷键'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _SettingsSection(
                   icon: Icons.password_rounded,
                   title: '主密码',
                   subtitle: settings.hasMasterPassword
@@ -489,6 +556,112 @@ class _SettingsSection extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _TerminalShortcutDialog extends StatefulWidget {
+  const _TerminalShortcutDialog({required this.action, required this.current});
+
+  final TerminalShortcutAction action;
+  final TerminalShortcutBinding current;
+
+  @override
+  State<_TerminalShortcutDialog> createState() =>
+      _TerminalShortcutDialogState();
+}
+
+class _TerminalShortcutDialogState extends State<_TerminalShortcutDialog> {
+  String? _error;
+
+  KeyEventResult _capture(FocusNode _, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      Navigator.pop(context);
+      return KeyEventResult.handled;
+    }
+    if (isTerminalShortcutModifier(event.logicalKey)) {
+      return KeyEventResult.handled;
+    }
+
+    final keyboard = HardwareKeyboard.instance;
+    final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
+    final primary = isMacOS
+        ? keyboard.isMetaPressed
+        : keyboard.isControlPressed;
+    if (!primary) {
+      setState(() => _error = '请同时按住 Ctrl 或 Command');
+      return KeyEventResult.handled;
+    }
+
+    Navigator.pop(
+      context,
+      TerminalShortcutBinding(
+        keyId: event.logicalKey.keyId,
+        shift: keyboard.isShiftPressed,
+      ),
+    );
+    return KeyEventResult.handled;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
+    return AlertDialog(
+      icon: const Icon(Icons.keyboard_command_key_rounded),
+      title: Text('设置“${widget.action.label}”'),
+      content: ConstrainedBox(
+        constraints: const BoxConstraints(minWidth: 280, maxWidth: 420),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text('点击下方区域并按下新的组合键。Esc 取消。'),
+            const SizedBox(height: 14),
+            Focus(
+              autofocus: true,
+              onKeyEvent: _capture,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 20,
+                ),
+                decoration: BoxDecoration(
+                  color: colors.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: colors.outlineVariant),
+                ),
+                child: Column(
+                  children: [
+                    Icon(Icons.keyboard_rounded, color: colors.primary),
+                    const SizedBox(height: 8),
+                    Text(
+                      widget.current.label(isMacOS: isMacOS),
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '等待按键…',
+                      style: TextStyle(color: colors.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(_error!, style: TextStyle(color: colors.error)),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+      ],
     );
   }
 }

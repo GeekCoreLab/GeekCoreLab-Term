@@ -153,6 +153,23 @@ void main() {
     expect(await store.loadCommandSnippets(), [snippet]);
   });
 
+  test('SessionStore restores and clears the terminal split layout', () async {
+    SharedPreferencesAsyncPlatform.instance =
+        InMemorySharedPreferencesAsync.empty();
+    addTearDown(() => SharedPreferencesAsyncPlatform.instance = null);
+    final store = SessionStore();
+
+    expect(await store.loadTerminalSplitMode(), TerminalSplitMode.none);
+    await store.saveTerminalSplitMode(TerminalSplitMode.quad);
+    expect(
+      await SessionStore().loadTerminalSplitMode(),
+      TerminalSplitMode.quad,
+    );
+
+    await store.clear();
+    expect(await store.loadTerminalSplitMode(), TerminalSplitMode.none);
+  });
+
   test(
     'clearing app session data also clears persisted transfer tasks',
     () async {

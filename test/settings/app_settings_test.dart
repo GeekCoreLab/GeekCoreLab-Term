@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
 import 'package:geekcore_term/settings/settings_page.dart';
+import 'package:geekcore_term/terminal/terminal_shortcuts.dart';
 import 'package:shared_preferences_platform_interface/in_memory_shared_preferences_async.dart';
 import 'package:shared_preferences_platform_interface/shared_preferences_async_platform_interface.dart';
 
@@ -45,6 +47,10 @@ void main() {
     await settings.setTerminalFontSize(19);
     await settings.setTerminalFontFamily(TerminalFontFamily.firaCode);
     await settings.setSshKeepAliveSeconds(60);
+    await settings.setTerminalShortcut(
+      TerminalShortcutAction.search,
+      TerminalShortcutBinding(keyId: LogicalKeyboardKey.keyE.keyId),
+    );
 
     await settings.clearAll();
 
@@ -52,6 +58,10 @@ void main() {
     expect(settings.terminalFontSize, 14);
     expect(settings.terminalFontFamily, TerminalFontFamily.system);
     expect(settings.sshKeepAliveSeconds, 10);
+    expect(
+      settings.terminalShortcuts[TerminalShortcutAction.search],
+      defaultTerminalShortcutBindings[TerminalShortcutAction.search],
+    );
   });
 
   test('persists supported SSH keep-alive intervals only', () async {
@@ -62,6 +72,75 @@ void main() {
     expect((await AppSettingsController.load()).sshKeepAliveSeconds, 30);
     await expectLater(settings.setSshKeepAliveSeconds(15), throwsArgumentError);
   });
+
+  test(
+    'persists custom terminal shortcuts and rejects duplicate bindings',
+    () async {
+      final settings = await AppSettingsController.load();
+      final custom = TerminalShortcutBinding(
+        keyId: LogicalKeyboardKey.keyE.keyId,
+        shift: true,
+      );
+
+      await settings.setTerminalShortcut(TerminalShortcutAction.search, custom);
+      expect(
+        (await AppSettingsController.load())
+            .terminalShortcuts[TerminalShortcutAction.search],
+        custom,
+      );
+      await expectLater(
+        settings.setTerminalShortcut(TerminalShortcutAction.copy, custom),
+        throwsArgumentError,
+      );
+      await settings.resetTerminalShortcuts();
+      expect(
+        settings.terminalShortcuts[TerminalShortcutAction.search],
+        defaultTerminalShortcutBindings[TerminalShortcutAction.search],
+      );
+    },
+  );
+
+  test(
+    'shortcut matches exact modifiers and leaves Alt combinations alone',
+    () {
+      final binding = TerminalShortcutBinding(
+        keyId: LogicalKeyboardKey.keyF.keyId,
+      );
+      const event = KeyDownEvent(
+        physicalKey: PhysicalKeyboardKey.keyF,
+        logicalKey: LogicalKeyboardKey.keyF,
+        timeStamp: Duration.zero,
+      );
+
+      expect(
+        binding.matches(
+          event,
+          primaryPressed: true,
+          shiftPressed: false,
+          altPressed: false,
+        ),
+        isTrue,
+      );
+      expect(
+        binding.matches(
+          event,
+          primaryPressed: true,
+          shiftPressed: false,
+          altPressed: true,
+        ),
+        isFalse,
+      );
+      expect(
+        binding.matches(
+          event,
+          primaryPressed: true,
+          shiftPressed: true,
+          altPressed: false,
+        ),
+        isFalse,
+      );
+    },
+  );
 
   testWidgets('settings page applies and displays the selected font size', (
     tester,
@@ -106,5 +185,38 @@ void main() {
     await tester.tap(find.text('30 秒'));
     await tester.pumpAndSettle();
     expect(settings.sshKeepAliveSeconds, 30);
+  });
+
+  testWidgets('settings page records a Ctrl shortcut without AltGr capture', (
+    tester,
+  ) async {
+    final settings = await AppSettingsController.load();
+    addTearDown(settings.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: settings.themeData,
+        home: AppSettingsPage(settings: settings, onClearAppData: () async {}),
+      ),
+    );
+    await tester.scrollUntilVisible(
+      find.text('Ctrl+F'),
+      300,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Ctrl+F'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('设置“搜索终端输出”'), findsOneWidget);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.keyE);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.keyE);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+
+    expect(
+      settings.terminalShortcuts[TerminalShortcutAction.search]?.keyId,
+      LogicalKeyboardKey.keyE.keyId,
+    );
   });
 }
