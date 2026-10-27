@@ -73,6 +73,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   String _sessionSearch = '';
   String? _sessionGroupFilter;
   _SidebarSection _sidebarSection = _SidebarSection.sessions;
+  bool _assistantPanelOpen = true;
   bool _clearingAppData = false;
   int _nextTabId = 1;
   int? _activeTabId;
@@ -904,7 +905,17 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   void _writeTerminalOutput(_TerminalTab tab, String value) {
-    tab.terminal.write(value);
+    tab.inlineHintTransformer.onFlush ??= (flushedText) {
+      if (!tab.isClosed && mounted) {
+        tab.terminal.write(flushedText);
+      }
+    };
+    final terminalOutput = widget.settings.terminalAssistantInlineHints
+        ? tab.inlineHintTransformer.transform(value)
+        : value;
+    if (terminalOutput.isNotEmpty) {
+      tab.terminal.write(terminalOutput);
+    }
     if (!tab.isClosed) {
       tab.keywordHighlighter.schedule(
         tab.terminal,
@@ -954,6 +965,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         tab.scrollController.dispose();
         tab.remoteMonitorCache.dispose();
         tab.assistant.dispose();
+        tab.inlineHintTransformer.dispose();
         await _disposeTab(tab);
       }
 
@@ -1691,6 +1703,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.scrollController.dispose();
       tab.remoteMonitorCache.dispose();
       tab.assistant.dispose();
+      tab.inlineHintTransformer.dispose();
     });
     unawaited(_disposeTab(tab));
     if (nextTab != null) _focusTab(nextTab);
@@ -2745,6 +2758,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     if (tab.isClosed || tab.starting || tab.restarting) return;
     _stopInputRecordingOnDisconnect(tab);
     tab.assistant.reset();
+    tab.inlineHintTransformer.reset();
     tab.restarting = true;
     tab.starting = true;
     tab.status = '正在重新连接${tab.connection.displayName}';
@@ -3048,6 +3062,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.scrollController.dispose();
       tab.remoteMonitorCache.dispose();
       tab.assistant.dispose();
+      tab.inlineHintTransformer.dispose();
       unawaited(_disposeTab(tab));
     }
     _tabs.clear();
@@ -3516,13 +3531,29 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   TerminalAssistantPanel(
                     analyzer: activeTab?.assistant,
                     sessionTitle: activeTab?.title,
+                    inlineHintsEnabled:
+                        widget.settings.terminalAssistantInlineHints,
+                    onToggleInlineHints: (value) => unawaited(
+                      widget.settings.setTerminalAssistantInlineHints(value),
+                    ),
                   ),
-                VerticalDivider(
-                  width: 1,
-                  thickness: 1,
-                  color: colors.outlineVariant,
-                ),
                 Expanded(child: terminalArea),
+                if (_assistantPanelOpen) ...[
+                  VerticalDivider(
+                    width: 1,
+                    thickness: 1,
+                    color: colors.outlineVariant,
+                  ),
+                  TerminalAssistantPanel(
+                    analyzer: activeTab?.assistant,
+                    sessionTitle: activeTab?.title,
+                    inlineHintsEnabled:
+                        widget.settings.terminalAssistantInlineHints,
+                    onToggleInlineHints: (value) => unawaited(
+                      widget.settings.setTerminalAssistantInlineHints(value),
+                    ),
+                  ),
+                ],
               ],
             ),
     );
@@ -4403,6 +4434,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             _SidebarSection.assistant => TerminalAssistantPanel(
               analyzer: _activeTab?.assistant,
               sessionTitle: _activeTab?.title,
+              inlineHintsEnabled: widget.settings.terminalAssistantInlineHints,
+              onToggleInlineHints: (value) => unawaited(
+                widget.settings.setTerminalAssistantInlineHints(value),
+              ),
               width: width,
             ),
           };
@@ -4538,7 +4573,30 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               ],
               icon: const Icon(Icons.view_quilt_outlined, size: 20),
             ),
-            const SizedBox(width: 12),
+            IconButton(
+              tooltip: _assistantPanelOpen ? '隐藏终端助手' : '显示终端助手',
+              onPressed: () => setState(
+                () => _assistantPanelOpen = !_assistantPanelOpen,
+              ),
+              color: _assistantPanelOpen ? colors.primary : null,
+              icon: _activeTab == null
+                  ? const Icon(Icons.tips_and_updates_outlined, size: 20)
+                  : ListenableBuilder(
+                      listenable: _activeTab!.assistant,
+                      builder: (context, _) {
+                        final count = _activeTab!.assistant.findings.length;
+                        return Badge(
+                          isLabelVisible: count > 0,
+                          label: Text(count > 9 ? '9+' : '$count'),
+                          child: const Icon(
+                            Icons.tips_and_updates_outlined,
+                            size: 20,
+                          ),
+                        );
+                      },
+                    ),
+            ),
+            const SizedBox(width: 8),
           ],
         ),
       ),
@@ -8008,6 +8066,8 @@ class _TerminalTab {
   final BytesBuilder pendingInput = BytesBuilder(copy: false);
   final TerminalTranscript transcript = TerminalTranscript();
   final TerminalAssistantAnalyzer assistant = TerminalAssistantAnalyzer();
+  final TerminalInlineHintTransformer inlineHintTransformer =
+      TerminalInlineHintTransformer();
   final TerminalInputRecorder inputRecorder = TerminalInputRecorder();
   late final TerminalKeywordHighlighter keywordHighlighter =
       TerminalKeywordHighlighter(terminalController);

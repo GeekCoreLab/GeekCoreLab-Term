@@ -79,6 +79,17 @@ void main() {
     expect(find.text('快速连接'), findsOneWidget);
     expect(find.byTooltip('录制键盘输入'), findsOneWidget);
     expect(find.byTooltip('录制宏管理'), findsOneWidget);
+    expect(find.byTooltip('终端分屏'), findsOneWidget);
+    expect(find.byTooltip('隐藏终端助手'), findsOneWidget);
+
+    // Toggle assistant panel from the top right button
+    await tester.tap(find.byTooltip('隐藏终端助手'));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('显示终端助手'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('显示终端助手'));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('隐藏终端助手'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

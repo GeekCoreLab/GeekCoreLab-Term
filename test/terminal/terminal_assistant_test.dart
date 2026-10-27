@@ -114,4 +114,52 @@ void main() {
     expect(find.text('getent ahosts HOSTNAME'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  group('TerminalInlineHintTransformer', () {
+    test('transforms systemctl status output with GUI-styled inline hints', () {
+      final transformer = TerminalInlineHintTransformer();
+      final line1 =
+          'Loaded: loaded (/etc/systemd/system/k3s.service; enabled; preset: enabled)\r\n';
+      final out1 = transformer.transform(line1);
+
+      expect(out1, contains('enabled'));
+      expect(out1, contains('已启用'));
+
+      final line2 =
+          '     Active: active (running) since Tue 2026-10-20 02:53:47 UTC; 1 week 0 days ago\r\n';
+      final out2 = transformer.transform(line2);
+
+      expect(out2, contains('active'));
+      expect(out2, contains('活跃'));
+      expect(out2, contains('running'));
+      expect(out2, contains('运行中'));
+      expect(out2, contains('本地 '));
+      expect(out2, contains('1周0天前'));
+    });
+
+    test('handles split chunks across lines without losing text', () {
+      final transformer = TerminalInlineHintTransformer();
+      final chunk1 = 'Loaded: loaded (/etc/systemd/system/test.service; en';
+      final chunk2 = 'abled; preset: disabled)\n';
+      expect(transformer.transform(chunk1), isEmpty);
+      final out2 = transformer.transform(chunk2);
+      expect(out2, contains('enabled'));
+      expect(out2, contains('已启用'));
+      expect(out2, contains('disabled'));
+      expect(out2, contains('已禁用'));
+    });
+
+    test('flushes trailing partial lines like prompts asynchronously', () async {
+      final transformer = TerminalInlineHintTransformer();
+      String flushed = '';
+      transformer.onFlush = (text) => flushed += text;
+
+      final immediate = transformer.transform('root@bt-main:~# ');
+      expect(immediate, isEmpty);
+      expect(flushed, isEmpty);
+
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(flushed, 'root@bt-main:~# ');
+    });
+  });
 }

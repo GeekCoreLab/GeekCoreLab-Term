@@ -7,12 +7,16 @@ class TerminalAssistantPanel extends StatelessWidget {
   const TerminalAssistantPanel({
     required this.analyzer,
     required this.sessionTitle,
+    this.inlineHintsEnabled,
+    this.onToggleInlineHints,
     this.width = 260,
     super.key,
   });
 
   final TerminalAssistantAnalyzer? analyzer;
   final String? sessionTitle;
+  final bool? inlineHintsEnabled;
+  final ValueChanged<bool>? onToggleInlineHints;
   final double width;
 
   @override
@@ -73,6 +77,32 @@ class TerminalAssistantPanel extends StatelessWidget {
                               ?.copyWith(color: colors.onSurfaceVariant),
                         ),
                       ),
+                      if (inlineHintsEnabled != null) ...[
+                        const Divider(height: 1),
+                        Material(
+                          color: Colors.transparent,
+                          child: SwitchListTile.adaptive(
+                            dense: true,
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 2,
+                            ),
+                            title: const Text(
+                              '内联提示',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                            subtitle: const Text(
+                              '输出服务状态与时间时插入直观标签',
+                              style: TextStyle(fontSize: 11),
+                            ),
+                            value: inlineHintsEnabled!,
+                            onChanged: onToggleInlineHints,
+                          ),
+                        ),
+                      ],
                       const Divider(height: 1),
                       Expanded(
                         child: findings.isEmpty

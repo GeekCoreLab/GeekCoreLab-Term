@@ -439,6 +439,23 @@ class _AppSettingsPageState extends State<AppSettingsPage> {
                 ),
                 const SizedBox(height: 16),
                 _SettingsSection(
+                  icon: Icons.tips_and_updates_outlined,
+                  title: '终端助手内联提示',
+                  subtitle: '在终端输出特定系统状态与时间信息后显示内联 GUI 标签提示',
+                  child: SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('开启内联提示'),
+                    subtitle: const Text('开启后在 systemctl status 等命令输出后插入直观状态与时间提示'),
+                    value: settings.terminalAssistantInlineHints,
+                    onChanged: _clearing
+                        ? null
+                        : (value) => unawaited(
+                            settings.setTerminalAssistantInlineHints(value),
+                          ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _SettingsSection(
                   icon: Icons.timer_outlined,
                   title: 'SSH 连接保活',
                   subtitle: '定期发送 SSH 保活请求，帮助维持空闲连接',

@@ -90,6 +90,24 @@ void main() {
     },
   );
 
+  test('persists terminal assistant inline hints setting', () async {
+    final settings = await AppSettingsController.load();
+    expect(settings.terminalAssistantInlineHints, isTrue);
+
+    await settings.setTerminalAssistantInlineHints(false);
+    expect(settings.terminalAssistantInlineHints, isFalse);
+    expect(
+      (await AppSettingsController.load()).terminalAssistantInlineHints,
+      isFalse,
+    );
+
+    await settings.setTerminalAssistantInlineHints(true);
+    expect(
+      (await AppSettingsController.load()).terminalAssistantInlineHints,
+      isTrue,
+    );
+  });
+
   test('clearAll restores first-run appearance defaults', () async {
     final settings = await AppSettingsController.load();
     await settings.setThemeStyle(AppThemeStyle.graphite);

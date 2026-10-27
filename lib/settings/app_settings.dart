@@ -105,6 +105,7 @@ class AppSettingsController extends ChangeNotifier {
     required this._windowBounds,
     required this._terminalShortcuts,
     required List<TerminalKeywordRule> terminalKeywordRules,
+    required bool terminalAssistantInlineHints,
     required this._startupSessionGroup,
     required String? passwordSalt,
     required String? passwordVerifier,
@@ -116,6 +117,7 @@ class AppSettingsController extends ChangeNotifier {
        // ignore: prefer_initializing_formals
        _sshKeepAliveSeconds = sshKeepAliveSeconds,
        _terminalKeywordRules = List.unmodifiable(terminalKeywordRules),
+       _terminalAssistantInlineHints = terminalAssistantInlineHints,
        _passwordSalt = passwordSalt,
        _passwordVerifier = passwordVerifier,
        _isLocked = passwordSalt != null && passwordVerifier != null;
@@ -136,6 +138,8 @@ class AppSettingsController extends ChangeNotifier {
       'geekcore_term.settings.terminal_shortcuts.v1';
   static const _terminalKeywordRulesKey =
       'geekcore_term.settings.terminal_keyword_rules.v1';
+  static const _terminalAssistantInlineHintsKey =
+      'geekcore_term.settings.terminal_assistant_inline_hints.v1';
   static const _startupSessionGroupKey =
       'geekcore_term.settings.startup_session_group.v1';
   static const _passwordSaltKey = 'geekcore_term.settings.password_salt.v1';
@@ -152,6 +156,7 @@ class AppSettingsController extends ChangeNotifier {
   int _sshKeepAliveSeconds;
   Map<TerminalShortcutAction, TerminalShortcutBinding> _terminalShortcuts;
   List<TerminalKeywordRule> _terminalKeywordRules;
+  bool _terminalAssistantInlineHints;
   String? _startupSessionGroup;
   bool _rememberWindowBounds;
   WindowBounds? _windowBounds;
@@ -180,6 +185,8 @@ class AppSettingsController extends ChangeNotifier {
     final terminalKeywordRules = _parseTerminalKeywordRules(
       await preferences.getString(_terminalKeywordRulesKey),
     );
+    final terminalAssistantInlineHints =
+        await preferences.getBool(_terminalAssistantInlineHintsKey) ?? true;
     final startupSessionGroup = await preferences.getString(
       _startupSessionGroupKey,
     );
@@ -203,6 +210,7 @@ class AppSettingsController extends ChangeNotifier {
       windowBounds: bounds?.isUsable == true ? bounds : null,
       terminalShortcuts: terminalShortcuts,
       terminalKeywordRules: terminalKeywordRules,
+      terminalAssistantInlineHints: terminalAssistantInlineHints,
       startupSessionGroup: startupSessionGroup,
       passwordSalt: salt,
       passwordVerifier: verifier,
@@ -217,6 +225,7 @@ class AppSettingsController extends ChangeNotifier {
       Map.unmodifiable(_terminalShortcuts);
   List<TerminalKeywordRule> get terminalKeywordRules =>
       List.unmodifiable(_terminalKeywordRules);
+  bool get terminalAssistantInlineHints => _terminalAssistantInlineHints;
   String? get startupSessionGroup => _startupSessionGroup;
   bool get rememberWindowBounds => _rememberWindowBounds;
   WindowBounds? get windowBounds => _windowBounds;
@@ -402,6 +411,13 @@ class AppSettingsController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> setTerminalAssistantInlineHints(bool enabled) async {
+    if (_terminalAssistantInlineHints == enabled) return;
+    await _preferences.setBool(_terminalAssistantInlineHintsKey, enabled);
+    _terminalAssistantInlineHints = enabled;
+    notifyListeners();
+  }
+
   Future<void> setStartupSessionGroup(String? group) async {
     final normalized = group?.trim();
     if (normalized != null &&
@@ -494,6 +510,7 @@ class AppSettingsController extends ChangeNotifier {
     _sshKeepAliveSeconds = 10;
     _terminalShortcuts = defaultTerminalShortcutBindings;
     _terminalKeywordRules = const [];
+    _terminalAssistantInlineHints = true;
     _startupSessionGroup = null;
     _rememberWindowBounds = true;
     _windowBounds = null;

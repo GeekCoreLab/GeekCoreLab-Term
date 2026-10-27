@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 class TerminalAssistantFinding {
@@ -336,5 +338,213 @@ class _AnsiOutputFilter {
   void reset() {
     _state = _plain;
     _stringReturnState = _plain;
+  }
+}
+
+class _PendingHintSpan {
+  _PendingHintSpan(this.start, this.text);
+  final int start;
+  final String text;
+}
+
+/// Transforms terminal output stream to insert inline GUI-styled hints
+/// when enabled for status keywords (e.g. enabled, active, running),
+/// UTC timestamps, and elapsed times (xxx ago).
+class TerminalInlineHintTransformer {
+  String _lineBuffer = '';
+  Timer? _flushTimer;
+
+  /// Callback invoked when buffered text (e.g. an unfinished line or shell prompt)
+  /// is flushed asynchronously after a brief pause so terminal displays stay instant.
+  void Function(String)? onFlush;
+
+  String transform(String chunk, {DateTime Function()? clock}) {
+    if (chunk.isEmpty) return chunk;
+
+    _flushTimer?.cancel();
+    _flushTimer = null;
+
+    final combined = '$_lineBuffer$chunk';
+    final lineBreakRegex = RegExp(r'[^\r\n]*(?:\r\n|\n|\r)');
+    final matches = lineBreakRegex.allMatches(combined).toList();
+
+    if (matches.isEmpty) {
+      _lineBuffer = combined;
+      _scheduleFlush(clock: clock);
+      return '';
+    }
+
+    final lastMatch = matches.last;
+    final readyChunk = combined.substring(0, lastMatch.end);
+    _lineBuffer = combined.substring(lastMatch.end);
+
+    if (_lineBuffer.isNotEmpty) {
+      _scheduleFlush(clock: clock);
+    }
+
+    final buffer = StringBuffer();
+    for (final match in matches) {
+      final line = match.group(0)!;
+      buffer.write(_processLine(line, clock: clock));
+    }
+    return buffer.toString();
+  }
+
+  void _scheduleFlush({DateTime Function()? clock}) {
+    _flushTimer?.cancel();
+    _flushTimer = Timer(const Duration(milliseconds: 20), () {
+      if (_lineBuffer.isNotEmpty) {
+        final pending = _processLine(_lineBuffer, clock: clock);
+        _lineBuffer = '';
+        onFlush?.call(pending);
+      }
+    });
+  }
+
+  String flush({DateTime Function()? clock}) {
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    if (_lineBuffer.isEmpty) return '';
+    final res = _processLine(_lineBuffer, clock: clock);
+    _lineBuffer = '';
+    return res;
+  }
+
+  void reset() {
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _lineBuffer = '';
+  }
+
+  void dispose() {
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _lineBuffer = '';
+    onFlush = null;
+  }
+
+  static String _processLine(String line, {DateTime Function()? clock}) {
+    // 1. Strip ANSI escape codes to plain text while building plainIndex -> rawIndex map
+    final plainToRawMap = <int>[];
+    final plainBuffer = StringBuffer();
+
+    final ansiRegex = RegExp(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)');
+    var lastEnd = 0;
+    for (final match in ansiRegex.allMatches(line)) {
+      for (var i = lastEnd; i < match.start; i++) {
+        plainToRawMap.add(i);
+        plainBuffer.write(line[i]);
+      }
+      lastEnd = match.end;
+    }
+    for (var i = lastEnd; i < line.length; i++) {
+      plainToRawMap.add(i);
+      plainBuffer.write(line[i]);
+    }
+    plainToRawMap.add(line.length);
+
+    final plainText = plainBuffer.toString();
+
+    if (!plainText.contains('enabled') &&
+        !plainText.contains('disabled') &&
+        !plainText.contains('active') &&
+        !plainText.contains('running') &&
+        !plainText.contains('inactive') &&
+        !plainText.contains('dead') &&
+        !plainText.contains('failed') &&
+        !plainText.contains('UTC') &&
+        !plainText.contains('ago')) {
+      return line;
+    }
+
+    final insertions = <_PendingHintSpan>[];
+
+    void addWordMatches(String word, String hint, String bg, String fg) {
+      final reg = RegExp('\\b$word\\b');
+      for (final m in reg.allMatches(plainText)) {
+        final rawIndex = plainToRawMap[m.end];
+        insertions.add(_PendingHintSpan(
+          rawIndex,
+          ' \x1b[$bg;$fg;1m $hint \x1b[0m',
+        ));
+      }
+    }
+
+    addWordMatches('enabled', '已启用', '48;2;49;196;141', '38;2;255;255;255');
+    addWordMatches('disabled', '已禁用', '48;2;240;82;82', '38;2;255;255;255');
+    addWordMatches('active', '活跃', '48;2;49;196;141', '38;2;255;255;255');
+    addWordMatches('running', '运行中', '48;2;49;196;141', '38;2;255;255;255');
+    addWordMatches('inactive', '未激活', '48;2;120;130;140', '38;2;255;255;255');
+    addWordMatches('dead', '已停止', '48;2;120;130;140', '38;2;255;255;255');
+    addWordMatches('failed', '失败', '48;2;240;82;82', '38;2;255;255;255');
+
+    final utcReg = RegExp(
+      r'\b(?:[A-Za-z]{3}\s+)?(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+UTC\b',
+    );
+    for (final m in utcReg.allMatches(plainText)) {
+      final dateStr = m.group(1)!;
+      final iso = '${dateStr.replaceAll(' ', 'T')}Z';
+      try {
+        final dt = DateTime.parse(iso).toLocal();
+        String twoDigits(int n) => n.toString().padLeft(2, '0');
+        final formatted =
+            '${dt.year}-${twoDigits(dt.month)}-${twoDigits(dt.day)} '
+            '${twoDigits(dt.hour)}:${twoDigits(dt.minute)}:${twoDigits(dt.second)}';
+        final rawIndex = plainToRawMap[m.end];
+        insertions.add(_PendingHintSpan(
+          rawIndex,
+          ' \x1b[48;2;85;169;232;38;2;255;255;255;1m 本地 $formatted \x1b[0m',
+        ));
+      } catch (_) {}
+    }
+
+    final agoReg = RegExp(
+      r'\b((?:\d+\s*(?:years?|y|months?|mo|weeks?|w|days?|d|hours?|hr|h|minutes?|min|m|seconds?|sec|s)\s*)+ago)\b',
+      caseSensitive: false,
+    );
+    for (final m in agoReg.allMatches(plainText)) {
+      final matchedText = m.group(1)!;
+      final inner = matchedText
+          .replaceAll(RegExp(r'\s*ago$', caseSensitive: false), '')
+          .trim();
+      final buffer = StringBuffer();
+      final partRegex = RegExp(r'(\d+)\s*([a-zA-Z]+)');
+      for (final p in partRegex.allMatches(inner)) {
+        final num = p.group(1)!;
+        final unit = p.group(2)!.toLowerCase();
+        String unitCn = unit;
+        if (unit.startsWith('year') || unit == 'y') {
+          unitCn = '年';
+        } else if (unit.startsWith('month') || unit == 'mo') {
+          unitCn = '个月';
+        } else if (unit.startsWith('week') || unit == 'w') {
+          unitCn = '周';
+        } else if (unit.startsWith('day') || unit == 'd') {
+          unitCn = '天';
+        } else if (unit.startsWith('hour') || unit == 'hr' || unit == 'h') {
+          unitCn = '小时';
+        } else if (unit.startsWith('min') || unit == 'm') {
+          unitCn = '分钟';
+        } else if (unit.startsWith('sec') || unit == 's') {
+          unitCn = '秒';
+        }
+        buffer.write('$num$unitCn');
+      }
+      final cn = buffer.isEmpty ? '$inner前' : '${buffer.toString()}前';
+      final rawIndex = plainToRawMap[m.end];
+      insertions.add(_PendingHintSpan(
+        rawIndex,
+        ' \x1b[48;2;227;160;8;38;2;255;255;255;1m $cn \x1b[0m',
+      ));
+    }
+
+    if (insertions.isEmpty) return line;
+
+    insertions.sort((a, b) => b.start.compareTo(a.start));
+    var res = line;
+    for (final item in insertions) {
+      res = res.substring(0, item.start) + item.text + res.substring(item.start);
+    }
+    return res;
   }
 }
