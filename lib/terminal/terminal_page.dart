@@ -30,6 +30,7 @@ import 'package:geekcore_term/terminal/command_snippet_dialog.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
 import 'package:geekcore_term/terminal/terminal_search_dialog.dart';
 import 'package:geekcore_term/terminal/terminal_transcript.dart';
+import 'package:geekcore_term/terminal/terminal_input_targets.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
 import 'package:geekcore_term/settings/settings_page.dart';
@@ -64,6 +65,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   _TerminalSplitMode _splitMode = _TerminalSplitMode.none;
   final List<int> _splitTabIds = [];
   bool _broadcastSplitInput = false;
+  final Set<int> _multiExecTabIds = {};
+
+  bool get _hasInputBroadcast =>
+      (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) ||
+      _multiExecTabIds.isNotEmpty;
 
   _TerminalTab? get _activeTab {
     for (final tab in _tabs) {
@@ -182,15 +188,14 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           initialSnippets: snippets,
           sessionTitle: tab?.title,
           canInsert: tab?.isConnected == true,
-          isBroadcasting:
-              _broadcastSplitInput && _splitMode != _TerminalSplitMode.none,
+          isBroadcasting: _hasInputBroadcast,
           onSave: _sessionStore.saveCommandSnippets,
           onInsert: (snippet) async {
             if (tab == null || tab.isClosed || !tab.isConnected) return false;
-            if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
-              final confirmed = await _confirmSplitBroadcastPaste(
-                '命令片段“${snippet.name}”会粘贴到所有可见且已连接的终端；片段为单行，不会自动按 Enter 执行。',
-                confirmLabel: '粘贴到分屏',
+            if (_hasInputBroadcast) {
+              final confirmed = await _confirmBroadcastPaste(
+                '命令片段“${snippet.name}”会粘贴到输入广播目标；片段为单行，不会自动按 Enter 执行。',
+                confirmLabel: '继续粘贴',
               );
               if (!mounted || tab.isClosed || confirmed != true) return false;
             }
@@ -206,18 +211,27 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
   }
 
-  Future<bool> _confirmSplitBroadcastPaste(
+  Future<bool> _confirmBroadcastPaste(
     String description, {
     String confirmLabel = '广播粘贴',
   }) async {
-    if (!_broadcastSplitInput || _splitMode == _TerminalSplitMode.none) {
+    if (!_hasInputBroadcast) {
       return true;
     }
+    final targetIds = <int>{..._multiExecTabIds};
+    if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
+      targetIds.addAll(_splitTabIds);
+    }
+    if (_activeTabId case final activeId?) targetIds.add(activeId);
+    final targetNames = _tabs
+        .where((tab) => targetIds.contains(tab.id))
+        .map((tab) => tab.isConnected ? tab.title : '${tab.title}（未连接，会跳过）')
+        .join('、');
     return await showDialog<bool>(
           context: context,
           builder: (context) => AlertDialog(
-            title: const Text('向分屏会话广播粘贴？'),
-            content: Text(description),
+            title: const Text('向输入广播目标粘贴？'),
+            content: Text('$description\n\n接收会话：$targetNames'),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, false),
@@ -231,6 +245,91 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           ),
         ) ??
         false;
+  }
+
+  Future<void> _configureMultiExec() async {
+    final selected = _multiExecTabIds.toSet();
+    final result = await showDialog<Set<int>>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('多会话输入广播'),
+          content: SizedBox(
+            width: 420,
+            height: 320,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '从任一终端输入时，同步发送到选中的已连接会话。粘贴前会再次确认。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: _tabs.isEmpty
+                      ? const Center(child: Text('没有打开的终端会话'))
+                      : ListView(
+                          children: [
+                            for (final tab in _tabs)
+                              CheckboxListTile(
+                                dense: true,
+                                value: selected.contains(tab.id),
+                                title: Text(
+                                  tab.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                subtitle: Text(
+                                  tab.isConnected ? tab.status : '未连接',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                onChanged: (checked) {
+                                  if (checked == true && !tab.isConnected) {
+                                    return;
+                                  }
+                                  setDialogState(() {
+                                    if (checked == true) {
+                                      selected.add(tab.id);
+                                    } else {
+                                      selected.remove(tab.id);
+                                    }
+                                  });
+                                },
+                                controlAffinity:
+                                    ListTileControlAffinity.leading,
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                          ],
+                        ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, <int>{}),
+              child: const Text('关闭广播'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, selected.toSet()),
+              child: Text('应用 ${selected.length} 个目标'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (result == null || !mounted) return;
+    final liveIds = _tabs.map((tab) => tab.id).toSet();
+    setState(() {
+      _multiExecTabIds
+        ..clear()
+        ..addAll(result.where(liveIds.contains));
+    });
   }
 
   Future<void> _toggleTranscriptLog(_TerminalTab tab) async {
@@ -920,6 +1019,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
     setState(() {
       _tabs.removeAt(index);
+      _multiExecTabIds.remove(tab.id);
       if (wasActive) _activeTabId = nextTab?.id;
       if (_splitMode != _TerminalSplitMode.none) {
         final removedSlot = _splitTabIds.indexOf(tab.id);
@@ -1915,19 +2015,28 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     }
 
     final data = tab.pendingInput.takeBytes();
-    final targets = <_TerminalTab>{
-      if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none)
-        for (final id in _splitTabIds)
-          for (final target in _tabs)
-            if (target.id == id && target.isConnected) target,
-      tab,
-    };
+    final targetIds = terminalInputTargetIds(
+      sourceTabId: tab.id,
+      connectedTabIds: _tabs
+          .where((candidate) => candidate.isConnected && !candidate.isClosed)
+          .map((candidate) => candidate.id),
+      splitTabIds: _splitTabIds,
+      selectedTabIds: _multiExecTabIds,
+      broadcastSplitInput:
+          _broadcastSplitInput && _splitMode != _TerminalSplitMode.none,
+    );
+    final targets = _tabs.where((target) => targetIds.contains(target.id));
     for (final target in targets) {
       final targetSessionId = target.sessionId;
       final targetSshSession = target.sshSession;
       if (targetSessionId == null && targetSshSession == null) continue;
       target.inputWriteQueue = target.inputWriteQueue
           .then((_) async {
+            if (target.isClosed ||
+                target.sessionId != targetSessionId ||
+                !identical(target.sshSession, targetSshSession)) {
+              return;
+            }
             if (targetSshSession != null) {
               await targetSshSession.stdin.addStream(
                 Stream<Uint8List>.value(Uint8List.fromList(data)),
@@ -2032,9 +2141,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     final text = data?.text;
     if (!mounted || text == null || tab.isClosed) return;
-    if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
-      final confirmed = await _confirmSplitBroadcastPaste(
-        '剪贴板内容会粘贴到所有可见且已连接的终端，请确认内容后继续。',
+    if (_hasInputBroadcast) {
+      final confirmed = await _confirmBroadcastPaste(
+        '剪贴板内容会粘贴到输入广播目标，请确认内容后继续。',
       );
       if (!mounted || tab.isClosed || confirmed != true) return;
     }
@@ -2403,6 +2512,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             child: Column(
               children: [
                 _buildTabBar(colors),
+                if (_hasInputBroadcast) _buildInputBroadcastBanner(colors),
                 Expanded(child: _buildTerminalWorkspace(colors)),
                 if (activeTab != null &&
                     activeTab.connection.kind == _ConnectionKind.ssh)
@@ -2617,10 +2727,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   Future<void> _insertRemotePath(_TerminalTab tab, String path) async {
     if (tab.id != _activeTabId || !tab.isConnected) return;
-    if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
-      final confirmed = await _confirmSplitBroadcastPaste(
-        '远端路径“$path”会粘贴到所有可见且已连接的终端。',
-        confirmLabel: '插入到分屏',
+    if (_hasInputBroadcast) {
+      final confirmed = await _confirmBroadcastPaste(
+        '远端路径“$path”会粘贴到输入广播目标。',
+        confirmLabel: '插入路径',
       );
       if (!mounted || tab.isClosed || confirmed != true) return;
     }
@@ -3233,6 +3343,19 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       ),
                     ),
             ),
+            if (_tabs.length > 1)
+              IconButton(
+                tooltip: _multiExecTabIds.isEmpty
+                    ? '多会话输入广播'
+                    : '管理多会话输入广播（${_multiExecTabIds.length} 个目标）',
+                onPressed: () => unawaited(_configureMultiExec()),
+                color: _multiExecTabIds.isEmpty ? null : colors.error,
+                icon: Badge(
+                  isLabelVisible: _multiExecTabIds.isNotEmpty,
+                  label: Text('${_multiExecTabIds.length}'),
+                  child: const Icon(Icons.groups_outlined, size: 19),
+                ),
+              ),
             if (_splitMode != _TerminalSplitMode.none)
               IconButton(
                 tooltip: _broadcastSplitInput ? '关闭分屏输入广播' : '向所有分屏会话广播输入',
@@ -3270,6 +3393,47 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             const SizedBox(width: 12),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildInputBroadcastBanner(ColorScheme colors) {
+    final targetIds = <int>{..._multiExecTabIds};
+    if (_broadcastSplitInput && _splitMode != _TerminalSplitMode.none) {
+      targetIds.addAll(_splitTabIds);
+    }
+    final names = _tabs
+        .where((tab) => targetIds.contains(tab.id))
+        .map((tab) => tab.isConnected ? tab.title : '${tab.title}（未连接）')
+        .join('、');
+    return Container(
+      height: 32,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      color: colors.errorContainer.withValues(alpha: 0.72),
+      child: Row(
+        children: [
+          Icon(Icons.campaign_rounded, size: 15, color: colors.error),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(
+              '输入广播已开启 · 目标：$names',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: colors.onErrorContainer,
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          if (_multiExecTabIds.isNotEmpty)
+            IconButton(
+              tooltip: '关闭多会话输入广播',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => setState(_multiExecTabIds.clear),
+              icon: const Icon(Icons.close_rounded, size: 16),
+            ),
+        ],
       ),
     );
   }
