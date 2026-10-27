@@ -1220,8 +1220,12 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   void _handleResize(_TerminalTab tab, int columns, int rows) {
-    tab.columns = columns.clamp(1, 1000);
-    tab.rows = rows.clamp(1, 500);
+    final nextColumns = columns.clamp(1, 1000);
+    final nextRows = rows.clamp(1, 500);
+    if (tab.columns == nextColumns && tab.rows == nextRows) return;
+
+    tab.columns = nextColumns;
+    tab.rows = nextRows;
     final sshSession = tab.sshSession;
     if (sshSession != null) {
       sshSession.resizeTerminal(tab.columns, tab.rows);
@@ -2145,7 +2149,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       children: [
                         TerminalView(
                           tab.terminal,
-                          key: ValueKey('terminal-${tab.id}'),
+                          key: tab.terminalViewKey,
                           controller: tab.terminalController,
                           focusNode: tab.focusNode,
                           autofocus: false,
@@ -4093,6 +4097,7 @@ class _TerminalTab {
   final _TerminalConnection connection;
   final TerminalController terminalController;
   final FocusNode focusNode;
+  final GlobalKey terminalViewKey = GlobalKey();
   final BytesBuilder pendingInput = BytesBuilder(copy: false);
   late final Terminal terminal;
 
