@@ -20,6 +20,9 @@ import 'package:geekcore_term/terminal/ssh_config_file.dart';
 import 'package:geekcore_term/terminal/ssh_config_import_dialog.dart';
 import 'package:geekcore_term/terminal/ssh_identity_file.dart';
 import 'package:geekcore_term/terminal/ssh_terminal_environment.dart';
+import 'package:geekcore_term/terminal/ssh_remote_monitor_dialog.dart';
+import 'package:geekcore_term/terminal/ssh_remote_monitor_bar.dart';
+import 'package:geekcore_term/terminal/ssh_remote_monitor_cache.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
@@ -85,6 +88,21 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           settings: widget.settings,
           onClearAppData: _clearAppData,
         ),
+      ),
+    );
+  }
+
+  Future<void> _openSshRemoteMonitor(_TerminalTab tab) async {
+    final client = tab.sshClient;
+    if (client == null || tab.isClosed) {
+      _showMessage('先连接 SSH 会话，再打开远程监控');
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (_) => SshRemoteMonitorDialog(
+        cache: tab.remoteMonitorCache,
+        sessionTitle: tab.title,
       ),
     );
   }
@@ -1379,6 +1397,12 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             onPressed: () =>
                 unawaited(_handleNewSession(_NewSessionAction.ssh)),
           ),
+          if (activeTab?.sshClient != null)
+            IconButton(
+              tooltip: '远程监控',
+              onPressed: () => unawaited(_openSshRemoteMonitor(activeTab!)),
+              icon: const Icon(Icons.monitor_heart_outlined),
+            ),
           const SizedBox(width: 8),
           VerticalDivider(
             width: 1,
@@ -1449,6 +1473,16 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                           ],
                         ),
                 ),
+                if (activeTab != null &&
+                    activeTab.connection.kind == _ConnectionKind.ssh)
+                  SshRemoteMonitorBar(
+                    key: ValueKey('remote-monitor-${activeTab.id}'),
+                    client: activeTab.sshClient,
+                    cache: activeTab.remoteMonitorCache,
+                    sessionTitle: activeTab.title,
+                    onOpenDetails: () =>
+                        unawaited(_openSshRemoteMonitor(activeTab)),
+                  ),
               ],
             ),
           ),
@@ -4099,6 +4133,7 @@ class _TerminalTab {
   final _TerminalConnection connection;
   final TerminalController terminalController;
   final FocusNode focusNode;
+  final SshRemoteMonitorCache remoteMonitorCache = SshRemoteMonitorCache();
   final GlobalKey terminalViewKey = GlobalKey();
   final BytesBuilder pendingInput = BytesBuilder(copy: false);
   late final Terminal terminal;
