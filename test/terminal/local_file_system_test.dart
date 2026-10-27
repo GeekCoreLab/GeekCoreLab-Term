@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geekcore_term/terminal/local_file_system.dart';
+import 'package:geekcore_term/terminal/remote_file_transfer.dart';
 
 void main() {
   group('local file system', () {
@@ -36,6 +37,25 @@ void main() {
         expect(localJoinPath(root.path, 'file.txt'), '${root.path}/file.txt');
       },
     );
+
+    test('local upload sources can seek and reject changed files', () async {
+      final path = '${root.path}/source.bin';
+      final file = File(path);
+      await file.writeAsBytes([1, 2, 3, 4]);
+      final source = await localFileSource(path);
+
+      expect(source.canResumeFromLocalPath, isTrue);
+      expect(
+        await source.openReadFromOffset!(2).expand((chunk) => chunk).toList(),
+        [3, 4],
+      );
+
+      await file.writeAsBytes([9, 8, 7, 6, 5]);
+      await expectLater(
+        source.length(),
+        throwsA(isA<RemoteFileSourceChanged>()),
+      );
+    });
 
     test('writes a new file and refuses implicit overwrite', () async {
       final destination = '${root.path}/download.txt';

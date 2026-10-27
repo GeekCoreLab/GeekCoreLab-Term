@@ -23,22 +23,24 @@ class RemoteTransferTask {
     required this.remotePath,
     required this.direction,
     required this.protocol,
+    this.uploadResumeToken,
     this.source,
     this.expectedLength,
     this.localDirectory,
   });
 
   final int id;
-  final Object connectionIdentity;
+  Object connectionIdentity;
   final String persistenceKey;
   final String name;
   final String remotePath;
   final RemoteTransferDirection direction;
   final RemoteTransferProtocol protocol;
+  final String? uploadResumeToken;
   final RemoteFileSource? source;
   final int? expectedLength;
   final String? localDirectory;
-  final RemoteTransferCancellation cancellation = RemoteTransferCancellation();
+  RemoteTransferCancellation cancellation = RemoteTransferCancellation();
 
   RemoteTransferStatus _status = RemoteTransferStatus.queued;
   int _transferredBytes = 0;
@@ -51,16 +53,29 @@ class RemoteTransferTask {
   String? get detail => _detail;
   bool get isPersistable =>
       direction != RemoteTransferDirection.upload ||
-      (source?.localPath != null && source!.localPath!.isNotEmpty);
+      (source?.canResumeFromLocalPath == true &&
+          uploadResumeToken != null &&
+          uploadResumeToken!.isNotEmpty);
+  bool get retainsRemoteUploadResume =>
+      status == RemoteTransferStatus.failed &&
+      direction == RemoteTransferDirection.upload &&
+      protocol == RemoteTransferProtocol.sftp &&
+      source?.canResumeFromLocalPath == true &&
+      uploadResumeToken != null;
 
   PersistedRemoteTransferTask? toPersistenceSnapshot() {
-    if (isFinished) return null;
+    if (status == RemoteTransferStatus.completed ||
+        status == RemoteTransferStatus.cancelled ||
+        status == RemoteTransferStatus.skipped) {
+      return null;
+    }
     if (!isPersistable) return null;
     return PersistedRemoteTransferTask(
       direction: direction,
       protocol: protocol,
       name: name,
       remotePath: remotePath,
+      uploadResumeToken: uploadResumeToken,
       expectedLength: expectedLength,
       localDirectory: localDirectory,
       localSourcePath: source?.localPath,
@@ -106,6 +121,7 @@ class RemoteTransferQueue {
     required String remoteDirectory,
     required RemoteFileSource source,
     required RemoteTransferProtocol protocol,
+    String? uploadResumeToken,
   }) {
     final task = RemoteTransferTask._(
       id: _nextId++,
@@ -115,6 +131,7 @@ class RemoteTransferQueue {
       remotePath: _joinPath(remoteDirectory, source.name),
       direction: RemoteTransferDirection.upload,
       protocol: protocol,
+      uploadResumeToken: uploadResumeToken ?? createRemoteTransferResumeToken(),
       source: source,
     );
     _tasks.add(task);
@@ -227,6 +244,37 @@ class RemoteTransferQueue {
     return true;
   }
 
+  bool retryFailed(int id) {
+    for (final task in _tasks) {
+      if (task.id != id || task.status != RemoteTransferStatus.failed) {
+        continue;
+      }
+      unawaited(task.cancellation.dispose());
+      task
+        ..cancellation = RemoteTransferCancellation()
+        .._status = RemoteTransferStatus.queued
+        .._transferredBytes = 0
+        .._totalBytes = null
+        .._detail = null;
+      return true;
+    }
+    return false;
+  }
+
+  int rebindConnection(String persistenceKey, Object connectionIdentity) {
+    var rebound = 0;
+    for (final task in _tasks) {
+      if (task.persistenceKey != persistenceKey ||
+          (task.status != RemoteTransferStatus.queued &&
+              task.status != RemoteTransferStatus.failed)) {
+        continue;
+      }
+      task.connectionIdentity = connectionIdentity;
+      rebound++;
+    }
+    return rebound;
+  }
+
   void clearFinished() {
     _tasks.removeWhere((task) => task.isFinished);
   }
@@ -255,12 +303,18 @@ class RemoteTransferQueue {
 
   void _trimHistory() {
     const maxFinished = 100;
-    final finished = _tasks.where((task) => task.isFinished).toList();
+    final finished = _tasks
+        .where((task) => task.isFinished && !task.retainsRemoteUploadResume)
+        .toList();
     final excess = finished.length - maxFinished;
     if (excess <= 0) return;
     var removed = 0;
     _tasks.removeWhere((task) {
-      if (removed >= excess || !task.isFinished) return false;
+      if (removed >= excess ||
+          !task.isFinished ||
+          task.retainsRemoteUploadResume) {
+        return false;
+      }
       removed++;
       return true;
     });
@@ -278,6 +332,7 @@ class PersistedRemoteTransferTask {
     required this.remotePath,
     this.expectedLength,
     this.localDirectory,
+    this.uploadResumeToken,
     this.localSourcePath,
     this.localSourceLength,
     this.localSourceModifiedAtMillis,
@@ -289,6 +344,7 @@ class PersistedRemoteTransferTask {
   final String remotePath;
   final int? expectedLength;
   final String? localDirectory;
+  final String? uploadResumeToken;
   final String? localSourcePath;
   final int? localSourceLength;
   final int? localSourceModifiedAtMillis;
@@ -306,6 +362,7 @@ class PersistedRemoteTransferTask {
 
     addIfPresent('expectedLength', expectedLength);
     addIfPresent('localDirectory', localDirectory);
+    addIfPresent('uploadResumeToken', uploadResumeToken);
     addIfPresent('localSourcePath', localSourcePath);
     addIfPresent('localSourceLength', localSourceLength);
     addIfPresent('localSourceModifiedAtMillis', localSourceModifiedAtMillis);
@@ -328,6 +385,7 @@ class PersistedRemoteTransferTask {
     final remotePath = encoded['remotePath'];
     final expectedLength = encoded['expectedLength'];
     final localDirectory = encoded['localDirectory'];
+    final uploadResumeToken = encoded['uploadResumeToken'];
     final localSourcePath = encoded['localSourcePath'];
     final localSourceLength = encoded['localSourceLength'];
     final localSourceModifiedAtMillis = encoded['localSourceModifiedAtMillis'];
@@ -337,6 +395,7 @@ class PersistedRemoteTransferTask {
         remotePath.isEmpty ||
         (expectedLength != null && expectedLength is! int) ||
         (localDirectory != null && localDirectory is! String) ||
+        (uploadResumeToken != null && uploadResumeToken is! String) ||
         (localSourcePath != null && localSourcePath is! String) ||
         (localSourceLength != null && localSourceLength is! int) ||
         (localSourceModifiedAtMillis != null &&
@@ -347,6 +406,10 @@ class PersistedRemoteTransferTask {
         (localSourcePath == null || localSourcePath.isEmpty)) {
       throw const FormatException('上传任务缺少本地源文件路径');
     }
+    if (uploadResumeToken != null &&
+        !RegExp(r'^[a-f0-9]{24}$').hasMatch(uploadResumeToken as String)) {
+      throw const FormatException('上传任务续传标识无效');
+    }
     if ((expectedLength is int && expectedLength < 0) ||
         (localSourceLength is int && localSourceLength < 0)) {
       throw const FormatException('传输任务长度不能为负数');
@@ -356,6 +419,7 @@ class PersistedRemoteTransferTask {
       protocol: protocol,
       name: name,
       remotePath: remotePath,
+      uploadResumeToken: uploadResumeToken as String?,
       expectedLength: expectedLength as int?,
       localDirectory: localDirectory as String?,
       localSourcePath: localSourcePath as String?,
@@ -371,6 +435,7 @@ class PersistedRemoteTransferTask {
       other.protocol == protocol &&
       other.name == name &&
       other.remotePath == remotePath &&
+      other.uploadResumeToken == uploadResumeToken &&
       other.expectedLength == expectedLength &&
       other.localDirectory == localDirectory &&
       other.localSourcePath == localSourcePath &&
@@ -383,6 +448,7 @@ class PersistedRemoteTransferTask {
     protocol,
     name,
     remotePath,
+    uploadResumeToken,
     expectedLength,
     localDirectory,
     localSourcePath,

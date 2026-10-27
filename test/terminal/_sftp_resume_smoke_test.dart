@@ -190,6 +190,133 @@ Subsystem sftp internal-sftp
           isTrue,
         );
 
+        final uploadDestination = '${root.path}/upload-source.bin';
+        final localUploadDirectory = Directory('${root.path}/local-source');
+        await localUploadDirectory.create();
+        final uploadSourcePath =
+            '${localUploadDirectory.path}/upload-source.bin';
+        final uploadData = Uint8List.fromList(
+          List<int>.generate(
+            2 * 1024 * 1024,
+            (index) => (index * 13 + 7) & 0xff,
+          ),
+        );
+        final originalTarget = Uint8List.fromList([4, 5, 6]);
+        await File(uploadDestination).writeAsBytes(originalTarget, flush: true);
+        await File(uploadSourcePath).writeAsBytes(uploadData, flush: true);
+        final uploadSource = await localFileSource(uploadSourcePath);
+        final uploadToken = createRemoteTransferResumeToken();
+        var injectedUploadFailure = false;
+        await expectLater(
+          uploadRemoteFile(
+            client: sshClient,
+            remoteDirectory: root.path,
+            source: uploadSource,
+            protocol: RemoteTransferProtocol.sftp,
+            sftpClient: sftp,
+            overwriteConfirmed: true,
+            resumeToken: uploadToken,
+            onProgress: (sent) {
+              if (sent > 0 && !injectedUploadFailure) {
+                injectedUploadFailure = true;
+                throw StateError('injected upload interruption');
+              }
+            },
+          ),
+          throwsStateError,
+        );
+        expect(injectedUploadFailure, isTrue);
+        final retainedTarget = await sftp.open(
+          uploadDestination,
+          mode: SftpFileOpenMode.read,
+        );
+        expect(await retainedTarget.readBytes(), originalTarget);
+        await retainedTarget.close();
+        final uploadPartialPath =
+            '${root.path}/.geekcore-upload-$uploadToken.part';
+        final retainedPart = await sftp.open(
+          uploadPartialPath,
+          mode: SftpFileOpenMode.read,
+        );
+        final partialSize = (await retainedPart.stat()).size!;
+        expect(partialSize, greaterThan(0));
+        expect(partialSize, lessThan(uploadData.length));
+        await retainedPart.close();
+        final uploadMetadata = await sftp.open(
+          '$uploadPartialPath.meta',
+          mode: SftpFileOpenMode.read,
+        );
+        final metadataContents = utf8.decode(await uploadMetadata.readBytes());
+        expect(metadataContents, contains('upload-source.bin'));
+        expect(metadataContents, isNot(contains(uploadSourcePath)));
+        await uploadMetadata.close();
+
+        await uploadRemoteFile(
+          client: sshClient,
+          remoteDirectory: root.path,
+          source: uploadSource,
+          protocol: RemoteTransferProtocol.sftp,
+          sftpClient: sftp,
+          overwriteConfirmed: true,
+          resumeToken: uploadToken,
+        );
+        final completedTarget = await sftp.open(
+          uploadDestination,
+          mode: SftpFileOpenMode.read,
+        );
+        expect(await completedTarget.readBytes(), uploadData);
+        await completedTarget.close();
+        final namesAfterUpload = (await sftp.listdir(
+          root.path,
+        )).map((entry) => entry.filename).toSet();
+        expect(
+          namesAfterUpload,
+          isNot(contains('.geekcore-upload-$uploadToken.part')),
+        );
+        expect(
+          namesAfterUpload,
+          isNot(contains('.geekcore-upload-$uploadToken.part.meta')),
+        );
+
+        final uploadCancellation = RemoteTransferCancellation();
+        final uploadCancellationToken = createRemoteTransferResumeToken();
+        await expectLater(
+          uploadRemoteFile(
+            client: sshClient,
+            remoteDirectory: root.path,
+            source: uploadSource,
+            protocol: RemoteTransferProtocol.sftp,
+            sftpClient: sftp,
+            overwriteConfirmed: true,
+            cancellation: uploadCancellation,
+            resumeToken: uploadCancellationToken,
+            onProgress: (sent) {
+              if (sent > 0) uploadCancellation.cancel();
+            },
+          ),
+          throwsA(isA<RemoteTransferCancelled>()),
+        );
+        await uploadCancellation.dispose();
+        final afterCancelledUpload = await sftp.open(
+          uploadDestination,
+          mode: SftpFileOpenMode.read,
+        );
+        expect(await afterCancelledUpload.readBytes(), uploadData);
+        await afterCancelledUpload.close();
+        final namesAfterCancelledUpload = (await sftp.listdir(
+          root.path,
+        )).map((entry) => entry.filename).toSet();
+        expect(
+          namesAfterCancelledUpload,
+          isNot(contains('.geekcore-upload-$uploadCancellationToken.part')),
+        );
+        expect(
+          namesAfterCancelledUpload,
+          isNot(
+            contains('.geekcore-upload-$uploadCancellationToken.part.meta'),
+          ),
+        );
+
         final cancelledLocalPath = '${root.path}/cancelled-local.bin';
         final downloadCancellation = RemoteTransferCancellation();
         final cancelledRemote = await sftp.open(

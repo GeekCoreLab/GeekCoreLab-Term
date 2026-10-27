@@ -14,6 +14,15 @@ class RemoteTransferCancelled implements Exception {
   String toString() => '用户取消传输';
 }
 
+class RemoteFileSourceChanged implements Exception {
+  const RemoteFileSourceChanged(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
 class RemoteTransferCancellation {
   final StreamController<void> _cancelEvents = StreamController<void>.broadcast(
     sync: true,
@@ -48,6 +57,7 @@ class RemoteFileSource {
     required this.name,
     required this.length,
     required this.openRead,
+    this.openReadFromOffset,
     this.localPath,
     this.localLength,
     this.localModifiedAtMillis,
@@ -56,10 +66,16 @@ class RemoteFileSource {
   final String name;
   final Future<int> Function() length;
   final Stream<Uint8List> Function() openRead;
+  final Stream<Uint8List> Function(int offset)? openReadFromOffset;
   final String? localPath;
   final int? localLength;
   final int? localModifiedAtMillis;
+
+  bool get canResumeFromLocalPath =>
+      localPath != null && localPath!.isNotEmpty && openReadFromOffset != null;
 }
+
+String createRemoteTransferResumeToken() => _randomTransferToken();
 
 Future<void> uploadRemoteFile({
   required SSHClient client,
@@ -69,6 +85,7 @@ Future<void> uploadRemoteFile({
   SftpClient? sftpClient,
   bool overwriteConfirmed = false,
   RemoteTransferCancellation? cancellation,
+  String? resumeToken,
   void Function(int bytesSent)? onProgress,
 }) async {
   cancellation?.throwIfCancelled();
@@ -88,6 +105,7 @@ Future<void> uploadRemoteFile({
           source: source,
           overwriteConfirmed: overwriteConfirmed,
           cancellation: cancellation,
+          resumeToken: resumeToken,
           onProgress: onProgress,
         );
       } finally {
@@ -126,6 +144,7 @@ Future<void> _uploadSftpFile({
   required RemoteFileSource source,
   required bool overwriteConfirmed,
   RemoteTransferCancellation? cancellation,
+  String? resumeToken,
   void Function(int bytesSent)? onProgress,
 }) async {
   cancellation?.throwIfCancelled();
@@ -143,26 +162,64 @@ Future<void> _uploadSftpFile({
   }
 
   final length = await source.length();
-  final temporaryPath = _joinRemotePath(
-    remoteDirectory,
-    '.geekcore-upload-${_randomTransferToken()}.tmp',
-  );
-  var temporaryExists = false;
+  final canResume =
+      source.canResumeFromLocalPath &&
+      resumeToken != null &&
+      RegExp(r'^[a-f0-9]{24}$').hasMatch(resumeToken);
+  final temporaryPath = canResume
+      ? _remoteUploadPartialPath(destination, resumeToken)
+      : _joinRemotePath(
+          remoteDirectory,
+          '.geekcore-upload-${_randomTransferToken()}.tmp',
+        );
+  final metadataPath = canResume ? '$temporaryPath.meta' : null;
+  var keepPartial = false;
+  var offset = 0;
+  var resumePartExists = false;
+  if (canResume) {
+    final sourceMetadata = _uploadResumeMetadata(source, length);
+    final metadataMatches = await _remoteUploadMetadataMatches(
+      sftp,
+      metadataPath!,
+      sourceMetadata,
+    );
+    final existingPart = await _statRemoteFile(sftp, temporaryPath);
+    if (!metadataMatches ||
+        existingPart == null ||
+        !existingPart.isFile ||
+        existingPart.size == null ||
+        existingPart.size! > length) {
+      await _removeRemoteFileIfExists(sftp, temporaryPath);
+      await _removeRemoteFileIfExists(sftp, metadataPath);
+    } else {
+      offset = existingPart.size!;
+      resumePartExists = true;
+    }
+
+    if (offset == 0) {
+      await _createRemoteUploadMetadata(sftp, metadataPath, sourceMetadata);
+    }
+    keepPartial = true;
+  }
   var committed = false;
+  var discardPartial = false;
   try {
     final remoteFile = await sftp.open(
       temporaryPath,
-      mode:
-          SftpFileOpenMode.create |
-          SftpFileOpenMode.exclusive |
-          SftpFileOpenMode.write,
+      mode: resumePartExists
+          ? SftpFileOpenMode.write
+          : SftpFileOpenMode.create |
+                SftpFileOpenMode.exclusive |
+                SftpFileOpenMode.write,
     );
-    temporaryExists = true;
     try {
-      var bytesRead = 0;
+      var bytesRead = offset;
       Stream<Uint8List> validatedSource() async* {
         cancellation?.throwIfCancelled();
-        await for (final chunk in source.openRead()) {
+        final chunks = offset > 0
+            ? source.openReadFromOffset!(offset)
+            : source.openRead();
+        await for (final chunk in chunks) {
           cancellation?.throwIfCancelled();
           bytesRead += chunk.length;
           if (bytesRead > length) {
@@ -175,23 +232,27 @@ Future<void> _uploadSftpFile({
         }
       }
 
-      final writer = remoteFile.write(
-        validatedSource(),
-        onProgress: onProgress,
-      );
-      Future<void>? abortFuture;
-      final cancellationSubscription = cancellation?.onCancel.listen((_) {
-        abortFuture ??= writer.abort();
-      });
-      if (cancellation?.isCancelled ?? false) {
-        abortFuture ??= writer.abort();
-      }
-      try {
-        await writer.done;
-        cancellation?.throwIfCancelled();
-      } finally {
-        await cancellationSubscription?.cancel();
-        await abortFuture;
+      if (offset < length) {
+        final writer = remoteFile.write(
+          validatedSource(),
+          offset: offset,
+          onProgress: (bytes) => onProgress?.call(offset + bytes),
+        );
+        Future<void>? abortFuture;
+        final cancellationSubscription = cancellation?.onCancel.listen((_) {
+          abortFuture ??= writer.abort();
+        });
+        if (cancellation?.isCancelled ?? false) {
+          abortFuture ??= writer.abort();
+        }
+        try {
+          onProgress?.call(offset);
+          await writer.done;
+          cancellation?.throwIfCancelled();
+        } finally {
+          await cancellationSubscription?.cancel();
+          await abortFuture;
+        }
       }
       cancellation?.throwIfCancelled();
       final originalMode = initialTarget?.mode;
@@ -204,6 +265,11 @@ Future<void> _uploadSftpFile({
       }
     } finally {
       await remoteFile.close();
+    }
+
+    final uploadedPart = await _statRemoteFile(sftp, temporaryPath);
+    if (uploadedPart?.size != length) {
+      throw StateError('远端临时文件长度与本地文件不一致');
     }
 
     final currentTarget = await _statRemoteFile(sftp, destination);
@@ -223,19 +289,124 @@ Future<void> _uploadSftpFile({
     }
 
     cancellation?.throwIfCancelled();
+    onProgress?.call(offset);
     cancellation?.beginCommit();
     await sftp.rename(temporaryPath, destination);
     committed = true;
-  } finally {
-    if (temporaryExists && !committed) {
+    if (metadataPath != null) {
       try {
-        await sftp.remove(temporaryPath);
+        await _removeRemoteFileIfExists(sftp, metadataPath);
+      } on Object {
+        // A completed upload should not be reported as failed if cleanup alone
+        // cannot remove its hidden metadata file.
+      }
+    }
+  } on RemoteFileSourceChanged {
+    discardPartial = true;
+    rethrow;
+  } finally {
+    if (!committed &&
+        (!keepPartial ||
+            discardPartial ||
+            (cancellation?.isCancelled ?? false))) {
+      try {
+        await _removeRemoteFileIfExists(sftp, temporaryPath);
       } on Object {
         // Keep the original transfer error; a disconnected server may leave
         // an orphaned sibling temporary file for manual cleanup.
       }
+      if (metadataPath != null) {
+        try {
+          await _removeRemoteFileIfExists(sftp, metadataPath);
+        } on Object {
+          // Preserve the primary transfer or cancellation result.
+        }
+      }
     }
   }
+}
+
+String _remoteUploadPartialPath(String destination, String token) {
+  final separator = destination.lastIndexOf('/');
+  final directory = separator <= 0 ? '/' : destination.substring(0, separator);
+  final name = '.geekcore-upload-$token.part';
+  return _joinRemotePath(directory, name);
+}
+
+Map<String, Object?> _uploadResumeMetadata(
+  RemoteFileSource source,
+  int length,
+) => {
+  'version': 1,
+  'name': source.name,
+  'length': length,
+  'modifiedAtMillis': source.localModifiedAtMillis,
+};
+
+Future<bool> _remoteUploadMetadataMatches(
+  SftpClient sftp,
+  String metadataPath,
+  Map<String, Object?> expected,
+) async {
+  final attrs = await _statRemoteFile(sftp, metadataPath);
+  if (attrs == null ||
+      !attrs.isFile ||
+      attrs.size == null ||
+      attrs.size! > 4096) {
+    return false;
+  }
+  final file = await sftp.open(metadataPath, mode: SftpFileOpenMode.read);
+  try {
+    final bytes = await file.readBytes(length: attrs.size);
+    final decoded = jsonDecode(utf8.decode(bytes));
+    if (decoded is! Map<String, dynamic>) return false;
+    return decoded.length == expected.length &&
+        expected.entries.every((entry) => decoded[entry.key] == entry.value);
+  } on FormatException {
+    return false;
+  } finally {
+    await file.close();
+  }
+}
+
+Future<void> _createRemoteUploadMetadata(
+  SftpClient sftp,
+  String metadataPath,
+  Map<String, Object?> metadata,
+) async {
+  final file = await sftp.open(
+    metadataPath,
+    mode:
+        SftpFileOpenMode.create |
+        SftpFileOpenMode.exclusive |
+        SftpFileOpenMode.write,
+  );
+  try {
+    await file.writeBytes(
+      Uint8List.fromList(utf8.encode(jsonEncode(metadata))),
+    );
+  } finally {
+    await file.close();
+  }
+}
+
+Future<void> _removeRemoteFileIfExists(SftpClient sftp, String path) async {
+  try {
+    await sftp.remove(path);
+  } on SftpStatusError catch (error) {
+    if (error.code != SftpStatusCode.noSuchFile) rethrow;
+  }
+}
+
+Future<void> removeRemoteUploadResumeArtifacts({
+  required SftpClient sftp,
+  required String destination,
+  required String resumeToken,
+}) async {
+  if (!RegExp(r'^[a-f0-9]{24}$').hasMatch(resumeToken)) return;
+  final partialPath = _remoteUploadPartialPath(destination, resumeToken);
+  await _removeRemoteFileIfExists(sftp, partialPath);
+  await _removeRemoteFileIfExists(sftp, '$partialPath.meta');
 }
 
 Future<SftpFileAttrs?> _statRemoteFile(SftpClient sftp, String path) async {
@@ -283,6 +454,12 @@ void validateRemoteFileName(String name, RemoteTransferProtocol protocol) {
     throw ArgumentError.value(name, 'name', '文件名包含传输协议不支持的控制字符');
   }
 }
+
+bool isRemoteTransferTemporaryFileName(String name) =>
+    name.startsWith('.geekcore-upload-') &&
+    (name.endsWith('.tmp') ||
+        name.endsWith('.part') ||
+        name.endsWith('.part.meta'));
 
 Future<Uint8List> downloadRemoteFile({
   required SSHClient client,

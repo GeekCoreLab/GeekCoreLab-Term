@@ -84,6 +84,21 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
   void didUpdateWidget(covariant RemoteFileBrowser oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!identical(widget.client, oldWidget.client)) {
+      final hasQueuedWork = _transferQueue.tasks.any(
+        (task) =>
+            task.persistenceKey == widget.sessionIdentity &&
+            (task.status == RemoteTransferStatus.queued ||
+                task.status == RemoteTransferStatus.transferring ||
+                task.status == RemoteTransferStatus.cancelling),
+      );
+      _transferQueue.rebindConnection(widget.sessionIdentity, widget.client);
+      if (hasQueuedWork) {
+        setState(() {
+          _queuePaused = true;
+          _showTransferQueue = true;
+        });
+        _scheduleQueuePersistence();
+      }
       unawaited(_connect());
     } else if (widget.refreshToken != oldWidget.refreshToken) {
       unawaited(_refresh());
@@ -132,11 +147,24 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
     var restored = 0;
     var unavailable = 0;
     for (final snapshot in snapshots) {
+      var remotePathValidated = false;
       try {
         validateRemoteFileName(snapshot.name, snapshot.protocol);
-        if (snapshot.remotePath.split('/').last != snapshot.name) {
+        final pathComponents = snapshot.remotePath.split('/');
+        if (!snapshot.remotePath.startsWith('/') ||
+            pathComponents.last != snapshot.name ||
+            pathComponents
+                .skip(1)
+                .any(
+                  (component) =>
+                      component.isEmpty ||
+                      component == '.' ||
+                      component == '..',
+                ) ||
+            snapshot.remotePath.contains('\u0000')) {
           throw const FormatException('远端路径与文件名不匹配');
         }
+        remotePathValidated = true;
         if (snapshot.direction == RemoteTransferDirection.upload) {
           final path = snapshot.localSourcePath;
           if (path == null) throw const FormatException('缺少本地源文件路径');
@@ -155,6 +183,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
             remoteDirectory: _parentPath(snapshot.remotePath),
             source: source,
             protocol: snapshot.protocol,
+            uploadResumeToken: snapshot.uploadResumeToken,
           );
         } else {
           _transferQueue.enqueueDownload(
@@ -170,6 +199,23 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
         restored++;
       } on Object catch (error) {
         unavailable++;
+        final token = snapshot.uploadResumeToken;
+        final sftp = _sftp;
+        if (remotePathValidated &&
+            snapshot.direction == RemoteTransferDirection.upload &&
+            snapshot.protocol == RemoteTransferProtocol.sftp &&
+            token != null &&
+            sftp != null) {
+          try {
+            await removeRemoteUploadResumeArtifacts(
+              sftp: sftp,
+              destination: snapshot.remotePath,
+              resumeToken: token,
+            );
+          } on Object {
+            // Preserve the unavailable-task message if remote cleanup fails.
+          }
+        }
         widget.onMessage('未恢复传输“${snapshot.name}”：$error', isError: true);
       }
     }
@@ -200,7 +246,10 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
       final absolutePath = await sftp.absolute(path);
       final entries = await sftp.listdir(absolutePath);
       entries.removeWhere(
-        (entry) => entry.filename == '.' || entry.filename == '..',
+        (entry) =>
+            entry.filename == '.' ||
+            entry.filename == '..' ||
+            isRemoteTransferTemporaryFileName(entry.filename),
       );
       entries.sort((a, b) {
         final directoryOrder =
@@ -412,7 +461,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
     var failed = 0;
     var refreshCurrentDirectory = false;
     try {
-      while (mounted) {
+      while (mounted && !_queuePaused) {
         final task = _transferQueue.takeNext();
         if (task == null) break;
         if (!identical(task.connectionIdentity, widget.client)) {
@@ -459,6 +508,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
               sftpClient: sftp,
               overwriteConfirmed: target != null,
               cancellation: task.cancellation,
+              resumeToken: task.uploadResumeToken,
               onProgress: (bytes) {
                 _transferQueue.updateProgress(task, bytes, totalBytes: length);
                 if (mounted) setState(() {});
@@ -614,6 +664,20 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
             _transferQueue.cancelled(task);
             cancelled++;
           } else {
+            if (error is RemoteFileSourceChanged &&
+                task.direction == RemoteTransferDirection.upload &&
+                task.protocol == RemoteTransferProtocol.sftp &&
+                task.uploadResumeToken != null) {
+              try {
+                await removeRemoteUploadResumeArtifacts(
+                  sftp: sftp,
+                  destination: task.remotePath,
+                  resumeToken: task.uploadResumeToken!,
+                );
+              } on Object {
+                // Keep the source-change error; cleanup can be retried later.
+              }
+            }
             _transferQueue.fail(task, error.toString());
             failed++;
           }
@@ -626,6 +690,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
       }
     } finally {
       if (mounted) {
+        _transferQueue.rebindConnection(widget.sessionIdentity, widget.client);
         setState(() {
           _transferring = false;
         });
@@ -670,9 +735,42 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
     if (_transferQueue.cancelActive(task.id)) setState(() {});
   }
 
-  void _clearFinishedTransfers() {
+  Future<void> _clearFinishedTransfers() async {
+    final sftp = _sftp;
+    final resumableUploads = _transferQueue.tasks.where(
+      (task) =>
+          task.isFinished &&
+          task.direction == RemoteTransferDirection.upload &&
+          task.protocol == RemoteTransferProtocol.sftp &&
+          task.source?.canResumeFromLocalPath == true &&
+          task.uploadResumeToken != null,
+    );
+    if (resumableUploads.isNotEmpty && sftp == null) {
+      widget.onMessage('连接 SFTP 后再清除失败上传及其远端续传片段', isError: true);
+      return;
+    }
+    try {
+      for (final task in resumableUploads) {
+        await removeRemoteUploadResumeArtifacts(
+          sftp: sftp!,
+          destination: task.remotePath,
+          resumeToken: task.uploadResumeToken!,
+        );
+      }
+    } catch (error) {
+      if (mounted) widget.onMessage('清理远端上传片段失败：$error', isError: true);
+      return;
+    }
+    if (!mounted) return;
     setState(_transferQueue.clearFinished);
     _scheduleQueuePersistence();
+  }
+
+  void _retryFailedTransfer(RemoteTransferTask task) {
+    if (!_transferQueue.retryFailed(task.id)) return;
+    _scheduleQueuePersistence();
+    setState(() {});
+    unawaited(_runTransferQueue());
   }
 
   Future<void> _edit(SftpName entry) async {
@@ -1187,6 +1285,13 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                             dimension: 13,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           ),
+                        )
+                      else if (task.status == RemoteTransferStatus.failed)
+                        IconButton(
+                          tooltip: '重试传输',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => _retryFailedTransfer(task),
+                          icon: const Icon(Icons.refresh_rounded, size: 15),
                         )
                       else
                         Padding(

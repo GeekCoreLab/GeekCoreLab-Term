@@ -127,7 +127,10 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
       final absolutePath = await sftp.absolute(path);
       final entries = await sftp.listdir(absolutePath);
       entries.removeWhere(
-        (entry) => entry.filename == '.' || entry.filename == '..',
+        (entry) =>
+            entry.filename == '.' ||
+            entry.filename == '..' ||
+            isRemoteTransferTemporaryFileName(entry.filename),
       );
       entries.sort((left, right) {
         final typeOrder =

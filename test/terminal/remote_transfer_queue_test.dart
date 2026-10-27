@@ -94,6 +94,38 @@ void main() {
       expect(queue.tasks, isEmpty);
     });
 
+    test('rebinds queued and failed work for the same session only', () {
+      final failed = queue.enqueueDownload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:test',
+        name: 'failed.txt',
+        remotePath: '/tmp/failed.txt',
+        protocol: RemoteTransferProtocol.sftp,
+      );
+      queue.start(failed);
+      queue.fail(failed, 'disconnect');
+      final queued = queue.enqueueDownload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:test',
+        name: 'queued.txt',
+        remotePath: '/tmp/queued.txt',
+        protocol: RemoteTransferProtocol.sftp,
+      );
+      final otherSession = queue.enqueueDownload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:other',
+        name: 'other.txt',
+        remotePath: '/tmp/other.txt',
+        protocol: RemoteTransferProtocol.sftp,
+      );
+      final replacement = Object();
+
+      expect(queue.rebindConnection('session:test', replacement), 2);
+      expect(failed.connectionIdentity, same(replacement));
+      expect(queued.connectionIdentity, same(replacement));
+      expect(otherSession.connectionIdentity, same(connection));
+    });
+
     test(
       'cancels only an active task and records its terminal state',
       () async {
@@ -153,6 +185,7 @@ void main() {
           name: 'upload.bin',
           length: () async => 12,
           openRead: () => const Stream.empty(),
+          openReadFromOffset: (_) => const Stream.empty(),
           localPath: '/home/user/upload.bin',
           localLength: 12,
           localModifiedAtMillis: 1234,
@@ -190,6 +223,37 @@ void main() {
       queue.removeQueued(persistentUpload.id);
     });
 
+    test('retries a failed upload with the same durable resume token', () {
+      final task = queue.enqueueUpload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:persist',
+        remoteDirectory: '/tmp',
+        source: RemoteFileSource(
+          name: 'retry.bin',
+          length: () async => 12,
+          openRead: () => const Stream.empty(),
+          openReadFromOffset: (_) => const Stream.empty(),
+          localPath: '/home/user/retry.bin',
+          localLength: 12,
+          localModifiedAtMillis: 4567,
+        ),
+        protocol: RemoteTransferProtocol.sftp,
+      );
+      final resumeToken = task.uploadResumeToken;
+      queue.start(task, totalBytes: 12);
+      queue.fail(task, 'network disconnected');
+
+      expect(
+        queue.pendingSnapshots('session:persist').single.uploadResumeToken,
+        resumeToken,
+      );
+      expect(queue.retryFailed(task.id), isTrue);
+      expect(task.status, RemoteTransferStatus.queued);
+      expect(task.uploadResumeToken, resumeToken);
+      expect(task.cancellation.canCancel, isTrue);
+      expect(queue.takeNext(), same(task));
+    });
+
     test('retains only the most recent 100 finished tasks', () {
       for (var index = 0; index < 105; index++) {
         final task = queue.enqueueDownload(
@@ -201,9 +265,28 @@ void main() {
         );
         queue.skip(task);
       }
+      final resumableFailure = queue.enqueueUpload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:test',
+        remoteDirectory: '/tmp',
+        source: RemoteFileSource(
+          name: 'resumable.bin',
+          length: () async => 3,
+          openRead: () => Stream.value(Uint8List.fromList([1, 2, 3])),
+          openReadFromOffset: (_) =>
+              Stream.value(Uint8List.fromList([1, 2, 3])),
+          localPath: '/tmp/resumable.bin',
+          localLength: 3,
+          localModifiedAtMillis: 1234,
+        ),
+        protocol: RemoteTransferProtocol.sftp,
+      );
+      queue.start(resumableFailure);
+      queue.fail(resumableFailure, 'connection lost');
 
-      expect(queue.tasks, hasLength(100));
+      expect(queue.tasks, hasLength(101));
       expect(queue.tasks.first.name, '5.txt');
+      expect(queue.tasks.last, same(resumableFailure));
     });
   });
 }

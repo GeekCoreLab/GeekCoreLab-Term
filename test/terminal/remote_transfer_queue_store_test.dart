@@ -60,6 +60,27 @@ void main() {
     expect(await store.loadForSession('ssh:one'), isEmpty);
   });
 
+  test(
+    'round-trips resumable upload identity without source contents',
+    () async {
+      final store = RemoteTransferQueueStore();
+      const upload = PersistedRemoteTransferTask(
+        direction: RemoteTransferDirection.upload,
+        protocol: RemoteTransferProtocol.sftp,
+        name: 'bundle.tar',
+        remotePath: '/srv/bundle.tar',
+        uploadResumeToken: '0123456789abcdef01234567',
+        localSourcePath: '/home/user/bundle.tar',
+        localSourceLength: 8192,
+        localSourceModifiedAtMillis: 123456,
+      );
+
+      await store.saveForSession('ssh:one', [upload]);
+
+      expect(await store.loadForSession('ssh:one'), [upload]);
+    },
+  );
+
   test('rejects upload descriptors without a local source path', () {
     expect(
       () => PersistedRemoteTransferTask.fromJson({
@@ -70,5 +91,16 @@ void main() {
       }),
       throwsFormatException,
     );
+  });
+
+  test('accepts older upload descriptors without a resume token', () {
+    final descriptor = PersistedRemoteTransferTask.fromJson({
+      'direction': 'upload',
+      'protocol': 'sftp',
+      'name': 'file.bin',
+      'remotePath': '/tmp/file.bin',
+      'localSourcePath': '/tmp/file.bin',
+    });
+    expect(descriptor.uploadResumeToken, isNull);
   });
 }

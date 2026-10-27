@@ -88,10 +88,38 @@ Future<RemoteFileSource> localFileSource(String path) async {
     throw FileSystemException('只能上传普通文件', path);
   }
   validateLocalFileName(localFileName(path));
+  Future<void> validateVersion() async {
+    if (await FileSystemEntity.type(path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      throw const RemoteFileSourceChanged('本地上传源文件已被替换或移除');
+    }
+    final current = await file.stat();
+    if (current.size != stat.size ||
+        current.modified.millisecondsSinceEpoch !=
+            stat.modified.millisecondsSinceEpoch) {
+      throw const RemoteFileSourceChanged('本地上传源文件已变化');
+    }
+  }
+
+  Stream<Uint8List> openReadAt(int offset) async* {
+    if (offset < 0 || offset > stat.size) {
+      throw RangeError.range(offset, 0, stat.size, 'offset');
+    }
+    await validateVersion();
+    await for (final chunk in file.openRead(offset)) {
+      yield Uint8List.fromList(chunk);
+    }
+    await validateVersion();
+  }
+
   return RemoteFileSource(
     name: localFileName(path),
-    length: () async => file.length(),
-    openRead: () => file.openRead().map(Uint8List.fromList),
+    length: () async {
+      await validateVersion();
+      return file.length();
+    },
+    openRead: () => openReadAt(0),
+    openReadFromOffset: openReadAt,
     localPath: file.absolute.path,
     localLength: stat.size,
     localModifiedAtMillis: stat.modified.millisecondsSinceEpoch,
