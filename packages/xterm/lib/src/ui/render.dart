@@ -135,6 +135,7 @@ class RenderTerminal extends RenderBox with RelayoutWhenSystemFontsChangeMixin {
   }
 
   EditableRectCallback? _onEditableRect;
+  bool _editableRectUpdateScheduled = false;
   set onEditableRect(EditableRectCallback? value) {
     if (value == _onEditableRect) return;
     _onEditableRect = value;
@@ -323,9 +324,16 @@ class RenderTerminal extends RenderBox with RelayoutWhenSystemFontsChangeMixin {
   }
 
   void _notifyEditableRect() {
-    if (!attached) return;
-    final caretRect = cursorOffset & _painter.cellSize;
-    _onEditableRect?.call(size, getTransformTo(null), caretRect);
+    if (!attached || _onEditableRect == null || _editableRectUpdateScheduled) {
+      return;
+    }
+    _editableRectUpdateScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _editableRectUpdateScheduled = false;
+      if (!attached || _onEditableRect == null) return;
+      final caretRect = cursorOffset & _painter.cellSize;
+      _onEditableRect?.call(size, getTransformTo(null), caretRect);
+    });
   }
 
   /// Update the viewport size in cells based on the current widget size in

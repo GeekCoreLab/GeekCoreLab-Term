@@ -1,6 +1,7 @@
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:xterm/src/core/buffer/cell_offset.dart';
 import 'package:xterm/src/core/mouse/button.dart';
 import 'package:xterm/src/core/mouse/button_state.dart';
 import 'package:xterm/src/terminal_view.dart';
@@ -17,6 +18,7 @@ class TerminalGestureHandler extends StatefulWidget {
     required this.terminalController,
     this.child,
     this.onTapUp,
+    this.onTapDownIntercept,
     this.onSingleTapUp,
     this.onTapDown,
     this.onSecondaryTapDown,
@@ -33,6 +35,9 @@ class TerminalGestureHandler extends StatefulWidget {
   final Widget? child;
 
   final GestureTapUpCallback? onTapUp;
+
+  final bool Function(TapDownDetails details, CellOffset offset)?
+      onTapDownIntercept;
 
   final GestureTapUpCallback? onSingleTapUp;
 
@@ -60,6 +65,8 @@ class _TerminalGestureHandlerState extends State<TerminalGestureHandler> {
   DragStartDetails? _lastDragStartDetails;
 
   bool _isBlockSelection = false;
+
+  bool _suppressSingleTapUpMouse = false;
 
   LongPressStartDetails? _lastLongPressStartDetails;
 
@@ -130,6 +137,16 @@ class _TerminalGestureHandlerState extends State<TerminalGestureHandler> {
   }
 
   void onTapDown(TapDownDetails details) {
+    _suppressSingleTapUpMouse = widget.onTapDownIntercept?.call(
+          details,
+          renderTerminal.getCellOffset(details.localPosition),
+        ) ??
+        false;
+    if (_suppressSingleTapUpMouse) {
+      widget.onTapDown?.call(details);
+      return;
+    }
+
     // onTapDown is special, as it will always call the supplied callback.
     // The TerminalView depends on it to bring the terminal into focus.
     _tapDown(
@@ -141,6 +158,10 @@ class _TerminalGestureHandlerState extends State<TerminalGestureHandler> {
   }
 
   void onSingleTapUp(TapUpDetails details) {
+    if (_suppressSingleTapUpMouse) {
+      _suppressSingleTapUpMouse = false;
+      return;
+    }
     _tapUp(widget.onSingleTapUp, details, TerminalMouseButton.left);
   }
 

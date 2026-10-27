@@ -37,6 +37,7 @@ import 'package:geekcore_term/terminal/terminal_assistant_panel.dart';
 import 'package:geekcore_term/terminal/terminal_input_targets.dart';
 import 'package:geekcore_term/terminal/terminal_shortcuts.dart';
 import 'package:geekcore_term/terminal/terminal_tab_order.dart';
+import 'package:geekcore_term/terminal/terminal_link.dart';
 import 'package:geekcore_term/terminal/terminal_macro.dart';
 import 'package:geekcore_term/terminal/terminal_input_recording.dart';
 import 'package:geekcore_term/terminal/terminal_recorded_macro_dialog.dart';
@@ -44,6 +45,7 @@ import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
 import 'package:geekcore_term/settings/settings_page.dart';
 import 'package:geekcore_term/settings/window_state.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:xterm/xterm.dart';
 
 class LocalTerminalPage extends StatefulWidget {
@@ -941,6 +943,33 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     );
   }
 
+  bool _prepareTerminalLinkOpen(_TerminalTab tab, CellOffset offset) {
+    tab.pendingExternalLink = null;
+    final keyboard = HardwareKeyboard.instance;
+    final modifierPressed = terminalLinkModifierPressed(
+      platform: defaultTargetPlatform,
+      controlPressed: keyboard.isControlPressed,
+      metaPressed: keyboard.isMetaPressed,
+    );
+    if (!modifierPressed) return false;
+
+    final uri = terminalHttpLinkAtCell(tab.terminal, offset);
+    if (uri == null) return false;
+    tab.pendingExternalLink = uri;
+    return true;
+  }
+
+  Future<void> _openTerminalLink(Uri uri) async {
+    try {
+      final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!opened && mounted) {
+        _showMessage('没有可用的浏览器打开链接', isError: true);
+      }
+    } catch (error) {
+      if (mounted) _showMessage('打开链接失败：$error', isError: true);
+    }
+  }
+
   void _replaceNotification(
     String message, {
     bool isError = false,
@@ -1732,11 +1761,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           jumpHost.port == connection.port) {
         throw StateError('跳板机和目标主机不能相同');
       }
-      if (connection.portKnockActions.any(
-        (action) =>
-            action.kind == PortKnockActionKind.knock &&
-            action.protocol != PortKnockProtocol.tcp,
-      )) {
+      if (!canRunPortKnockActionsViaSshJump(connection.portKnockActions)) {
         throw UnsupportedError('经 SSH 跳板只支持 TCP 端口敲门');
       }
       _notifySessionProgress(tab, '正在连接 SSH 跳板机“${jumpHost.name}”…');
@@ -4708,7 +4733,14 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                           keyboardType: TextInputType.multiline,
                           onKeyEvent: (focusNode, event) =>
                               _handleTerminalKeyEvent(tab, focusNode, event),
+                          onTapDownIntercept: (_, offset) =>
+                              _prepareTerminalLinkOpen(tab, offset),
                           onTapUp: (_, _) {
+                            final pendingLink = tab.pendingExternalLink;
+                            tab.pendingExternalLink = null;
+                            if (pendingLink != null) {
+                              unawaited(_openTerminalLink(pendingLink));
+                            }
                             if (_activeTabId != tab.id) _selectTab(tab);
                           },
                           autoResize: true,
@@ -5675,8 +5707,8 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
           ],
           validator: (value) {
             if (value == null) return null;
-            if (_portKnockActions.isNotEmpty) {
-              return '经跳板连接时，请先清除目标主机的端口敲门操作';
+            if (!canRunPortKnockActionsViaSshJump(_portKnockActions)) {
+              return '经跳板仅支持 TCP 敲门和延迟，请移除 UDP/ICMP 操作';
             }
             for (final record in widget.savedSshSessions) {
               if (record.id != value) continue;
@@ -5701,7 +5733,16 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
         ),
         if (_jumpHostSessionId != null && _portKnockActions.isNotEmpty) ...[
           const SizedBox(height: 6),
-          Text('经跳板连接时暂不支持对目标主机执行端口敲门。', style: TextStyle(color: colors.error)),
+          Text(
+            canRunPortKnockActionsViaSshJump(_portKnockActions)
+                ? 'TCP 敲门会通过 SSH 跳板发送，延迟操作仍按顺序执行。'
+                : '经跳板仅支持 TCP 敲门和延迟；请移除 UDP/ICMP 操作。',
+            style: TextStyle(
+              color: canRunPortKnockActionsViaSshJump(_portKnockActions)
+                  ? colors.onSurfaceVariant
+                  : colors.error,
+            ),
+          ),
         ],
         const SizedBox(height: 16),
         Row(
@@ -7439,6 +7480,7 @@ class _TerminalTab {
   final TerminalInputRecorder inputRecorder = TerminalInputRecorder();
   final SshRemoteMonitorCache remoteMonitorCache = SshRemoteMonitorCache();
   late final Terminal terminal;
+  Uri? pendingExternalLink;
 
   Future<void> inputWriteQueue = Future<void>.value();
   StreamSubscription<String>? outputSubscription;

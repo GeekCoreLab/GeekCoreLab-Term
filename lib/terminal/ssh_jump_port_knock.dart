@@ -1,8 +1,16 @@
 import 'dart:async';
 
 import 'package:dartssh2/dartssh2.dart';
+import 'package:geekcore_term/terminal/session_store.dart';
 
 const _sshOpenConnectFailed = 2;
+
+bool canRunPortKnockActionsViaSshJump(Iterable<PortKnockAction> actions) =>
+    actions.every(
+      (action) =>
+          action.kind == PortKnockActionKind.delay ||
+          action.protocol == PortKnockProtocol.tcp,
+    );
 
 /// Opens and immediately closes a TCP channel through an authenticated SSH
 /// jump host. A remote connect refusal still counts as a sent knock, matching

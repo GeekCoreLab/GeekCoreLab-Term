@@ -3,8 +3,30 @@ import 'dart:async';
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geekcore_term/terminal/ssh_jump_port_knock.dart';
+import 'package:geekcore_term/terminal/session_store.dart';
 
 void main() {
+  test('allows TCP knocks and delays through an SSH jump', () {
+    expect(
+      canRunPortKnockActionsViaSshJump([
+        const PortKnockAction.delay(100),
+        const PortKnockAction.knock(22),
+      ]),
+      isTrue,
+    );
+  });
+
+  test('rejects UDP and ICMP knocks through an SSH jump', () {
+    for (final protocol in [PortKnockProtocol.udp, PortKnockProtocol.icmp]) {
+      expect(
+        canRunPortKnockActionsViaSshJump([
+          PortKnockAction.knock(22, protocol: protocol),
+        ]),
+        isFalse,
+      );
+    }
+  });
+
   test('closes a forwarded TCP channel immediately after opening', () async {
     final channel = _FakeChannel();
 
