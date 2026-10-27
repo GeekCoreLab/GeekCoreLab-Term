@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'remote_transfer_queue_store.dart';
+import 'ssh_proxy_config.dart';
 import 'terminal_macro.dart';
 import 'terminal_input_recording.dart';
 
@@ -172,6 +173,9 @@ class SshJumpHost {
     if (record.jumpHost != null) {
       throw ArgumentError.value(record.name, 'record', '不支持多层 SSH 跳转');
     }
+    if (record.sshProxy != null) {
+      throw ArgumentError.value(record.name, 'record', '代理会话不能用作 SSH 跳板机');
+    }
     if (record.address.trim().isEmpty ||
         record.port < 1 ||
         record.port > 65535) {
@@ -209,6 +213,7 @@ class SessionRecord {
     this.identityFile,
     this.sshConfigAlias,
     this.jumpHost,
+    this.sshProxy,
     this.group = '',
     required this.lastConnectedAt,
   });
@@ -230,6 +235,7 @@ class SessionRecord {
   final String? identityFile;
   final String? sshConfigAlias;
   final SshJumpHost? jumpHost;
+  final SshProxyConfig? sshProxy;
   final String group;
   final DateTime lastConnectedAt;
 
@@ -239,7 +245,7 @@ class SessionRecord {
     SessionProtocol.serial =>
       '${protocol.name}:${address.trim().toLowerCase()}:$port:$dataBits:$parity:$stopBits:$flowControl',
     SessionProtocol.ssh || SessionProtocol.sftp =>
-      '${protocol.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}',
+      '${protocol.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}${sshProxy == null ? '' : ':proxy:${sshProxy!.credentialKey}'}',
   };
 
   String get endpointLabel => switch (protocol) {
@@ -247,7 +253,9 @@ class SessionRecord {
     SessionProtocol.telnet => '$address:$port',
     SessionProtocol.ssh || SessionProtocol.sftp =>
       jumpHost == null
-          ? '$address:$port'
+          ? sshProxy == null
+                ? '$address:$port'
+                : '$address:$port · 经 ${sshProxy!.type == SshProxyType.socks5 ? 'SOCKS5' : 'HTTP'} 代理'
           : '$address:$port · 经 ${jumpHost!.name}',
   };
 
@@ -262,6 +270,7 @@ class SessionRecord {
     String? group,
     DateTime? lastConnectedAt,
     SshJumpHost? jumpHost,
+    SshProxyConfig? sshProxy,
   }) => SessionRecord(
     id: id ?? this.id,
     name: name ?? this.name,
@@ -279,6 +288,7 @@ class SessionRecord {
     identityFile: identityFile,
     sshConfigAlias: sshConfigAlias,
     jumpHost: jumpHost ?? this.jumpHost,
+    sshProxy: sshProxy ?? this.sshProxy,
     group: group ?? this.group,
     lastConnectedAt: lastConnectedAt ?? this.lastConnectedAt,
   );
@@ -302,6 +312,7 @@ class SessionRecord {
     'identityFile': ?identityFile,
     'sshConfigAlias': ?sshConfigAlias,
     if (jumpHost != null) 'jumpHost': jumpHost!.toJson(),
+    'sshProxy': ?sshProxy?.toJson(),
     if (group.isNotEmpty) 'group': group,
     'lastConnectedAt': lastConnectedAt.toIso8601String(),
   };
@@ -314,6 +325,28 @@ class SessionRecord {
     final protocol = SessionProtocol.values.firstWhere(
       (item) => item.name == value['protocol'],
     );
+    final jumpHost = value['jumpHost'] == null
+        ? null
+        : SshJumpHost.fromJson(value['jumpHost']);
+    final sshProxy = value['sshProxy'] == null
+        ? null
+        : SshProxyConfig.fromJson(value['sshProxy']);
+    if (sshProxy != null &&
+        protocol != SessionProtocol.ssh &&
+        protocol != SessionProtocol.sftp) {
+      throw const FormatException('SSH 代理只能用于 SSH 或 SFTP 会话');
+    }
+    if (sshProxy != null && jumpHost != null) {
+      throw const FormatException('SSH 代理和跳板机不能同时配置');
+    }
+    if (sshProxy != null &&
+        (value['webSocketUrl'] as String? ?? '').isNotEmpty) {
+      throw const FormatException('WebSocket 网关和 SSH TCP 代理不能同时配置');
+    }
+    if (sshProxy != null &&
+        (value['portKnockActions'] as List<Object?>? ?? const []).isNotEmpty) {
+      throw const FormatException('SSH 代理和端口敲门不能同时配置');
+    }
     return SessionRecord(
       id: value['id'] as String,
       name: value['name'] as String,
@@ -336,9 +369,8 @@ class SessionRecord {
       username: value['username'] as String? ?? '',
       identityFile: value['identityFile'] as String?,
       sshConfigAlias: value['sshConfigAlias'] as String?,
-      jumpHost: value['jumpHost'] == null
-          ? null
-          : SshJumpHost.fromJson(value['jumpHost']),
+      jumpHost: jumpHost,
+      sshProxy: sshProxy,
       group: value['group'] as String? ?? '',
       lastConnectedAt: DateTime.parse(value['lastConnectedAt'] as String),
     );

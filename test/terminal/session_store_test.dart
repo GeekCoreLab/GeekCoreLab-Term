@@ -9,6 +9,7 @@ import 'package:geekcore_term/terminal/remote_transfer_queue.dart';
 import 'package:geekcore_term/terminal/remote_transfer_queue_store.dart';
 import 'package:geekcore_term/terminal/terminal_macro.dart';
 import 'package:geekcore_term/terminal/terminal_input_recording.dart';
+import 'package:geekcore_term/terminal/ssh_proxy_config.dart';
 
 void main() {
   group('SessionRecord', () {
@@ -54,6 +55,56 @@ void main() {
       expect(decoded.portKnockActions, original.portKnockActions);
       expect(decoded.lastConnectedAt, original.lastConnectedAt);
     });
+
+    test('round-trips proxy routing without serializing proxy passwords', () {
+      const proxy = SshProxyConfig(
+        type: SshProxyType.socks5,
+        address: 'proxy.example.net',
+        port: 1080,
+        username: 'operator',
+      );
+      final original = SessionRecord(
+        id: 'ssh-proxy',
+        name: '代理会话',
+        protocol: SessionProtocol.ssh,
+        address: 'node.example.net',
+        port: 22,
+        sshProxy: proxy,
+        lastConnectedAt: DateTime.utc(2026, 10, 27),
+      );
+      final encoded = jsonEncode(original.toJson());
+      final decoded = SessionRecord.fromJson(encoded);
+
+      expect(decoded.sshProxy, proxy);
+      expect(encoded, isNot(contains('password')));
+      expect(decoded.endpointKey, contains('proxy:'));
+      expect(() => SshJumpHost.fromSession(decoded), throwsArgumentError);
+    });
+
+    test(
+      'rejects invalid combinations of proxy, jump host, and port knocks',
+      () {
+        final base = SessionRecord(
+          id: 'ssh-proxy',
+          name: '代理会话',
+          protocol: SessionProtocol.ssh,
+          address: 'node.example.net',
+          port: 22,
+          sshProxy: const SshProxyConfig(
+            type: SshProxyType.httpConnect,
+            address: 'proxy.example.net',
+            port: 8080,
+          ),
+          lastConnectedAt: DateTime.utc(2026, 10, 27),
+        );
+        final withKnock = base.toJson()
+          ..['portKnockActions'] = [const PortKnockAction.knock(22).toJson()];
+        expect(
+          () => SessionRecord.fromJson(jsonEncode(withKnock)),
+          throwsFormatException,
+        );
+      },
+    );
 
     test('round-trips serial framing options', () {
       final original = SessionRecord(
@@ -154,7 +205,20 @@ void main() {
         lastConnectedAt: DateTime.utc(2026, 10, 26),
       );
 
+      expect(direct.endpointKey, 'ssh:10.0.0.5:22::target:jump:');
       expect(routed.endpointKey, isNot(direct.endpointKey));
+      expect(
+        direct
+            .copyWith(
+              sshProxy: const SshProxyConfig(
+                type: SshProxyType.socks5,
+                address: 'proxy.example.net',
+                port: 1080,
+              ),
+            )
+            .endpointKey,
+        isNot(direct.endpointKey),
+      );
     });
   });
 

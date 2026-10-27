@@ -102,6 +102,17 @@ void main() {
     expect(find.text('仅文件浏览和传输，不启动 Shell'), findsOneWidget);
     expect(find.text('SFTP 服务器（SSH 主机）'), findsOneWidget);
     expect(find.text('SSH/SFTP 端口'), findsOneWidget);
+    await tester.tap(find.text('SSH 代理'));
+    await tester.pumpAndSettle();
+    expect(find.text('通过代理连接 SSH 主机'), findsOneWidget);
+    await tester.ensureVisible(find.text('通过代理连接 SSH 主机'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('通过代理连接 SSH 主机'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('代理主机'));
+    await tester.pumpAndSettle();
+    expect(find.text('代理主机'), findsOneWidget);
+    expect(find.text('代理端口'), findsOneWidget);
     expect(tester.takeException(), isNull);
 
     await tester.tap(find.text('取消'));

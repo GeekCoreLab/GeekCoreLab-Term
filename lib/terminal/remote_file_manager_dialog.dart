@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:geekcore_term/terminal/local_file_system.dart';
+import 'package:geekcore_term/terminal/file_comparison.dart';
+import 'package:geekcore_term/terminal/file_comparison_dialog.dart';
 import 'package:geekcore_term/terminal/remote_file_transfer.dart';
 
 class RemoteFileManagerDialog extends StatefulWidget {
@@ -62,6 +65,7 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
   bool _localLoading = false;
   bool _remoteLoading = true;
   bool _transferring = false;
+  bool _comparing = false;
   bool _showRemoteOnCompact = true;
   int _generation = 0;
   int _remoteNavigationGeneration = 0;
@@ -276,6 +280,125 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
     }
   }
 
+  bool get _canCompareFiles {
+    if (!localFileSystemSupported ||
+        _selectedLocalPaths.length != 1 ||
+        _selectedRemotePaths.length != 1) {
+      return false;
+    }
+    final localPath = _selectedLocalPaths.single;
+    final remoteName = _selectedRemotePaths.single;
+    final local = _localEntries.where((entry) => entry.path == localPath);
+    final remote = _remoteEntries.where(
+      (entry) => entry.filename == remoteName,
+    );
+    return local.length == 1 &&
+        remote.length == 1 &&
+        !local.single.isDirectory &&
+        remote.single.attr.isFile;
+  }
+
+  Future<Uint8List> _readLocalForComparison(String path) async {
+    final source = await localFileSource(path);
+    final length = await source.length();
+    if (length > maxComparableFileBytes) {
+      throw StateError('本地文件超过 2 MiB 比较上限');
+    }
+    final output = BytesBuilder(copy: false);
+    var received = 0;
+    await for (final chunk in source.openRead()) {
+      received += chunk.length;
+      if (received > maxComparableFileBytes) {
+        throw StateError('本地文件读取长度超过 2 MiB 比较上限');
+      }
+      output.add(chunk);
+    }
+    final bytes = output.takeBytes();
+    if (bytes.length != length) {
+      throw StateError('本地文件在比较期间发生变化');
+    }
+    return bytes;
+  }
+
+  Future<Uint8List> _readRemoteForComparison(
+    SftpClient sftp,
+    String path,
+  ) async {
+    final pathVersion = await sftp.stat(path, followLink: false);
+    if (!pathVersion.isFile) {
+      throw StateError('仅支持比较远端普通文件，不跟随符号链接');
+    }
+    final remoteFile = await sftp.open(path, mode: SftpFileOpenMode.read);
+    try {
+      final initial = await remoteFile.stat();
+      if (!initial.isFile || !_sameRemoteFileVersion(pathVersion, initial)) {
+        throw StateError('远端文件在打开前发生变化');
+      }
+      final length = initial.size;
+      if (length == null || length < 0) {
+        throw StateError('远端未提供可读取的文件长度');
+      }
+      if (length > maxComparableFileBytes) {
+        throw StateError('远端文件超过 2 MiB 比较上限');
+      }
+      final bytes = await remoteFile.readBytes(length: length);
+      if (bytes.length != length) {
+        throw StateError('远端文件读取不完整');
+      }
+      final currentHandleVersion = await remoteFile.stat();
+      final currentPathVersion = await sftp.stat(path, followLink: false);
+      if (!_sameRemoteFileVersion(initial, currentHandleVersion) ||
+          !_sameRemoteFileVersion(pathVersion, currentPathVersion) ||
+          !currentPathVersion.isFile) {
+        throw StateError('远端文件在比较期间发生变化');
+      }
+      return bytes;
+    } finally {
+      await remoteFile.close();
+    }
+  }
+
+  bool _sameRemoteFileVersion(SftpFileAttrs left, SftpFileAttrs right) =>
+      left.size == right.size && left.modifyTime == right.modifyTime;
+
+  Future<void> _compareSelectedFiles() async {
+    if (!_canCompareFiles || _comparing || _transferring) return;
+    final localPath = _selectedLocalPaths.single;
+    final remoteName = _selectedRemotePaths.single;
+    final remotePath = _remotePath;
+    final sftp = _sftp;
+    if (remotePath == null || sftp == null) return;
+    final localEntry = _localEntries.singleWhere(
+      (entry) => entry.path == localPath,
+    );
+    final remoteEntry = _remoteEntries.singleWhere(
+      (entry) => entry.filename == remoteName,
+    );
+    final fullRemotePath = remotePath.endsWith('/')
+        ? '$remotePath$remoteName'
+        : '$remotePath/$remoteName';
+    setState(() => _comparing = true);
+    try {
+      final localBytes = await _readLocalForComparison(localPath);
+      final remoteBytes = await _readRemoteForComparison(sftp, fullRemotePath);
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (context) => FileComparisonDialog(
+          leftName: localEntry.name,
+          leftPath: localEntry.path,
+          rightName: remoteEntry.filename,
+          rightPath: fullRemotePath,
+          comparison: compareFileContents(localBytes, remoteBytes),
+        ),
+      );
+    } catch (error) {
+      if (mounted) widget.onMessage('比较文件失败：$error', isError: true);
+    } finally {
+      if (mounted) setState(() => _comparing = false);
+    }
+  }
+
   void _setProtocol(RemoteTransferProtocol? value) {
     if (value == null) return;
     setState(() => _protocol = value);
@@ -442,7 +565,8 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
             onPressed:
                 _selectedLocalPaths.isEmpty ||
                     _remotePath == null ||
-                    _transferring
+                    _transferring ||
+                    _comparing
                 ? null
                 : _queueUploads,
             icon: const Icon(Icons.upload_rounded, size: 18),
@@ -480,7 +604,8 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
             onPressed:
                 _selectedRemotePaths.isEmpty ||
                     _localPath == null ||
-                    _transferring
+                    _transferring ||
+                    _comparing
                 ? null
                 : _queueDownloads,
             icon: const Icon(Icons.download_rounded, size: 18),
@@ -760,6 +885,25 @@ class _RemoteFileManagerDialogState extends State<RemoteFileManagerDialog> {
             overflow: TextOverflow.ellipsis,
             style: TextStyle(fontSize: 11, color: colors.onSurfaceVariant),
           ),
+        ),
+        TextButton(
+          onPressed: _canCompareFiles && !_comparing && !_transferring
+              ? _compareSelectedFiles
+              : null,
+          child: _comparing
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.compare_arrows_rounded, size: 17),
+                    SizedBox(width: 5),
+                    Text('比较'),
+                  ],
+                ),
         ),
         TextButton(
           onPressed: () => Navigator.pop(context),

@@ -20,6 +20,7 @@ import 'package:geekcore_term/terminal/ssh_config_file.dart';
 import 'package:geekcore_term/terminal/ssh_config_import_dialog.dart';
 import 'package:geekcore_term/terminal/ssh_agent.dart';
 import 'package:geekcore_term/terminal/ssh_identity_file.dart';
+import 'package:geekcore_term/terminal/ssh_proxy.dart';
 import 'package:geekcore_term/terminal/ssh_tunnel.dart';
 import 'package:geekcore_term/terminal/ssh_terminal_environment.dart';
 import 'package:geekcore_term/terminal/ssh_jump_port_knock.dart';
@@ -1185,6 +1186,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           identityFile: record.identityFile,
           sshConfigAlias: record.sshConfigAlias,
           jumpHost: record.jumpHost,
+          sshProxy: record.sshProxy,
           webSocketUrl: record.webSocketUrl,
           portKnockActions: record.portKnockActions,
           authenticationMode: record.authenticationMode,
@@ -1197,6 +1199,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           identityFile: record.identityFile,
           sshConfigAlias: record.sshConfigAlias,
           jumpHost: record.jumpHost,
+          sshProxy: record.sshProxy,
           webSocketUrl: record.webSocketUrl,
           portKnockActions: record.portKnockActions,
           authenticationMode: record.authenticationMode,
@@ -1232,6 +1235,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       identityFile: connection.identityFile,
       sshConfigAlias: connection.sshConfigAlias,
       jumpHost: connection.jumpHost,
+      sshProxy: connection.sshProxy,
       lastConnectedAt: now,
     );
     final updated = [
@@ -1287,6 +1291,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       identityFile: connection.identityFile,
       sshConfigAlias: connection.sshConfigAlias,
       jumpHost: connection.jumpHost,
+      sshProxy: connection.sshProxy,
       group: existing?.group ?? '',
       lastConnectedAt: existing?.lastConnectedAt ?? DateTime.now(),
     );
@@ -1487,7 +1492,8 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           for (final record in _savedSessions)
             if ((record.protocol == SessionProtocol.ssh ||
                     record.protocol == SessionProtocol.sftp) &&
-                record.jumpHost == null)
+                record.jumpHost == null &&
+                record.sshProxy == null)
               record,
         ],
       ),
@@ -1822,6 +1828,43 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   ) async {
     SSHClient? jumpClient;
     final jumpHost = connection.jumpHost;
+    final proxy = connection.sshProxy;
+    if (proxy != null && kIsWeb) {
+      throw UnsupportedError('浏览器 SSH 代理由 WebSocket 网关配置');
+    }
+    if (proxy != null && jumpHost != null) {
+      throw StateError('SSH 代理和跳板机不能同时使用');
+    }
+    if (proxy != null && connection.portKnockActions.isNotEmpty) {
+      throw UnsupportedError('SSH 代理连接不能同时使用端口敲门');
+    }
+    if (proxy != null && connection.webSocketUrl.isNotEmpty) {
+      throw StateError('SSH 代理和 WebSocket 网关不能同时使用');
+    }
+    String? proxyPassword = connection.proxyPassword;
+    var rememberProxyCredentials = connection.rememberProxyCredentials;
+    if (proxy != null) {
+      final savedProxyCredentials = await _sshCredentialStore.read(
+        proxy.credentialKey,
+      );
+      proxyPassword ??= savedProxyCredentials?.password;
+      rememberProxyCredentials |= savedProxyCredentials != null;
+      if (!mounted || tab.isClosed) return;
+      if (proxy.username.isNotEmpty &&
+          (proxyPassword == null || proxyPassword.isEmpty)) {
+        final entered = await showDialog<_SshProxyPasswordResult>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) =>
+              _SshProxyPasswordDialog(proxy: proxy, sessionTitle: tab.title),
+        );
+        if (entered == null || tab.isClosed) {
+          throw StateError('SSH 代理认证已取消');
+        }
+        proxyPassword = entered.password;
+        rememberProxyCredentials = entered.rememberCredentials;
+      }
+    }
     if (jumpHost == null) {
       await _runPortKnockSequence(tab, connection);
     } else {
@@ -1958,7 +2001,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       final isKeyAttempt = method == _SshAuthMethod.key;
       _notifySessionProgress(tab, isKeyAttempt ? '正在尝试密钥登录...' : '正在尝试密码登录...');
       final socket = jumpClient == null
-          ? await _connectSshSocket(connection)
+          ? await _connectSshSocket(connection, proxyPassword: proxyPassword)
           : await jumpClient
                 .forwardLocal(connection.address, connection.port)
                 .timeout(const Duration(seconds: 15));
@@ -2048,6 +2091,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             _showMessage('SFTP 已连接，但凭据保存失败：$error', isError: true);
           }
         }
+        await _storeSshProxyCredentials(
+          connection,
+          proxyPassword,
+          rememberProxyCredentials,
+        );
         unawaited(_recordConnection(connection));
         unawaited(
           authenticatedClient.done.then<void>((_) {
@@ -2099,6 +2147,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
           _showMessage('SSH 已连接，但凭据保存失败：$error', isError: true);
         }
       }
+      await _storeSshProxyCredentials(
+        connection,
+        proxyPassword,
+        rememberProxyCredentials,
+      );
 
       unawaited(_recordConnection(connection));
       tab.outputSubscription = _mergeSshOutput(remoteSession)
@@ -2130,6 +2183,25 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       }
       await authenticatedClient.close();
       rethrow;
+    }
+  }
+
+  Future<void> _storeSshProxyCredentials(
+    _TerminalConnection connection,
+    String? password,
+    bool remember,
+  ) async {
+    final proxy = connection.sshProxy;
+    if (proxy == null || !remember || password == null || password.isEmpty) {
+      return;
+    }
+    try {
+      await _sshCredentialStore.write(
+        proxy.credentialKey,
+        SshCredentials(username: proxy.username, password: password),
+      );
+    } catch (error) {
+      _showMessage('SSH 已连接，但代理凭据保存失败：$error', isError: true);
     }
   }
 
@@ -2330,19 +2402,37 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     throw StateError('SSH 跳板机认证未完成');
   }
 
-  Future<SSHSocket> _connectSshSocket(_TerminalConnection connection) => kIsWeb
-      ? WebSocketSshSocket.connect(
-          _webSocketUri(
-            connection.webSocketUrl,
+  Future<SSHSocket> _connectSshSocket(
+    _TerminalConnection connection, {
+    String? proxyPassword,
+  }) {
+    final proxy = connection.sshProxy;
+    if (proxy != null) {
+      if (kIsWeb) {
+        return Future.error(UnsupportedError('浏览器 SSH 代理由 WebSocket 网关配置'));
+      }
+      return connectSshThroughProxy(
+        proxy: proxy,
+        targetHost: connection.address,
+        targetPort: connection.port,
+        password: proxyPassword,
+        timeout: const Duration(seconds: 15),
+      );
+    }
+    return kIsWeb
+        ? WebSocketSshSocket.connect(
+            _webSocketUri(
+              connection.webSocketUrl,
+              connection.address,
+              connection.port,
+            ),
+          )
+        : SSHSocket.connect(
             connection.address,
             connection.port,
-          ),
-        )
-      : SSHSocket.connect(
-          connection.address,
-          connection.port,
-          timeout: const Duration(seconds: 15),
-        );
+            timeout: const Duration(seconds: 15),
+          );
+  }
 
   Future<List<String>?> _requestSshUserInfo(
     _TerminalTab tab,
@@ -5310,7 +5400,10 @@ class _TerminalConnection {
       sessionTitle = null,
       identityFile = null,
       sshConfigAlias = null,
-      jumpHost = null;
+      jumpHost = null,
+      sshProxy = null,
+      proxyPassword = null,
+      rememberProxyCredentials = false;
 
   const _TerminalConnection.serial(
     this.address,
@@ -5331,7 +5424,10 @@ class _TerminalConnection {
        sessionTitle = null,
        identityFile = null,
        sshConfigAlias = null,
-       jumpHost = null;
+       jumpHost = null,
+       sshProxy = null,
+       proxyPassword = null,
+       rememberProxyCredentials = false;
 
   const _TerminalConnection.telnet(this.address, this.port)
     : kind = _ConnectionKind.telnet,
@@ -5350,7 +5446,10 @@ class _TerminalConnection {
       sessionTitle = null,
       identityFile = null,
       sshConfigAlias = null,
-      jumpHost = null;
+      jumpHost = null,
+      sshProxy = null,
+      proxyPassword = null,
+      rememberProxyCredentials = false;
 
   const _TerminalConnection.ssh(
     this.address,
@@ -5367,6 +5466,9 @@ class _TerminalConnection {
     this.identityFile,
     this.sshConfigAlias,
     this.jumpHost,
+    this.sshProxy,
+    this.proxyPassword,
+    this.rememberProxyCredentials = false,
   }) : kind = _ConnectionKind.ssh,
        dataBits = 8,
        parity = 'none',
@@ -5388,6 +5490,9 @@ class _TerminalConnection {
     this.identityFile,
     this.sshConfigAlias,
     this.jumpHost,
+    this.sshProxy,
+    this.proxyPassword,
+    this.rememberProxyCredentials = false,
   }) : kind = _ConnectionKind.sftp,
        dataBits = 8,
        parity = 'none',
@@ -5414,15 +5519,22 @@ class _TerminalConnection {
   final String? identityFile;
   final String? sshConfigAlias;
   final SshJumpHost? jumpHost;
+  final SshProxyConfig? sshProxy;
+  final String? proxyPassword;
+  final bool rememberProxyCredentials;
+
+  String get routeLabel => jumpHost != null
+      ? ' · 经 ${jumpHost!.name}'
+      : sshProxy == null
+      ? ''
+      : ' · 经 ${sshProxy!.type == SshProxyType.socks5 ? 'SOCKS5' : 'HTTP'} 代理';
 
   String get displayName => switch (kind) {
     _ConnectionKind.local => '本地终端',
     _ConnectionKind.serial => '串口 $address',
     _ConnectionKind.telnet => 'Telnet $address:$port',
-    _ConnectionKind.ssh =>
-      'SSH $address:$port${jumpHost == null ? '' : ' · ${jumpHost!.name}'}',
-    _ConnectionKind.sftp =>
-      'SFTP $address:$port${jumpHost == null ? '' : ' · ${jumpHost!.name}'}',
+    _ConnectionKind.ssh => 'SSH $address:$port$routeLabel',
+    _ConnectionKind.sftp => 'SFTP $address:$port$routeLabel',
   };
 
   String get openingStatus => switch (kind) {
@@ -5431,11 +5543,11 @@ class _TerminalConnection {
     _ConnectionKind.telnet => '正在连接 Telnet $address:$port',
     _ConnectionKind.ssh =>
       jumpHost == null
-          ? '正在连接 SSH $address:$port'
+          ? '正在连接 SSH $address:$port$routeLabel'
           : '正在经 ${jumpHost!.name} 连接 SSH $address:$port',
     _ConnectionKind.sftp =>
       jumpHost == null
-          ? '正在连接 SFTP $address:$port'
+          ? '正在连接 SFTP $address:$port$routeLabel'
           : '正在经 ${jumpHost!.name} 连接 SFTP $address:$port',
   };
 
@@ -5443,10 +5555,8 @@ class _TerminalConnection {
     _ConnectionKind.local => '本地终端已连接',
     _ConnectionKind.serial => '串口已连接 · $address',
     _ConnectionKind.telnet => 'Telnet 已连接 · $address:$port',
-    _ConnectionKind.ssh =>
-      'SSH 已连接 · $address:$port${jumpHost == null ? '' : ' · 经 ${jumpHost!.name}'}',
-    _ConnectionKind.sftp =>
-      'SFTP 已连接 · $address:$port${jumpHost == null ? '' : ' · 经 ${jumpHost!.name}'}',
+    _ConnectionKind.ssh => 'SSH 已连接 · $address:$port$routeLabel',
+    _ConnectionKind.sftp => 'SFTP 已连接 · $address:$port$routeLabel',
   };
 
   SessionProtocol? get sessionProtocol => switch (kind) {
@@ -5469,12 +5579,12 @@ class _TerminalConnection {
     _ConnectionKind.telnet =>
       '${kind.name}:${address.trim().toLowerCase()}:$port',
     _ConnectionKind.ssh || _ConnectionKind.sftp =>
-      '${kind.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}',
+      '${kind.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}${sshProxy == null ? '' : ':proxy:${sshProxy!.credentialKey}'}',
     _ConnectionKind.local => kind.name,
   };
 
   String get remoteFileEndpointKey =>
-      '${_ConnectionKind.ssh.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}';
+      '${_ConnectionKind.ssh.name}:${address.trim().toLowerCase()}:$port:$webSocketUrl:${sshConfigAlias?.toLowerCase() ?? ''}:jump:${jumpHost?.endpointKey ?? ''}${sshProxy == null ? '' : ':proxy:${sshProxy!.credentialKey}'}';
 }
 
 class _ConnectionDialogResult {
@@ -5535,6 +5645,10 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
   final _privateKeyController = TextEditingController();
   final _privateKeyPassphraseController = TextEditingController();
   final _webSocketUrlController = TextEditingController();
+  final _proxyHostController = TextEditingController();
+  final _proxyPortController = TextEditingController(text: '1080');
+  final _proxyUsernameController = TextEditingController();
+  final _proxyPasswordController = TextEditingController();
   final _deviceController = TextEditingController();
   final _baudController = TextEditingController(text: '115200');
   final _profileNameController = TextEditingController();
@@ -5549,6 +5663,10 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
   List<PortKnockAction> _portKnockActions = const [];
   SshAuthenticationMode _authenticationMode = SshAuthenticationMode.automatic;
   String? _jumpHostSessionId;
+  SshProxyType _proxyType = SshProxyType.socks5;
+  bool _useSshProxy = false;
+  bool _rememberProxyCredentials = false;
+  String? _proxyValidationError;
 
   @override
   void initState() {
@@ -5569,6 +5687,10 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
     _privateKeyController.dispose();
     _privateKeyPassphraseController.dispose();
     _webSocketUrlController.dispose();
+    _proxyHostController.dispose();
+    _proxyPortController.dispose();
+    _proxyUsernameController.dispose();
+    _proxyPasswordController.dispose();
     _deviceController.dispose();
     _baudController.dispose();
     _profileNameController.dispose();
@@ -5577,6 +5699,40 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
 
   void _connect() {
     if (!_formKey.currentState!.validate()) return;
+    SshProxyConfig? sshProxy;
+    final proxyPassword = _proxyPasswordController.text;
+    if (_useSshProxy) {
+      final parsedProxyPort = int.tryParse(_proxyPortController.text.trim());
+      final candidate = SshProxyConfig(
+        type: _proxyType,
+        address: _proxyHostController.text.trim(),
+        port: parsedProxyPort ?? 0,
+        username: _proxyUsernameController.text.trim(),
+      );
+      final validationError = candidate.validate();
+      if (validationError != null) {
+        setState(() => _proxyValidationError = validationError);
+        return;
+      }
+      if (_jumpHostSessionId != null) {
+        setState(() => _proxyValidationError = 'SSH 跳板机和代理不能同时配置');
+        return;
+      }
+      if (_portKnockActions.isNotEmpty) {
+        setState(() => _proxyValidationError = 'SSH 代理不能与端口敲门同时使用');
+        return;
+      }
+      if (_webSocketUrlController.text.trim().isNotEmpty) {
+        setState(() => _proxyValidationError = 'SSH 代理不能与 WebSocket 网关同时配置');
+        return;
+      }
+      if (candidate.username.isEmpty != proxyPassword.isEmpty) {
+        setState(() => _proxyValidationError = '代理用户名和密码需要同时填写');
+        return;
+      }
+      _proxyValidationError = null;
+      sshProxy = candidate;
+    }
     SshJumpHost? jumpHost;
     if (_jumpHostSessionId != null) {
       for (final record in widget.savedSshSessions) {
@@ -5619,6 +5775,11 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
         authenticationMode: _authenticationMode,
         sessionTitle: sessionTitle,
         jumpHost: jumpHost,
+        sshProxy: sshProxy,
+        proxyPassword: sshProxy == null || proxyPassword.isEmpty
+            ? null
+            : proxyPassword,
+        rememberProxyCredentials: _rememberProxyCredentials,
       ),
       _ConnectionKind.sftp => _TerminalConnection.sftp(
         _hostController.text.trim(),
@@ -5635,6 +5796,11 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
         authenticationMode: _authenticationMode,
         sessionTitle: sessionTitle,
         jumpHost: jumpHost,
+        sshProxy: sshProxy,
+        proxyPassword: sshProxy == null || proxyPassword.isEmpty
+            ? null
+            : proxyPassword,
+        rememberProxyCredentials: _rememberProxyCredentials,
       ),
       _ConnectionKind.local => const _TerminalConnection.local(),
     };
@@ -5795,7 +5961,11 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
             }
             return '所选跳板机会话已不存在';
           },
-          onChanged: (value) => setState(() => _jumpHostSessionId = value),
+          onChanged: (value) => setState(() {
+            _jumpHostSessionId = value;
+            if (value != null) _useSshProxy = false;
+            _proxyValidationError = null;
+          }),
         ),
         const SizedBox(height: 6),
         Text(
@@ -5804,6 +5974,8 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
               : '仅支持一层跳转；跳板机凭据使用对应会话的安全凭据记录。',
           style: TextStyle(color: colors.onSurfaceVariant),
         ),
+        const SizedBox(height: 10),
+        _buildSshProxyFields(colors),
         if (_jumpHostSessionId != null && _portKnockActions.isNotEmpty) ...[
           const SizedBox(height: 6),
           Text(
@@ -5958,6 +6130,171 @@ class _ConnectionDialogState extends State<_ConnectionDialog> {
           style: TextStyle(color: colors.onSurfaceVariant),
         ),
       ],
+    );
+  }
+
+  Widget _buildSshProxyFields(ColorScheme colors) {
+    if (kIsWeb) {
+      return Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: colors.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(Icons.info_outline_rounded, color: colors.primary, size: 19),
+            const SizedBox(width: 9),
+            const Expanded(child: Text('浏览器连接使用 WebSocket SSH 网关；代理路由在网关侧配置。')),
+          ],
+        ),
+      );
+    }
+
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        leading: const Icon(Icons.route_rounded),
+        title: const Text('SSH 代理'),
+        subtitle: Text(
+          _useSshProxy
+              ? '${_proxyType == SshProxyType.socks5 ? 'SOCKS5' : 'HTTP CONNECT'} · ${_proxyHostController.text.isEmpty ? '未配置主机' : _proxyHostController.text}'
+              : '可选，直连默认关闭',
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        children: [
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _useSshProxy,
+            onChanged: _jumpHostSessionId == null
+                ? (value) => setState(() {
+                    _useSshProxy = value;
+                    _proxyValidationError = null;
+                  })
+                : null,
+            title: const Text('通过代理连接 SSH 主机'),
+            subtitle: Text(
+              _jumpHostSessionId == null
+                  ? '支持 SOCKS5 和 HTTP CONNECT；代理密码不会写入会话备份。'
+                  : '当前已选择 SSH 跳板机；代理与跳板机不能同时使用。',
+            ),
+          ),
+          if (_useSshProxy) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<SshProxyType>(
+                    initialValue: _proxyType,
+                    decoration: const InputDecoration(labelText: '代理类型'),
+                    items: const [
+                      DropdownMenuItem(
+                        value: SshProxyType.socks5,
+                        child: Text('SOCKS5'),
+                      ),
+                      DropdownMenuItem(
+                        value: SshProxyType.httpConnect,
+                        child: Text('HTTP CONNECT'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      setState(() {
+                        _proxyType = value;
+                        _proxyValidationError = null;
+                      });
+                    },
+                  ),
+                ),
+                const SizedBox(width: 12),
+                SizedBox(
+                  width: 150,
+                  child: TextField(
+                    controller: _proxyPortController,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: '代理端口',
+                      hintText: '1080',
+                    ),
+                    onChanged: (_) =>
+                        setState(() => _proxyValidationError = null),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _proxyHostController,
+              decoration: const InputDecoration(
+                labelText: '代理主机',
+                hintText: '127.0.0.1',
+                prefixIcon: Icon(Icons.dns_rounded),
+              ),
+              onChanged: (_) => setState(() => _proxyValidationError = null),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _proxyUsernameController,
+                    decoration: const InputDecoration(
+                      labelText: '代理用户名（可选）',
+                      prefixIcon: Icon(Icons.person_outline_rounded),
+                    ),
+                    onChanged: (_) =>
+                        setState(() => _proxyValidationError = null),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: TextField(
+                    controller: _proxyPasswordController,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: '代理密码（可选）',
+                      prefixIcon: Icon(Icons.password_rounded),
+                    ),
+                    onChanged: (_) =>
+                        setState(() => _proxyValidationError = null),
+                  ),
+                ),
+              ],
+            ),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: _rememberProxyCredentials,
+              onChanged: (value) =>
+                  setState(() => _rememberProxyCredentials = value ?? false),
+              title: const Text('保存代理凭据'),
+              subtitle: Text(
+                defaultTargetPlatform == TargetPlatform.android
+                    ? '代理密码使用 Android 系统密钥库'
+                    : '代理密码保存在当前用户凭据存储中',
+              ),
+            ),
+            if (_proxyType == SshProxyType.httpConnect &&
+                _proxyUsernameController.text.isNotEmpty)
+              Text(
+                'HTTP CONNECT 使用 Basic 认证；代理凭据会通过明文代理连接发送，请只连接可信代理。',
+                style: TextStyle(color: colors.error, fontSize: 12),
+              ),
+            if (_proxyValidationError != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    _proxyValidationError!,
+                    style: TextStyle(color: colors.error),
+                  ),
+                ),
+              ),
+          ],
+        ],
+      ),
     );
   }
 
@@ -6772,6 +7109,113 @@ class _PortKnockDraft {
     ),
     PortKnockActionKind.delay => PortKnockAction.delay(int.parse(value)),
   };
+}
+
+class _SshProxyPasswordResult {
+  const _SshProxyPasswordResult({
+    required this.password,
+    required this.rememberCredentials,
+  });
+
+  final String password;
+  final bool rememberCredentials;
+}
+
+class _SshProxyPasswordDialog extends StatefulWidget {
+  const _SshProxyPasswordDialog({
+    required this.proxy,
+    required this.sessionTitle,
+  });
+
+  final SshProxyConfig proxy;
+  final String sessionTitle;
+
+  @override
+  State<_SshProxyPasswordDialog> createState() =>
+      _SshProxyPasswordDialogState();
+}
+
+class _SshProxyPasswordDialogState extends State<_SshProxyPasswordDialog> {
+  final TextEditingController _passwordController = TextEditingController();
+  bool _rememberCredentials = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (_passwordController.text.isEmpty) {
+      setState(() => _error = '请输入代理密码');
+      return;
+    }
+    Navigator.pop(
+      context,
+      _SshProxyPasswordResult(
+        password: _passwordController.text,
+        rememberCredentials: _rememberCredentials,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('SSH 代理认证'),
+    content: SizedBox(
+      width: 380,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            '${widget.sessionTitle} · ${widget.proxy.address}:${widget.proxy.port}',
+          ),
+          if (widget.proxy.type == SshProxyType.httpConnect &&
+              widget.proxy.username.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              'HTTP CONNECT 使用 Basic 认证；代理密码会通过明文代理连接发送。',
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ],
+          const SizedBox(height: 12),
+          TextField(
+            controller: _passwordController,
+            autofocus: true,
+            obscureText: true,
+            decoration: InputDecoration(
+              labelText: '代理密码',
+              prefixIcon: const Icon(Icons.password_rounded),
+              errorText: _error,
+            ),
+            onSubmitted: (_) => _submit(),
+          ),
+          CheckboxListTile(
+            contentPadding: EdgeInsets.zero,
+            controlAffinity: ListTileControlAffinity.leading,
+            value: _rememberCredentials,
+            onChanged: (value) =>
+                setState(() => _rememberCredentials = value ?? false),
+            title: const Text('保存代理密码'),
+            subtitle: Text(
+              defaultTargetPlatform == TargetPlatform.android
+                  ? '保存到 Android 系统密钥库'
+                  : '保存到当前用户凭据存储',
+            ),
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(onPressed: _submit, child: const Text('连接')),
+    ],
+  );
 }
 
 class _SshCredentialPromptResult {
