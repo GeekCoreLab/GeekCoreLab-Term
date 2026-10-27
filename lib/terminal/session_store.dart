@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'remote_transfer_queue_store.dart';
+
 enum SessionProtocol { serial, telnet, ssh }
 
 enum SshAuthenticationMode { automatic, passwordFirst, keyFirst }
@@ -423,6 +425,7 @@ class SessionStore {
     await _preferences.remove(_groupsKey);
     await _preferences.remove(_snippetsKey);
     await _preferences.remove(_sshHostKeysKey);
+    await _preferences.remove(RemoteTransferQueueStore.storageKey);
   });
 
   Future<String?> loadSshHostKey(String endpointKey) async {

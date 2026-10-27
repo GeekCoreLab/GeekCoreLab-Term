@@ -92,6 +92,9 @@ Future<RemoteFileSource> localFileSource(String path) async {
     name: localFileName(path),
     length: () async => file.length(),
     openRead: () => file.openRead().map(Uint8List.fromList),
+    localPath: file.absolute.path,
+    localLength: stat.size,
+    localModifiedAtMillis: stat.modified.millisecondsSinceEpoch,
   );
 }
 
@@ -200,6 +203,7 @@ Future<void> writeResumableLocalDownload({
   required Stream<Uint8List> Function(int offset) openRead,
   required bool overwriteConfirmed,
   required Future<void> Function() validateSource,
+  void Function()? beforeCommit,
   void Function(int bytesReceived)? onProgress,
 }) async {
   if (expectedLength < 0) {
@@ -314,6 +318,7 @@ Future<void> writeResumableLocalDownload({
     throw FileSystemException('下载期间本地文件已变化，已保留新版本', path);
   }
 
+  beforeCommit?.call();
   final backup = File(
     '${parent.path}${Platform.pathSeparator}.geekcore-${_transferToken()}.bak',
   );

@@ -4,6 +4,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences_platform_interface/in_memory_shared_preferences_async.dart';
 import 'package:shared_preferences_platform_interface/shared_preferences_async_platform_interface.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
+import 'package:geekcore_term/terminal/remote_file_transfer.dart';
+import 'package:geekcore_term/terminal/remote_transfer_queue.dart';
+import 'package:geekcore_term/terminal/remote_transfer_queue_store.dart';
 
 void main() {
   group('SessionRecord', () {
@@ -149,6 +152,28 @@ void main() {
     expect(await store.loadGroups(), ['Production', 'Lab']);
     expect(await store.loadCommandSnippets(), [snippet]);
   });
+
+  test(
+    'clearing app session data also clears persisted transfer tasks',
+    () async {
+      SharedPreferencesAsyncPlatform.instance =
+          InMemorySharedPreferencesAsync.empty();
+      addTearDown(() => SharedPreferencesAsyncPlatform.instance = null);
+      final queueStore = RemoteTransferQueueStore();
+      await queueStore.saveForSession('ssh:node', const [
+        PersistedRemoteTransferTask(
+          direction: RemoteTransferDirection.download,
+          protocol: RemoteTransferProtocol.sftp,
+          name: 'logs.tar',
+          remotePath: '/var/logs.tar',
+        ),
+      ]);
+
+      await SessionStore().clear();
+
+      expect(await queueStore.loadForSession('ssh:node'), isEmpty);
+    },
+  );
 }
 
 SessionRecord _sshRecord({required String alias, required String host}) =>

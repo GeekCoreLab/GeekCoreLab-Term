@@ -36,5 +36,6 @@ Future<void> writeResumableLocalDownload({
   required Stream<Uint8List> Function(int offset) openRead,
   required bool overwriteConfirmed,
   required Future<void> Function() validateSource,
+  void Function()? beforeCommit,
   void Function(int bytesReceived)? onProgress,
 }) => Future.error(UnsupportedError('本地文件写入在当前平台不可用'));

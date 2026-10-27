@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geekcore_term/terminal/remote_file_transfer.dart';
@@ -23,12 +24,14 @@ void main() {
     test('keeps FIFO order and allows only the active task to complete', () {
       final first = queue.enqueueUpload(
         connectionIdentity: connection,
+        persistenceKey: 'session:test',
         remoteDirectory: '/tmp',
         source: source('one.txt'),
         protocol: RemoteTransferProtocol.sftp,
       );
       final second = queue.enqueueDownload(
         connectionIdentity: connection,
+        persistenceKey: 'session:test',
         name: 'two.txt',
         remotePath: '/tmp/two.txt',
         protocol: RemoteTransferProtocol.sftp,
@@ -49,6 +52,7 @@ void main() {
     test('clamps progress so the visible byte count never moves backward', () {
       final task = queue.enqueueDownload(
         connectionIdentity: connection,
+        persistenceKey: 'session:test',
         name: 'archive.tar',
         remotePath: '/tmp/archive.tar',
         protocol: RemoteTransferProtocol.scp,
@@ -69,12 +73,14 @@ void main() {
     test('removes queued work and clears finished history only', () {
       final queued = queue.enqueueDownload(
         connectionIdentity: connection,
+        persistenceKey: 'session:test',
         name: 'queued.txt',
         remotePath: '/tmp/queued.txt',
         protocol: RemoteTransferProtocol.sftp,
       );
       final active = queue.enqueueDownload(
         connectionIdentity: connection,
+        persistenceKey: 'session:test',
         name: 'active.txt',
         remotePath: '/tmp/active.txt',
         protocol: RemoteTransferProtocol.sftp,
@@ -88,10 +94,107 @@ void main() {
       expect(queue.tasks, isEmpty);
     });
 
+    test(
+      'cancels only an active task and records its terminal state',
+      () async {
+        final task = queue.enqueueDownload(
+          connectionIdentity: connection,
+          persistenceKey: 'session:test',
+          name: 'large.bin',
+          remotePath: '/tmp/large.bin',
+          protocol: RemoteTransferProtocol.sftp,
+        );
+        final cancelled = Completer<void>();
+        final subscription = task.cancellation.onCancel.listen((_) {
+          if (!cancelled.isCompleted) cancelled.complete();
+        });
+
+        expect(queue.cancelActive(task.id), isFalse);
+        queue.start(task);
+        expect(queue.cancelActive(task.id), isTrue);
+        await cancelled.future;
+        expect(task.status, RemoteTransferStatus.cancelling);
+        expect(task.cancellation.isCancelled, isTrue);
+        expect(queue.activeCount, 1);
+
+        queue.cancelled(task);
+        await subscription.cancel();
+        expect(task.status, RemoteTransferStatus.cancelled);
+        expect(task.detail, '已取消');
+        expect(task.isFinished, isTrue);
+        expect(queue.activeCount, 0);
+        expect(queue.cancelActive(task.id), isFalse);
+      },
+    );
+
+    test('does not interrupt a task once its final commit begins', () {
+      final task = queue.enqueueDownload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:test',
+        name: 'final.bin',
+        remotePath: '/tmp/final.bin',
+        protocol: RemoteTransferProtocol.sftp,
+      );
+      queue.start(task);
+      task.cancellation.beginCommit();
+
+      expect(task.cancellation.canCancel, isFalse);
+      expect(queue.cancelActive(task.id), isFalse);
+      expect(task.status, RemoteTransferStatus.transferring);
+      queue.complete(task);
+    });
+
+    test('persists only reproducible sources and includes active tasks', () {
+      final persistentUpload = queue.enqueueUpload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:persist',
+        remoteDirectory: '/tmp',
+        source: RemoteFileSource(
+          name: 'upload.bin',
+          length: () async => 12,
+          openRead: () => const Stream.empty(),
+          localPath: '/home/user/upload.bin',
+          localLength: 12,
+          localModifiedAtMillis: 1234,
+        ),
+        protocol: RemoteTransferProtocol.sftp,
+      );
+      queue.enqueueUpload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:persist',
+        remoteDirectory: '/tmp',
+        source: source('memory-only.bin'),
+        protocol: RemoteTransferProtocol.sftp,
+      );
+      final activeDownload = queue.enqueueDownload(
+        connectionIdentity: connection,
+        persistenceKey: 'session:persist',
+        name: 'download.bin',
+        remotePath: '/tmp/download.bin',
+        protocol: RemoteTransferProtocol.sftp,
+        expectedLength: 20,
+        localDirectory: '/home/user/Downloads',
+      );
+      queue.start(activeDownload);
+
+      final snapshots = queue.pendingSnapshots('session:persist');
+      expect(snapshots, hasLength(2));
+      expect(snapshots.first.localSourcePath, '/home/user/upload.bin');
+      expect(snapshots.first.localSourceLength, 12);
+      expect(snapshots.first.localSourceModifiedAtMillis, 1234);
+      expect(snapshots.last.remotePath, '/tmp/download.bin');
+      expect(queue.pendingSnapshots('session:other'), isEmpty);
+
+      queue.complete(activeDownload);
+      expect(queue.pendingSnapshots('session:persist'), [snapshots.first]);
+      queue.removeQueued(persistentUpload.id);
+    });
+
     test('retains only the most recent 100 finished tasks', () {
       for (var index = 0; index < 105; index++) {
         final task = queue.enqueueDownload(
           connectionIdentity: connection,
+          persistenceKey: 'session:test',
           name: '$index.txt',
           remotePath: '/tmp/$index.txt',
           protocol: RemoteTransferProtocol.sftp,

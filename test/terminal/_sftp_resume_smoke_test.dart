@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geekcore_term/terminal/local_file_system.dart';
+import 'package:geekcore_term/terminal/remote_file_transfer.dart';
 
 void main() {
   test(
@@ -186,6 +187,137 @@ Subsystem sftp internal-sftp
               .list()
               .where((entity) => entity.path.contains('.geekcore-resume-'))
               .isEmpty,
+          isTrue,
+        );
+
+        final cancelledLocalPath = '${root.path}/cancelled-local.bin';
+        final downloadCancellation = RemoteTransferCancellation();
+        final cancelledRemote = await sftp.open(
+          remoteFilePath,
+          mode: SftpFileOpenMode.read,
+        );
+        final cancellationSubscription = downloadCancellation.onCancel.listen((
+          _,
+        ) {
+          unawaited(cancelledRemote.close());
+        });
+        await expectLater(
+          writeResumableLocalDownload(
+            path: cancelledLocalPath,
+            transferIdentity: '$transferIdentity:cancel-test',
+            sourceVersion: version,
+            expectedLength: data.length,
+            openRead: (offset) async* {
+              await for (final chunk in cancelledRemote.read(
+                offset: offset,
+                length: data.length - offset,
+              )) {
+                yield chunk;
+                downloadCancellation.throwIfCancelled();
+              }
+            },
+            overwriteConfirmed: false,
+            validateSource: () async {
+              downloadCancellation.throwIfCancelled();
+            },
+            beforeCommit: downloadCancellation.beginCommit,
+            onProgress: (received) {
+              if (received > 0) downloadCancellation.cancel();
+            },
+          ),
+          throwsA(isA<RemoteTransferCancelled>()),
+        );
+        await cancellationSubscription.cancel();
+        await cancelledRemote.close();
+        await downloadCancellation.dispose();
+        expect(await localFileExists(cancelledLocalPath), isFalse);
+        final retainedParts = await Directory(root.path)
+            .list()
+            .where((entity) => entity.path.endsWith('.part'))
+            .cast<File>()
+            .toList();
+        expect(retainedParts, hasLength(1));
+        expect(await retainedParts.single.length(), greaterThan(0));
+
+        final resumedCancelledRemote = await sftp.open(
+          remoteFilePath,
+          mode: SftpFileOpenMode.read,
+        );
+        await writeResumableLocalDownload(
+          path: cancelledLocalPath,
+          transferIdentity: '$transferIdentity:cancel-test',
+          sourceVersion: version,
+          expectedLength: data.length,
+          openRead: (offset) => resumedCancelledRemote.read(
+            offset: offset,
+            length: data.length - offset,
+          ),
+          overwriteConfirmed: false,
+          validateSource: () async {},
+        );
+        await resumedCancelledRemote.close();
+        expect(await File(cancelledLocalPath).readAsBytes(), data);
+
+        final bufferedDownloadCancellation = RemoteTransferCancellation();
+        await expectLater(
+          downloadRemoteFile(
+            client: sshClient,
+            remotePath: remoteFilePath,
+            protocol: RemoteTransferProtocol.sftp,
+            sftpClient: sftp,
+            cancellation: bufferedDownloadCancellation,
+            onProgress: (received) {
+              if (received > 0) bufferedDownloadCancellation.cancel();
+            },
+          ),
+          throwsA(isA<Exception>()),
+        );
+        await bufferedDownloadCancellation.dispose();
+        expect((await sftp.stat(remoteFilePath)).size, data.length);
+
+        final protectedTargetPath = '${root.path}/protected.bin';
+        final protectedTargetBytes = Uint8List.fromList([4, 5, 6, 7]);
+        await File(protectedTargetPath).writeAsBytes(protectedTargetBytes);
+        final cancellation = RemoteTransferCancellation();
+        final firstProgress = Completer<void>();
+        final cancelSource = RemoteFileSource(
+          name: 'protected.bin',
+          length: () async => 8 * 1024 * 1024,
+          openRead: () async* {
+            final chunk = Uint8List(64 * 1024);
+            for (var sent = 0; sent < 8 * 1024 * 1024; sent += chunk.length) {
+              await Future<void>.delayed(const Duration(milliseconds: 10));
+              yield chunk;
+            }
+          },
+        );
+        final upload = uploadRemoteFile(
+          client: sshClient,
+          remoteDirectory: root.path,
+          source: cancelSource,
+          protocol: RemoteTransferProtocol.sftp,
+          sftpClient: sftp,
+          overwriteConfirmed: true,
+          cancellation: cancellation,
+          onProgress: (bytes) {
+            if (bytes > 0 && !firstProgress.isCompleted) {
+              firstProgress.complete();
+            }
+          },
+        );
+        await firstProgress.future.timeout(const Duration(seconds: 5));
+        expect(cancellation.cancel(), isTrue);
+        await expectLater(upload, throwsA(isA<RemoteTransferCancelled>()));
+        await cancellation.dispose();
+        expect(
+          await File(protectedTargetPath).readAsBytes(),
+          protectedTargetBytes,
+        );
+        expect((await sftp.stat(protectedTargetPath)).size, 4);
+        expect(
+          await Directory(
+            root.path,
+          ).list().where((entity) => entity.path.endsWith('.tmp')).isEmpty,
           isTrue,
         );
       } finally {

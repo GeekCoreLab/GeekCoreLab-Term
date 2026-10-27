@@ -7,16 +7,58 @@ import 'package:dartssh2/dartssh2.dart';
 
 enum RemoteTransferProtocol { sftp, scp }
 
+class RemoteTransferCancelled implements Exception {
+  const RemoteTransferCancelled();
+
+  @override
+  String toString() => '用户取消传输';
+}
+
+class RemoteTransferCancellation {
+  final StreamController<void> _cancelEvents = StreamController<void>.broadcast(
+    sync: true,
+  );
+  bool _isCancelled = false;
+  bool _canCancel = true;
+
+  bool get isCancelled => _isCancelled;
+  bool get canCancel => _canCancel && !_isCancelled;
+  Stream<void> get onCancel => _cancelEvents.stream;
+
+  bool cancel() {
+    if (!canCancel) return false;
+    _isCancelled = true;
+    _cancelEvents.add(null);
+    return true;
+  }
+
+  void beginCommit() {
+    _canCancel = false;
+  }
+
+  void throwIfCancelled() {
+    if (_isCancelled) throw const RemoteTransferCancelled();
+  }
+
+  Future<void> dispose() => _cancelEvents.close();
+}
+
 class RemoteFileSource {
   const RemoteFileSource({
     required this.name,
     required this.length,
     required this.openRead,
+    this.localPath,
+    this.localLength,
+    this.localModifiedAtMillis,
   });
 
   final String name;
   final Future<int> Function() length;
   final Stream<Uint8List> Function() openRead;
+  final String? localPath;
+  final int? localLength;
+  final int? localModifiedAtMillis;
 }
 
 Future<void> uploadRemoteFile({
@@ -26,8 +68,10 @@ Future<void> uploadRemoteFile({
   required RemoteTransferProtocol protocol,
   SftpClient? sftpClient,
   bool overwriteConfirmed = false,
+  RemoteTransferCancellation? cancellation,
   void Function(int bytesSent)? onProgress,
 }) async {
+  cancellation?.throwIfCancelled();
   final name = source.name;
   validateRemoteFileName(name, protocol);
 
@@ -43,6 +87,7 @@ Future<void> uploadRemoteFile({
           remoteDirectory: remoteDirectory,
           source: source,
           overwriteConfirmed: overwriteConfirmed,
+          cancellation: cancellation,
           onProgress: onProgress,
         );
       } finally {
@@ -63,7 +108,13 @@ Future<void> uploadRemoteFile({
       } finally {
         if (ownsClient) await sftp.close();
       }
-      await _scpUpload(client, remoteDirectory, source, onProgress: onProgress);
+      await _scpUpload(
+        client,
+        remoteDirectory,
+        source,
+        cancellation: cancellation,
+        onProgress: onProgress,
+      );
       return;
   }
 }
@@ -74,8 +125,10 @@ Future<void> _uploadSftpFile({
   required String remoteDirectory,
   required RemoteFileSource source,
   required bool overwriteConfirmed,
+  RemoteTransferCancellation? cancellation,
   void Function(int bytesSent)? onProgress,
 }) async {
+  cancellation?.throwIfCancelled();
   final initialTarget = await _statRemoteFile(sftp, destination);
   if (initialTarget != null) {
     if (!overwriteConfirmed) {
@@ -108,7 +161,9 @@ Future<void> _uploadSftpFile({
     try {
       var bytesRead = 0;
       Stream<Uint8List> validatedSource() async* {
+        cancellation?.throwIfCancelled();
         await for (final chunk in source.openRead()) {
+          cancellation?.throwIfCancelled();
           bytesRead += chunk.length;
           if (bytesRead > length) {
             throw StateError('本地文件大小在传输期间发生变化');
@@ -120,7 +175,25 @@ Future<void> _uploadSftpFile({
         }
       }
 
-      await remoteFile.write(validatedSource(), onProgress: onProgress).done;
+      final writer = remoteFile.write(
+        validatedSource(),
+        onProgress: onProgress,
+      );
+      Future<void>? abortFuture;
+      final cancellationSubscription = cancellation?.onCancel.listen((_) {
+        abortFuture ??= writer.abort();
+      });
+      if (cancellation?.isCancelled ?? false) {
+        abortFuture ??= writer.abort();
+      }
+      try {
+        await writer.done;
+        cancellation?.throwIfCancelled();
+      } finally {
+        await cancellationSubscription?.cancel();
+        await abortFuture;
+      }
+      cancellation?.throwIfCancelled();
       final originalMode = initialTarget?.mode;
       if (originalMode != null) {
         // Preserve the ordinary rwx permissions while keeping special bits
@@ -149,6 +222,8 @@ Future<void> _uploadSftpFile({
       throw StateError('远端 SFTP 服务不支持安全覆盖，原文件未修改');
     }
 
+    cancellation?.throwIfCancelled();
+    cancellation?.beginCommit();
     await sftp.rename(temporaryPath, destination);
     committed = true;
   } finally {
@@ -214,41 +289,46 @@ Future<Uint8List> downloadRemoteFile({
   required String remotePath,
   required RemoteTransferProtocol protocol,
   SftpClient? sftpClient,
+  RemoteTransferCancellation? cancellation,
   void Function(int bytesReceived)? onProgress,
 }) async {
+  cancellation?.throwIfCancelled();
   switch (protocol) {
     case RemoteTransferProtocol.sftp:
       final sftp = sftpClient ?? await client.sftp();
       final ownsClient = sftpClient == null;
       try {
-        final output = BytesBuilder(copy: false);
-        final sink = StreamController<List<int>>();
-        final done = Completer<void>();
-        final subscription = sink.stream.listen(
-          (chunk) {
-            output.add(chunk);
-          },
-          onError: done.completeError,
-          onDone: done.complete,
-        );
+        final file = await sftp.open(remotePath, mode: SftpFileOpenMode.read);
+        Future<void>? cancellationClose;
+        final cancellationSubscription = cancellation?.onCancel.listen((_) {
+          cancellationClose ??= file.close();
+        });
+        if (cancellation?.isCancelled ?? false) {
+          cancellationClose ??= file.close();
+        }
         try {
-          await sftp.download(
-            remotePath,
-            sink.sink,
-            onProgress: onProgress,
-            closeDestination: true,
-          );
-          await done.future;
+          final output = BytesBuilder(copy: false);
+          await for (final chunk in file.read(onProgress: onProgress)) {
+            cancellation?.throwIfCancelled();
+            output.add(chunk);
+          }
+          cancellation?.throwIfCancelled();
           return output.takeBytes();
         } finally {
-          await subscription.cancel();
-          if (!sink.isClosed) await sink.close();
+          await cancellationSubscription?.cancel();
+          await cancellationClose;
+          await file.close();
         }
       } finally {
         if (ownsClient) await sftp.close();
       }
     case RemoteTransferProtocol.scp:
-      return _scpDownload(client, remotePath, onProgress: onProgress);
+      return _scpDownload(
+        client,
+        remotePath,
+        cancellation: cancellation,
+        onProgress: onProgress,
+      );
   }
 }
 
@@ -256,17 +336,24 @@ Future<void> _scpUpload(
   SSHClient client,
   String remoteDirectory,
   RemoteFileSource source, {
+  RemoteTransferCancellation? cancellation,
   void Function(int bytesSent)? onProgress,
 }) async {
+  cancellation?.throwIfCancelled();
   final length = await source.length();
   final session = await client.execute(
     'scp -t ${_shellQuote(remoteDirectory)}',
   );
+  final cancellationSubscription = cancellation?.onCancel.listen((_) {
+    session.close();
+  });
+  if (cancellation?.isCancelled ?? false) session.close();
   final reader = _SshByteReader(session.stdout);
   final stderr = BytesBuilder(copy: false);
   final stderrSubscription = session.stderr.listen(stderr.add);
 
   try {
+    cancellation?.throwIfCancelled();
     await _expectScpAck(reader, stderr);
     final header = utf8.encode('C0644 $length ${source.name}\n');
     session.stdin.add(Uint8List.fromList(header));
@@ -275,6 +362,7 @@ Future<void> _scpUpload(
 
     var sent = 0;
     await for (final chunk in source.openRead()) {
+      cancellation?.throwIfCancelled();
       session.stdin.add(chunk);
       sent += chunk.length;
       onProgress?.call(sent);
@@ -282,6 +370,8 @@ Future<void> _scpUpload(
     if (sent != length) {
       throw StateError('本地文件大小在传输期间发生变化');
     }
+    cancellation?.throwIfCancelled();
+    cancellation?.beginCommit();
     session.stdin.add(Uint8List.fromList([0]));
     await session.flush();
     await _expectScpAck(reader, stderr);
@@ -295,6 +385,7 @@ Future<void> _scpUpload(
     if (detail.isNotEmpty) throw StateError('$error：$detail');
     rethrow;
   } finally {
+    await cancellationSubscription?.cancel();
     await stderrSubscription.cancel();
     await reader.cancel();
     session.close();
@@ -304,14 +395,21 @@ Future<void> _scpUpload(
 Future<Uint8List> _scpDownload(
   SSHClient client,
   String remotePath, {
+  RemoteTransferCancellation? cancellation,
   void Function(int bytesReceived)? onProgress,
 }) async {
+  cancellation?.throwIfCancelled();
   final session = await client.execute('scp -f ${_shellQuote(remotePath)}');
+  final cancellationSubscription = cancellation?.onCancel.listen((_) {
+    session.close();
+  });
+  if (cancellation?.isCancelled ?? false) session.close();
   final reader = _SshByteReader(session.stdout);
   final stderr = BytesBuilder(copy: false);
   final stderrSubscription = session.stderr.listen(stderr.add);
 
   try {
+    cancellation?.throwIfCancelled();
     session.stdin.add(Uint8List.fromList([0]));
     await session.flush();
     final messageType = await reader.readByte();
@@ -332,6 +430,7 @@ Future<Uint8List> _scpDownload(
     final output = BytesBuilder(copy: false);
     var received = 0;
     while (received < fileSize) {
+      cancellation?.throwIfCancelled();
       final chunk = await reader.readChunk(fileSize - received);
       output.add(chunk);
       received += chunk.length;
@@ -354,6 +453,7 @@ Future<Uint8List> _scpDownload(
     if (detail.isNotEmpty) throw StateError('$error：$detail');
     rethrow;
   } finally {
+    await cancellationSubscription?.cancel();
     await stderrSubscription.cancel();
     await reader.cancel();
     session.close();

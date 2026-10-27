@@ -46,6 +46,7 @@ Future<void> writeResumableLocalDownload({
   required Stream<Uint8List> Function(int offset) openRead,
   required bool overwriteConfirmed,
   required Future<void> Function() validateSource,
+  void Function()? beforeCommit,
   void Function(int bytesReceived)? onProgress,
 }) => platform.writeResumableLocalDownload(
   path: path,
@@ -55,5 +56,6 @@ Future<void> writeResumableLocalDownload({
   openRead: openRead,
   overwriteConfirmed: overwriteConfirmed,
   validateSource: validateSource,
+  beforeCommit: beforeCommit,
   onProgress: onProgress,
 );

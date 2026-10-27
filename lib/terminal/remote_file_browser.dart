@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -12,6 +13,7 @@ import 'package:geekcore_term/terminal/remote_file_permissions.dart';
 import 'package:geekcore_term/terminal/remote_file_search.dart';
 import 'package:geekcore_term/terminal/remote_file_transfer.dart';
 import 'package:geekcore_term/terminal/remote_transfer_queue.dart';
+import 'package:geekcore_term/terminal/remote_transfer_queue_store.dart';
 import 'package:geekcore_term/terminal/local_file_system.dart';
 import 'package:geekcore_term/terminal/remote_file_manager_dialog.dart';
 
@@ -58,8 +60,13 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
   bool _editing = false;
   bool _showNameFilter = false;
   bool _showTransferQueue = false;
+  bool _queuePaused = false;
   String _nameFilter = '';
   final RemoteTransferQueue _transferQueue = RemoteTransferQueue();
+  final RemoteTransferQueueStore _transferQueueStore =
+      RemoteTransferQueueStore();
+  final Set<String> _restoredQueueSessions = {};
+  Future<void> _queuePersistence = Future<void>.value();
   Completer<void>? _queueIdle;
   int _generation = 0;
 
@@ -105,12 +112,78 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
       }
       _sftp = sftp;
       await _navigate(widget.initialPath ?? '.');
+      await _restorePersistedQueue(generation);
     } catch (error) {
       if (!mounted || generation != _generation) return;
       setState(() {
         _loading = false;
         _error = error.toString();
       });
+    }
+  }
+
+  Future<void> _restorePersistedQueue(int generation) async {
+    final persistenceKey = widget.sessionIdentity;
+    if (_restoredQueueSessions.contains(persistenceKey)) return;
+    final snapshots = await _transferQueueStore.loadForSession(persistenceKey);
+    if (!mounted || generation != _generation) return;
+    if (!_restoredQueueSessions.add(persistenceKey)) return;
+
+    var restored = 0;
+    var unavailable = 0;
+    for (final snapshot in snapshots) {
+      try {
+        validateRemoteFileName(snapshot.name, snapshot.protocol);
+        if (snapshot.remotePath.split('/').last != snapshot.name) {
+          throw const FormatException('远端路径与文件名不匹配');
+        }
+        if (snapshot.direction == RemoteTransferDirection.upload) {
+          final path = snapshot.localSourcePath;
+          if (path == null) throw const FormatException('缺少本地源文件路径');
+          final source = await localFileSource(path);
+          if (source.name != snapshot.name ||
+              (snapshot.localSourceLength != null &&
+                  source.localLength != snapshot.localSourceLength) ||
+              (snapshot.localSourceModifiedAtMillis != null &&
+                  source.localModifiedAtMillis !=
+                      snapshot.localSourceModifiedAtMillis)) {
+            throw const FormatException('本地源文件已变化');
+          }
+          _transferQueue.enqueueUpload(
+            connectionIdentity: widget.client,
+            persistenceKey: persistenceKey,
+            remoteDirectory: _parentPath(snapshot.remotePath),
+            source: source,
+            protocol: snapshot.protocol,
+          );
+        } else {
+          _transferQueue.enqueueDownload(
+            connectionIdentity: widget.client,
+            persistenceKey: persistenceKey,
+            name: snapshot.name,
+            remotePath: snapshot.remotePath,
+            protocol: snapshot.protocol,
+            expectedLength: snapshot.expectedLength,
+            localDirectory: snapshot.localDirectory,
+          );
+        }
+        restored++;
+      } on Object catch (error) {
+        unavailable++;
+        widget.onMessage('未恢复传输“${snapshot.name}”：$error', isError: true);
+      }
+    }
+
+    if (!mounted || generation != _generation) return;
+    if (restored > 0) {
+      setState(() {
+        _showTransferQueue = true;
+        _queuePaused = true;
+      });
+      widget.onMessage('已恢复 $restored 项待确认任务；检查队列后点击“恢复任务”开始传输');
+    }
+    if (snapshots.isNotEmpty || unavailable > 0) {
+      _scheduleQueuePersistence();
     }
   }
 
@@ -187,14 +260,22 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
       final files = await FilePicker.pickFiles(dialogTitle: '选择要上传的文件');
       if (!mounted) return;
       if (files.isEmpty) return;
-      _enqueueUploads([
-        for (final file in files)
-          RemoteFileSource(
-            name: file.name,
-            length: () async => (await file.length()) ?? 0,
-            openRead: file.readAsByteStream,
-          ),
-      ]);
+      final sources = <RemoteFileSource>[];
+      for (final file in files) {
+        final path = file.path;
+        if (!kIsWeb && path != null && path.isNotEmpty) {
+          sources.add(await localFileSource(path));
+        } else {
+          sources.add(
+            RemoteFileSource(
+              name: file.name,
+              length: () async => (await file.length()) ?? 0,
+              openRead: file.readAsByteStream,
+            ),
+          );
+        }
+      }
+      _enqueueUploads(sources);
     } catch (error) {
       if (!mounted) return;
       widget.onMessage('选择文件失败：$error', isError: true);
@@ -209,14 +290,36 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
       return;
     }
     if (hasDirectories) widget.onMessage('目录已跳过；其余文件继续上传');
-    _enqueueUploads([
-      for (final file in files)
+    final sources = <RemoteFileSource>[];
+    for (final file in files) {
+      final path = file.path;
+      if (!kIsWeb && !file.fromPromise && path.isNotEmpty) {
+        try {
+          sources.add(await localFileSource(path));
+          continue;
+        } on Object {
+          // Use the drop stream if the platform cannot expose a local file.
+        }
+      }
+      int? length;
+      try {
+        length = await file.length();
+      } on Object {
+        // The upload stream will report source errors in the regular queue.
+      }
+      final modifiedAt = await file.lastModified();
+      sources.add(
         RemoteFileSource(
           name: file.name,
-          length: file.length,
+          length: () async => length ?? 0,
           openRead: file.openRead,
+          localPath: null,
+          localLength: length,
+          localModifiedAtMillis: modifiedAt.millisecondsSinceEpoch,
         ),
-    ]);
+      );
+    }
+    _enqueueUploads(sources);
   }
 
   void _enqueueUploads(
@@ -234,6 +337,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
         validateRemoteFileName(source.name, transferProtocol);
         _transferQueue.enqueueUpload(
           connectionIdentity: widget.client,
+          persistenceKey: widget.sessionIdentity,
           remoteDirectory: path,
           source: source,
           protocol: transferProtocol,
@@ -245,6 +349,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
     }
     if (!added) return;
     setState(() => _showTransferQueue = true);
+    _scheduleQueuePersistence();
     unawaited(_runTransferQueue());
   }
 
@@ -257,6 +362,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
     if (!mounted || _sftp == null || entry.attr.isDirectory || _editing) return;
     _transferQueue.enqueueDownload(
       connectionIdentity: widget.client,
+      persistenceKey: widget.sessionIdentity,
       name: entry.filename,
       remotePath: remotePath ?? _remotePath(entry.filename),
       protocol: protocol ?? widget.protocol,
@@ -264,11 +370,32 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
       localDirectory: localDirectory,
     );
     setState(() => _showTransferQueue = true);
+    _scheduleQueuePersistence();
+    unawaited(_runTransferQueue());
+  }
+
+  void _scheduleQueuePersistence() {
+    final persistenceKey = widget.sessionIdentity;
+    final snapshot = _transferQueue.pendingSnapshots(persistenceKey);
+    _queuePersistence = _queuePersistence
+        .then(
+          (_) => _transferQueueStore.saveForSession(persistenceKey, snapshot),
+        )
+        .catchError((Object error) {
+          if (mounted) {
+            widget.onMessage('无法保存待处理传输队列：$error', isError: true);
+          }
+        });
+  }
+
+  void _resumePersistedQueue() {
+    if (!_queuePaused) return;
+    setState(() => _queuePaused = false);
     unawaited(_runTransferQueue());
   }
 
   Future<void> _runTransferQueue() async {
-    if (!mounted || _editing) return;
+    if (!mounted || _editing || _queuePaused) return;
     if (_transferring) {
       final pending = _queueIdle;
       if (pending != null) await pending.future;
@@ -281,6 +408,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
     setState(() => _transferring = true);
     var completed = 0;
     var skipped = 0;
+    var cancelled = 0;
     var failed = 0;
     var refreshCurrentDirectory = false;
     try {
@@ -290,6 +418,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
         if (!identical(task.connectionIdentity, widget.client)) {
           _transferQueue.fail(task, 'SSH 会话已更换，任务未转移到新会话');
           failed++;
+          _scheduleQueuePersistence();
           setState(() {});
           continue;
         }
@@ -297,6 +426,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
         if (sftp == null) {
           _transferQueue.fail(task, 'SFTP 会话未就绪');
           failed++;
+          _scheduleQueuePersistence();
           setState(() {});
           continue;
         }
@@ -328,6 +458,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
               protocol: task.protocol,
               sftpClient: sftp,
               overwriteConfirmed: target != null,
+              cancellation: task.cancellation,
               onProgress: (bytes) {
                 _transferQueue.updateProgress(task, bytes, totalBytes: length);
                 if (mounted) setState(() {});
@@ -350,7 +481,16 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                 task.remotePath,
                 mode: SftpFileOpenMode.read,
               );
+              Future<void>? cancellationClose;
+              final cancellationSubscription = task.cancellation.onCancel
+                  .listen((_) {
+                    cancellationClose ??= remoteFile.close();
+                  });
+              if (task.cancellation.isCancelled) {
+                cancellationClose ??= remoteFile.close();
+              }
               try {
+                task.cancellation.throwIfCancelled();
                 final initialVersion = await remoteFile.stat();
                 final totalLength = initialVersion.size;
                 if (totalLength == null || totalLength < 0) {
@@ -369,12 +509,15 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                       if (mounted) setState(() {});
                     },
                   )) {
+                    task.cancellation.throwIfCancelled();
                     output.add(chunk);
                   }
+                  task.cancellation.throwIfCancelled();
                   final currentVersion = await remoteFile.stat();
                   if (!_sameRemoteVersion(initialVersion, currentVersion)) {
                     throw StateError('远端文件在下载期间发生变化');
                   }
+                  task.cancellation.beginCommit();
                   await writeLocalFileAtomically(
                     localPath,
                     output.takeBytes(),
@@ -393,11 +536,13 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                     ),
                     overwriteConfirmed: exists,
                     validateSource: () async {
+                      task.cancellation.throwIfCancelled();
                       final currentVersion = await remoteFile.stat();
                       if (!_sameRemoteVersion(initialVersion, currentVersion)) {
                         throw StateError('远端文件在下载期间发生变化，部分数据已保留');
                       }
                     },
+                    beforeCommit: task.cancellation.beginCommit,
                     onProgress: (received) {
                       _transferQueue.updateProgress(
                         task,
@@ -409,6 +554,8 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                   );
                 }
               } finally {
+                await cancellationSubscription.cancel();
+                await cancellationClose;
                 await remoteFile.close();
               }
             } else {
@@ -417,16 +564,19 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                 remotePath: task.remotePath,
                 protocol: task.protocol,
                 sftpClient: sftp,
+                cancellation: task.cancellation,
                 onProgress: (received) {
                   _transferQueue.updateProgress(task, received);
                   if (mounted) setState(() {});
                 },
               );
+              task.cancellation.throwIfCancelled();
               if (!mounted ||
                   !identical(task.connectionIdentity, widget.client)) {
                 throw StateError('SSH 会话已更换，任务已停止');
               }
               if (localDirectory == null) {
+                task.cancellation.beginCommit();
                 final result = await FilePicker.saveFile(
                   fileName: task.name,
                   bytes: bytes,
@@ -437,6 +587,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                   skipped++;
                   continue;
                 }
+                task.cancellation.throwIfCancelled();
               } else {
                 final localPath = localJoinPath(localDirectory, task.name);
                 final exists = await localFileExists(localPath);
@@ -445,6 +596,8 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                   skipped++;
                   continue;
                 }
+                task.cancellation.throwIfCancelled();
+                task.cancellation.beginCommit();
                 await writeLocalFileAtomically(
                   localPath,
                   bytes,
@@ -456,10 +609,19 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
           _transferQueue.complete(task);
           completed++;
         } catch (error) {
-          _transferQueue.fail(task, error.toString());
-          failed++;
+          if (task.cancellation.isCancelled ||
+              error is RemoteTransferCancelled) {
+            _transferQueue.cancelled(task);
+            cancelled++;
+          } else {
+            _transferQueue.fail(task, error.toString());
+            failed++;
+          }
         } finally {
-          if (mounted) setState(() {});
+          if (mounted) {
+            _scheduleQueuePersistence();
+            setState(() {});
+          }
         }
       }
     } finally {
@@ -474,9 +636,9 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
     }
     if (!mounted) return;
     if (refreshCurrentDirectory) await _refresh();
-    if (completed + skipped + failed > 0) {
+    if (completed + skipped + cancelled + failed > 0) {
       widget.onMessage(
-        '传输队列完成：$completed 项成功，$skipped 项跳过，$failed 项失败',
+        '传输队列完成：$completed 项成功，$skipped 项跳过，$cancelled 项取消，$failed 项失败',
         isError: failed > 0,
       );
     }
@@ -498,11 +660,19 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
   }
 
   void _removeQueuedTransfer(RemoteTransferTask task) {
-    if (_transferQueue.removeQueued(task.id)) setState(() {});
+    if (_transferQueue.removeQueued(task.id)) {
+      _scheduleQueuePersistence();
+      setState(() {});
+    }
+  }
+
+  void _cancelActiveTransfer(RemoteTransferTask task) {
+    if (_transferQueue.cancelActive(task.id)) setState(() {});
   }
 
   void _clearFinishedTransfers() {
     setState(_transferQueue.clearFinished);
+    _scheduleQueuePersistence();
   }
 
   Future<void> _edit(SftpName entry) async {
@@ -883,7 +1053,9 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
             children: [
               Expanded(
                 child: Text(
-                  '传输队列 · ${_transferQueue.queuedCount} 等待 · ${_transferQueue.activeCount} 进行中',
+                  _queuePaused
+                      ? '恢复前请检查 · ${_transferQueue.queuedCount} 项待确认'
+                      : '传输队列 · ${_transferQueue.queuedCount} 等待 · ${_transferQueue.activeCount} 进行中',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
@@ -892,6 +1064,13 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                   ),
                 ),
               ),
+              if (_queuePaused)
+                IconButton(
+                  tooltip: '恢复任务',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _resumePersistedQueue,
+                  icon: const Icon(Icons.play_arrow_rounded, size: 17),
+                ),
               IconButton(
                 tooltip: '清除已结束任务',
                 visualDensity: VisualDensity.compact,
@@ -923,6 +1102,8 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                   RemoteTransferStatus.completed => colors.primary,
                   RemoteTransferStatus.queued ||
                   RemoteTransferStatus.transferring ||
+                  RemoteTransferStatus.cancelling ||
+                  RemoteTransferStatus.cancelled ||
                   RemoteTransferStatus.skipped => colors.onSurfaceVariant,
                 };
                 final icon = switch (task.direction) {
@@ -930,12 +1111,17 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                   RemoteTransferDirection.download => Icons.download_rounded,
                 };
                 final statusText = switch (task.status) {
-                  RemoteTransferStatus.queued => '等待中',
+                  RemoteTransferStatus.queued =>
+                    task.isPersistable ? '等待中' : '等待中 · 当前运行期间有效',
                   RemoteTransferStatus.transferring =>
-                    task.totalBytes == null || task.totalBytes == 0
+                    !task.cancellation.canCancel
+                        ? '正在提交文件…'
+                        : task.totalBytes == null || task.totalBytes == 0
                         ? '传输中'
                         : '${_formatSize(task.transferredBytes)} / ${_formatSize(task.totalBytes!)}',
+                  RemoteTransferStatus.cancelling => '正在取消…',
                   RemoteTransferStatus.completed => '已完成',
+                  RemoteTransferStatus.cancelled => task.detail ?? '已取消',
                   RemoteTransferStatus.skipped => task.detail ?? '已跳过',
                   RemoteTransferStatus.failed => task.detail ?? '传输失败',
                 };
@@ -963,7 +1149,8 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                               style: TextStyle(fontSize: 9, color: color),
                             ),
                             if (task.status ==
-                                RemoteTransferStatus.transferring)
+                                    RemoteTransferStatus.transferring ||
+                                task.status == RemoteTransferStatus.cancelling)
                               LinearProgressIndicator(
                                 minHeight: 2,
                                 value:
@@ -983,7 +1170,17 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                           onPressed: () => _removeQueuedTransfer(task),
                           icon: const Icon(Icons.close_rounded, size: 15),
                         )
-                      else if (task.status == RemoteTransferStatus.transferring)
+                      else if (task.status ==
+                              RemoteTransferStatus.transferring &&
+                          task.cancellation.canCancel)
+                        IconButton(
+                          tooltip: '取消当前传输',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => _cancelActiveTransfer(task),
+                          icon: const Icon(Icons.cancel_outlined, size: 15),
+                        )
+                      else if (task.status == RemoteTransferStatus.cancelling ||
+                          task.status == RemoteTransferStatus.transferring)
                         const Padding(
                           padding: EdgeInsets.symmetric(horizontal: 8),
                           child: SizedBox.square(
@@ -1000,10 +1197,13 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
                                 Icons.check_circle_outline_rounded,
                               RemoteTransferStatus.skipped =>
                                 Icons.remove_circle_outline_rounded,
+                              RemoteTransferStatus.cancelled =>
+                                Icons.cancel_outlined,
                               RemoteTransferStatus.failed =>
                                 Icons.error_outline_rounded,
                               RemoteTransferStatus.queued ||
-                              RemoteTransferStatus.transferring =>
+                              RemoteTransferStatus.transferring ||
+                              RemoteTransferStatus.cancelling =>
                                 Icons.circle_outlined,
                             },
                             size: 15,
@@ -1024,6 +1224,7 @@ class _RemoteFileBrowserState extends State<RemoteFileBrowser> {
   @override
   void dispose() {
     _generation++;
+    _scheduleQueuePersistence();
     _pathController.dispose();
     _filterController.dispose();
     final sftp = _sftp;
