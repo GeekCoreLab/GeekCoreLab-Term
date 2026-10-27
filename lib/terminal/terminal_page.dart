@@ -533,11 +533,24 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       return;
     }
 
+    final TerminalMacroPlan plan;
+    if (macro.parameters.isEmpty) {
+      plan = macro.prepare(const {});
+    } else {
+      final prepared = await showDialog<TerminalMacroPlan>(
+        context: context,
+        builder: (_) => TerminalMacroParametersDialog(macro: macro),
+      );
+      if (!mounted || prepared == null) return;
+      plan = prepared;
+    }
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => TerminalMacroExecutionReviewDialog(
         macro: macro,
         targetNames: targets.map((target) => target.displayName).toList(),
+        plan: plan,
       ),
     );
     if (!mounted || confirmed != true) return;
@@ -555,6 +568,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         try {
           await executeTerminalMacroCommands(
             macro: macro,
+            commands: plan.commands,
             canContinue: (completedCommands) {
               if (abortRequested) return false;
               if (!_isMacroTargetCurrent(target)) {
@@ -600,7 +614,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       _showMessage('宏已中止：$failure', isError: true);
     } else {
       _showMessage(
-        '已向 ${targets.length} 个终端发送“${macro.name}”的 ${macro.commands.length} 条命令',
+        '已向 ${targets.length} 个终端发送“${macro.name}”的 ${plan.commands.length} 条命令',
       );
     }
   }

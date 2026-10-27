@@ -249,9 +249,17 @@ void main() {
       () => TerminalMacro.fromScript(
         id: 'empty-line',
         name: '错误宏',
-        script: 'hostname\n\nuptime',
+        script: 'hostname\n\n# 忽略注释和空行\nuptime',
       ),
-      throwsFormatException,
+      returnsNormally,
+    );
+    expect(
+      TerminalMacro.fromScript(
+        id: 'comments',
+        name: '兼容空行',
+        script: 'hostname\n\n# 注释\nuptime',
+      ).commands,
+      ['hostname', 'uptime'],
     );
     expect(
       () => TerminalMacro.fromScript(
@@ -274,6 +282,98 @@ void main() {
         id: 'too-large-utf8',
         name: '错误宏',
         script: "echo ${List.filled(6000, '中').join()}",
+      ),
+      throwsFormatException,
+    );
+  });
+
+  test(
+    'TerminalMacro expands parameters, exact conditions, and bounded loops',
+    () {
+      final macro = TerminalMacro.fromScript(
+        id: 'script-branch-loop',
+        name: '条件巡检',
+        script: r'''
+@param ENV=prod
+@secret TOKEN
+
+@if ENV == prod
+@repeat 2 as INDEX
+echo ${ENV}-${INDEX}-${TOKEN}
+@end
+@else
+echo skipped
+@endif
+''',
+      );
+
+      final production = macro.prepare({'TOKEN': 'secret-value'});
+      expect(production.commands, [
+        'echo prod-1-secret-value',
+        'echo prod-2-secret-value',
+      ]);
+      expect(production.reviewCommands, [
+        'echo prod-1-<已遮蔽变量:TOKEN>',
+        'echo prod-2-<已遮蔽变量:TOKEN>',
+      ]);
+      expect(production.usesSecret, isTrue);
+
+      final staging = macro.prepare({
+        'ENV': 'staging',
+        'TOKEN': 'secret-value',
+      });
+      expect(staging.commands, ['echo skipped']);
+      expect(staging.usesSecret, isFalse);
+      expect(TerminalMacro.fromJson(jsonEncode(macro.toJson())), macro);
+      expect(jsonEncode(macro.toJson()), isNot(contains('secret-value')));
+    },
+  );
+
+  test('TerminalMacro rejects unsafe or unbounded script expansions', () {
+    expect(
+      () => TerminalMacro.fromScript(
+        id: 'unknown-variable',
+        name: '错误变量',
+        script: r'echo ${MISSING}',
+      ),
+      throwsFormatException,
+    );
+    expect(
+      () => TerminalMacro.fromScript(
+        id: 'unclosed-condition',
+        name: '未闭合条件',
+        script: '@param ENV=prod\n@if ENV == prod\necho ok',
+      ),
+      throwsFormatException,
+    );
+    expect(
+      () => TerminalMacro.fromScript(
+        id: 'too-many-expanded',
+        name: '展开超限',
+        script: '@repeat 20 as INDEX\na\nb\nc\n@end',
+      ),
+      throwsFormatException,
+    );
+    final parameterized = TerminalMacro.fromScript(
+      id: 'bad-value',
+      name: '控制字符',
+      script: r'''
+@param VALUE
+echo ${VALUE}
+''',
+    );
+    expect(
+      () => parameterized.prepare({'VALUE': 'line one\nline two'}),
+      throwsFormatException,
+    );
+    expect(
+      () => TerminalMacro.fromScript(
+        id: 'secret-default',
+        name: '秘密默认值',
+        script: r'''
+@secret TOKEN=unsafe
+echo ${TOKEN}
+''',
       ),
       throwsFormatException,
     );
@@ -308,6 +408,31 @@ void main() {
       expect(sent, ['printf 中文\r']);
     },
   );
+
+  test('macro executor sends the reviewed expanded plan', () async {
+    final macro = TerminalMacro.fromScript(
+      id: 'expanded-plan',
+      name: '远端巡检',
+      script: r'''
+@param HOST=qa
+@repeat 2 as INDEX
+echo ${HOST} ${INDEX}
+@end
+''',
+    );
+    final plan = macro.prepare(const {});
+    final sent = <String>[];
+
+    final completed = await executeTerminalMacroCommands(
+      macro: macro,
+      commands: plan.commands,
+      canContinue: (_) => true,
+      write: (input) async => sent.add(utf8.decode(input)),
+    );
+
+    expect(completed, 2);
+    expect(sent, ['echo qa 1\r', 'echo qa 2\r']);
+  });
 
   test('SessionStore persists groups, snippets, and macros', () async {
     SharedPreferencesAsyncPlatform.instance =

@@ -137,8 +137,8 @@ class _TerminalMacroManagerDialogState
           children: [
             Text(
               widget.canRun
-                  ? '宏会逐行发送并自动按 Enter。每次执行前都会显示完整命令和目标会话供你确认。'
-                  : '宏保存在本机。连接终端后可执行；执行前会显示完整命令和目标会话供你确认。',
+                  ? '脚本会按顺序发送展开后的命令并自动按 Enter；分支和重复次数有上限。执行前会显示命令及目标会话供你确认。'
+                  : '脚本保存在本机。连接终端后可执行；执行前会显示展开命令和目标会话供你确认。',
               style: TextStyle(fontSize: 12, color: colors.onSurfaceVariant),
             ),
             const SizedBox(height: 6),
@@ -177,7 +177,9 @@ class _TerminalMacroManagerDialogState
                             overflow: TextOverflow.ellipsis,
                           ),
                           subtitle: Text(
-                            '${macro.commands.length} 条命令 · ${macro.commands.first}',
+                            macro.isStructured
+                                ? '${macro.commands.length} 条命令模板 · ${macro.parameters.length} 个变量'
+                                : '${macro.commands.length} 条命令 · ${macro.commands.first}',
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
@@ -223,15 +225,134 @@ class _TerminalMacroManagerDialogState
   }
 }
 
+class TerminalMacroParametersDialog extends StatefulWidget {
+  const TerminalMacroParametersDialog({required this.macro, super.key});
+
+  final TerminalMacro macro;
+
+  @override
+  State<TerminalMacroParametersDialog> createState() =>
+      _TerminalMacroParametersDialogState();
+}
+
+class _TerminalMacroParametersDialogState
+    extends State<TerminalMacroParametersDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final Map<String, TextEditingController> _controllers = {
+    for (final parameter in widget.macro.parameters)
+      parameter.name: TextEditingController(text: parameter.defaultValue ?? ''),
+  };
+
+  @override
+  void dispose() {
+    for (final controller in _controllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  void _prepare() {
+    if (!_formKey.currentState!.validate()) return;
+    try {
+      final plan = widget.macro.prepare({
+        for (final entry in _controllers.entries) entry.key: entry.value.text,
+      });
+      Navigator.of(context).pop(plan);
+    } on FormatException catch (error) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final viewport = MediaQuery.sizeOf(context);
+    final hasSecrets = widget.macro.parameters.any(
+      (parameter) => parameter.isSecret,
+    );
+    return AlertDialog(
+      scrollable: true,
+      title: const Text('填写脚本变量'),
+      content: SizedBox(
+        width: (viewport.width - 100).clamp(240.0, 600.0).toDouble(),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text('宏：${widget.macro.name}'),
+              const SizedBox(height: 8),
+              for (final parameter in widget.macro.parameters) ...[
+                TextFormField(
+                  controller: _controllers[parameter.name],
+                  obscureText: parameter.isSecret,
+                  autocorrect: false,
+                  enableSuggestions: !parameter.isSecret,
+                  maxLength: TerminalMacro.maxParameterLength,
+                  decoration: InputDecoration(
+                    labelText: parameter.isSecret
+                        ? '${parameter.name} · 秘密变量'
+                        : parameter.name,
+                    helperText: parameter.defaultValue == null
+                        ? '每次执行时填写'
+                        : '默认值可在本次执行中覆盖',
+                  ),
+                  validator: (value) {
+                    if ((parameter.isSecret ||
+                            parameter.defaultValue == null) &&
+                        (value ?? '').isEmpty) {
+                      return '请填写 ${parameter.name}';
+                    }
+                    return null;
+                  },
+                ),
+              ],
+              if (hasSecrets) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '秘密值不会写入宏。若变量被插入命令，远端 shell 仍可能将其记录在历史或进程信息中。',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton.icon(
+          onPressed: _prepare,
+          icon: const Icon(Icons.preview_rounded, size: 18),
+          label: const Text('预览命令'),
+        ),
+      ],
+    );
+  }
+}
+
 class TerminalMacroExecutionReviewDialog extends StatelessWidget {
   const TerminalMacroExecutionReviewDialog({
     required this.macro,
     required this.targetNames,
+    this.plan,
     super.key,
   });
 
   final TerminalMacro macro;
   final List<String> targetNames;
+  final TerminalMacroPlan? plan;
+
+  int get _commandCount => plan?.commands.length ?? macro.commands.length;
+
+  String get _reviewScript => plan?.reviewCommands.join('\n') ?? macro.script;
 
   @override
   Widget build(BuildContext context) {
@@ -255,7 +376,7 @@ class TerminalMacroExecutionReviewDialog extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text('宏：${macro.name} · ${macro.commands.length} 条命令'),
+            Text('宏：${macro.name} · $_commandCount 条命令'),
             const SizedBox(height: 8),
             Text(
               '目标会话（${targetNames.length}）',
@@ -290,7 +411,9 @@ class TerminalMacroExecutionReviewDialog extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Text(
-              '将按顺序发送以下命令，并为每行发送 Enter：',
+              plan == null
+                  ? '将按顺序发送以下命令，并为每行发送 Enter：'
+                  : '以下为变量和条件展开后的命令，将按顺序发送并为每行发送 Enter：',
               style: Theme.of(context).textTheme.titleSmall,
             ),
             const SizedBox(height: 4),
@@ -304,7 +427,7 @@ class TerminalMacroExecutionReviewDialog extends StatelessWidget {
                 child: SingleChildScrollView(
                   padding: const EdgeInsets.all(10),
                   child: SelectableText(
-                    macro.script,
+                    _reviewScript,
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       fontFamily: 'monospace',
                       height: 1.45,
@@ -314,6 +437,12 @@ class TerminalMacroExecutionReviewDialog extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 8),
+            if (plan?.usesSecret == true)
+              Text(
+                '秘密变量已在预览中遮蔽；实际值会原样发送到终端，远端 shell 可能记录该值。',
+                style: TextStyle(color: colors.error, fontSize: 12),
+              ),
+            if (plan?.usesSecret == true) const SizedBox(height: 6),
             Text(
               '断线或重连会停止剩余命令；已经发送的命令无法回滚。',
               style: TextStyle(color: colors.error, fontSize: 12),
@@ -331,7 +460,7 @@ class TerminalMacroExecutionReviewDialog extends StatelessWidget {
               ? null
               : () => Navigator.of(context).pop(true),
           icon: const Icon(Icons.play_arrow_rounded, size: 18),
-          label: Text('执行 ${macro.commands.length} 条命令'),
+          label: Text('执行 $_commandCount 条命令'),
         ),
       ],
     );
@@ -429,7 +558,9 @@ class _TerminalMacroEditDialogState extends State<_TerminalMacroEditDialog> {
               style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
               decoration: const InputDecoration(
                 labelText: '逐行执行的命令',
-                helperText: '每行执行后自动发送 Enter；空行会被拒绝。',
+                helperText:
+                    r'语法：@param HOST=qa；@secret TOKEN；@if HOST == prod / @else / @endif；@repeat 3 as INDEX / @end；用 ${HOST} 插值。最多 20 次重复、40 条展开命令。变量原样插入，需检查 shell 语法；秘密变量不保存，但可能进入远端 shell 历史。',
+                helperMaxLines: 4,
                 alignLabelWithHint: true,
               ),
               validator: _validateScript,
