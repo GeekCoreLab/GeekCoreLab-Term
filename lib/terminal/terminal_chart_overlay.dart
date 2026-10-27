@@ -83,47 +83,40 @@ class _TerminalChartOverlayState extends State<TerminalChartOverlay> {
         final children = <Widget>[];
 
         for (final block in blocks) {
+          // block.startBufferLine is the command line; block.endBufferLine - 1 is the last line of output
+          // (since block.endBufferLine is the line where the next prompt is located)
+          final lastOutputLine = math.max(block.startBufferLine, block.endBufferLine - 1);
           final startY = block.startBufferLine * lineHeight + widget.padding.top - scrollOffset;
-          final endY = (block.endBufferLine + 1) * lineHeight + widget.padding.top - scrollOffset;
+          final endY = (lastOutputLine + 1) * lineHeight + widget.padding.top - scrollOffset;
 
           // Check if command block intersects visible viewport or nearby
           if (endY < -300 || startY > viewportHeight + 300) {
             continue;
           }
 
-          // Calculate clamped floating position for toggle badge
-          // The floating badge must remain within [startY, endY - badgeHeight]
-          // and within viewport bounds [10, viewportHeight - 40]
-          const badgeHeight = 28.0;
+          // Calculate clamped floating position for toggle badge:
+          // The floating badge stays within [startY, endY - badgeHeight]
+          // while sticking to the viewport top/bottom [8.0, viewportHeight - 36.0] when scrolling
+          const badgeHeight = 26.0;
           final minBadgeY = startY;
           final maxBadgeY = math.max(startY, endY - badgeHeight);
+          final targetViewportY = startY.clamp(8.0, math.max(8.0, viewportHeight - badgeHeight - 8.0));
+          final badgeTop = targetViewportY.clamp(minBadgeY, maxBadgeY).toDouble();
 
-          // Clamped to viewport
-          final clampedY = minBadgeY.clamp(
-            math.max(10.0, minBadgeY),
-            math.min(viewportHeight - 38.0, maxBadgeY),
-          ).toDouble();
-
-          final badgeTop = (clampedY >= minBadgeY && clampedY <= maxBadgeY)
-              ? clampedY
-              : minBadgeY.clamp(0.0, viewportHeight - 38.0).toDouble();
-
-          // 1. If in render mode, show the GUI chart card exactly where the output was
+          // 1. If in render mode, show the GUI chart card starting right below the command line
           if (block.isRenderMode) {
             final cardTop = startY + lineHeight;
-            final blockPixelHeight = math.max(0.0, (block.endBufferLine - block.startBufferLine - 1) * lineHeight);
             children.add(
               Positioned(
                 left: widget.padding.left,
                 right: math.max(16.0, viewportWidth - 580),
                 top: cardTop,
-                height: blockPixelHeight > 60 ? blockPixelHeight : null,
                 child: _buildChartCard(block),
               ),
             );
           }
 
-          // 2. Floating toggle badge (Badge is always floating along [startY, endY])
+          // 2. Floating toggle badge (Badge floats within [startY, endY])
           children.add(
             Positioned(
               right: 18,
@@ -155,6 +148,11 @@ class _TerminalChartOverlayState extends State<TerminalChartOverlay> {
       case CommandChartType.free:
         return TerminalFreeChartWidget(
           stats: block.freeStats!,
+          onClose: () => widget.coordinator.toggleBlockMode(block),
+        );
+      case CommandChartType.dockerPs:
+        return TerminalDockerPsChartWidget(
+          entries: block.dockerEntries,
           onClose: () => widget.coordinator.toggleBlockMode(block),
         );
     }

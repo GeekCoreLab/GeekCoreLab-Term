@@ -367,7 +367,7 @@ class TerminalInlineHintTransformer {
 
   /// Patterns that indicate a shell prompt has returned (ending the command output)
   static final RegExp _promptPattern = RegExp(
-    r'(?:^|[\r\n])(?:[\w.\-]+@[\w.\-]+:[^#$]*[#$]|\$ |# )\s*$',
+    r'(?:^|[\r\n])(?:\[?[a-zA-Z0-9_.\-]+@[a-zA-Z0-9_.\-]+[^#$%>\]]*\]?[#$%>]|[\w.\-]+(?:[#$%>])|[#$%>])\s*$',
   );
 
   /// Callback invoked when buffered text (e.g. an unfinished line or shell prompt)

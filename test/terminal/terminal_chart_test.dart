@@ -60,6 +60,9 @@ void main() {
       expect(TerminalCommandChartParser.matchCommandType('  df  -h / '), equals(CommandChartType.df));
       expect(TerminalCommandChartParser.matchCommandType('free -h'), equals(CommandChartType.free));
       expect(TerminalCommandChartParser.matchCommandType('free -m'), equals(CommandChartType.free));
+      expect(TerminalCommandChartParser.matchCommandType('docker ps'), equals(CommandChartType.dockerPs));
+      expect(TerminalCommandChartParser.matchCommandType('docker ps -a'), equals(CommandChartType.dockerPs));
+      expect(TerminalCommandChartParser.matchCommandType('docker container ls'), equals(CommandChartType.dockerPs));
       expect(TerminalCommandChartParser.matchCommandType('cat 1.txt'), isNull);
     });
 
@@ -102,6 +105,54 @@ Swap:          2.0Gi       256Mi       1.7Gi
       expect(stats.memUsageRatio, greaterThan(0.2));
       expect(stats.memUsageRatio, lessThan(0.35));
     });
+
+    test('parses Chinese localized free -h and df -h outputs', () {
+      const sampleZhFree = '''
+                总计        已用        空闲        共享   缓冲/缓存        可用
+内存：          30Gi        20Gi       3.2Gi       767Mi       7.9Gi       9.9Gi
+交换：          47Gi        11Gi        36Gi
+''';
+      final stats = TerminalCommandChartParser.parseFree(sampleZhFree);
+      expect(stats, isNotNull);
+      expect(stats!.totalMem, equals('30Gi'));
+      expect(stats.usedMem, equals('20Gi'));
+      expect(stats.freeMem, equals('3.2Gi'));
+      expect(stats.totalSwap, equals('47Gi'));
+      expect(stats.usedSwap, equals('11Gi'));
+
+      const sampleZhDf = '''
+文件系统        大小  已用  可用 已用% 挂载点
+                 16G     0   16G    0% /
+/dev/nvme0n1p2  953G  554G  384G   60% /home/hhjmk
+''';
+      final entries = TerminalCommandChartParser.parseDf(sampleZhDf);
+      expect(entries.length, equals(2));
+      expect(entries[0].mountedOn, equals('/'));
+      expect(entries[1].filesystem, equals('/dev/nvme0n1p2'));
+      expect(entries[1].usePercent, closeTo(0.60, 0.01));
+    });
+
+    test('parses docker ps output into structured container entries', () {
+      const sampleDocker = '''
+CONTAINER ID   IMAGE          COMMAND                  CREATED         STATUS         PORTS                               NAMES
+a1b2c3d4e5f6   nginx:alpine   "/docker-entrypoint.…"   2 hours ago     Up 2 hours     0.0.0.0:80->80/tcp, :::80->80/tcp   web-server
+b2c3d4e5f6a1   redis:7        "docker-entrypoint.s…"   3 days ago      Up 3 days      0.0.0.0:6379->6379/tcp              redis-cache
+c3d4e5f6a1b2   postgres:15    "docker-entrypoint.s…"   5 days ago      Exited (0)                                         pg-db
+''';
+      final containers = TerminalCommandChartParser.parseDockerPs(sampleDocker);
+      expect(containers.length, equals(3));
+      expect(containers[0].containerId, equals('a1b2c3d4e5f6'));
+      expect(containers[0].image, equals('nginx:alpine'));
+      expect(containers[0].names, equals('web-server'));
+      expect(containers[0].isRunning, isTrue);
+
+      expect(containers[1].containerId, equals('b2c3d4e5f6a1'));
+      expect(containers[1].ports, contains('6379'));
+      expect(containers[1].isRunning, isTrue);
+
+      expect(containers[2].containerId, equals('c3d4e5f6a1b2'));
+      expect(containers[2].isRunning, isFalse);
+    });
   });
 
   group('TerminalChartCoordinator', () {
@@ -132,9 +183,43 @@ Swap:          2.0Gi       256Mi       1.7Gi
       expect(block.dfEntries.length, equals(1));
       expect(block.isRenderMode, isTrue);
 
+      // Verify that hidden lines are set in controller during render mode
+      expect(terminalController.hiddenLineIndices, isNotEmpty);
+
       // Toggle mode back to raw
       coordinator.toggleBlockMode(block);
       expect(block.isRenderMode, isFalse);
+      expect(terminalController.hiddenLineIndices, isEmpty);
+    });
+
+    test('captures Chinese free output with custom prompt via header detection and idle fallback', () async {
+      final terminal = Terminal();
+      final scrollController = ScrollController();
+      final terminalController = TerminalController();
+      final coordinator = TerminalChartCoordinator(
+        terminal: terminal,
+        scrollController: scrollController,
+        terminalController: terminalController,
+      );
+
+      terminal.write('╭─hhjmk@arch ~\r\n╰─❯ free -h\r\n');
+      coordinator.observeOutput('╭─hhjmk@arch ~\r\n╰─❯ free -h\r\n');
+      const zhFreeOut =
+          '                总计        已用        空闲        共享   缓冲/缓存        可用\r\n'
+          '内存：          30Gi        20Gi       3.2Gi       767Mi       7.9Gi       9.9Gi\r\n'
+          '交换：          47Gi        11Gi        36Gi\r\n'
+          '╭─hhjmk@arch ~\r\n╰─❯ ';
+      terminal.write(zhFreeOut);
+      coordinator.observeOutput(zhFreeOut);
+
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+
+      expect(coordinator.blocks.length, equals(1));
+      final block = coordinator.blocks.first;
+      expect(block.type, equals(CommandChartType.free));
+      expect(block.freeStats?.totalMem, equals('30Gi'));
+      expect(block.isRenderMode, isTrue);
+      expect(terminalController.hiddenLineIndices, isNotEmpty);
     });
   });
 }
