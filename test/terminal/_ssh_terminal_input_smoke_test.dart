@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:geekcore_term/terminal/terminal_macro.dart';
 
 void main() {
   test(
@@ -186,6 +187,24 @@ Subsystem sftp internal-sftp
           isFalse,
           reason: 'SSH channel closed after second input',
         );
+
+        final macro = TerminalMacro.fromScript(
+          id: 'ssh-smoke',
+          name: 'SSH 输入宏 smoke',
+          script: "printf 'macro-first-ok\\n'\nprintf 'macro-second-ok\\n'",
+        );
+        await executeTerminalMacroCommands(
+          macro: macro,
+          canContinue: (_) => !channelDone,
+          write: (input) async {
+            await session!.stdin.addStream(Stream<Uint8List>.value(input));
+            await session.flush();
+          },
+        );
+        await waitForOutput('macro-first-ok');
+        await waitForOutput('macro-second-ok');
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+        expect(channelDone, isFalse, reason: 'SSH macro closed the channel');
       } finally {
         await stdoutSubscription?.cancel();
         await stderrSubscription?.cancel();

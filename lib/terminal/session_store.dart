@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'remote_transfer_queue_store.dart';
+import 'terminal_macro.dart';
 
 enum SessionProtocol { serial, telnet, ssh }
 
@@ -392,6 +393,7 @@ class SessionStore {
   static const _recentKey = 'geekcore_term.recent_sessions.v1';
   static const _groupsKey = 'geekcore_term.session_groups.v1';
   static const _snippetsKey = 'geekcore_term.command_snippets.v1';
+  static const _macrosKey = 'geekcore_term.command_macros.v1';
   static const _sshHostKeysKey = 'geekcore_term.ssh_host_keys.v1';
   static const _terminalSplitModeKey = 'geekcore_term.terminal_split_mode.v1';
 
@@ -424,6 +426,20 @@ class SessionStore {
     return snippets;
   }
 
+  Future<List<TerminalMacro>> loadTerminalMacros() async {
+    final encodedMacros =
+        await _preferences.getStringList(_macrosKey) ?? const [];
+    final macros = <TerminalMacro>[];
+    for (final encoded in encodedMacros) {
+      try {
+        macros.add(TerminalMacro.fromJson(encoded));
+      } on Object {
+        // Ignore a malformed macro without losing the remaining library.
+      }
+    }
+    return macros;
+  }
+
   Future<void> saveSaved(List<SessionRecord> records) =>
       _save(_savedKey, records);
 
@@ -445,11 +461,19 @@ class SessionStore {
         ),
       );
 
+  Future<void> saveTerminalMacros(List<TerminalMacro> macros) => _enqueueWrite(
+    () => _preferences.setStringList(
+      _macrosKey,
+      macros.map((macro) => jsonEncode(macro.toJson())).toList(),
+    ),
+  );
+
   Future<void> clear() => _enqueueWrite(() async {
     await _preferences.remove(_savedKey);
     await _preferences.remove(_recentKey);
     await _preferences.remove(_groupsKey);
     await _preferences.remove(_snippetsKey);
+    await _preferences.remove(_macrosKey);
     await _preferences.remove(_sshHostKeysKey);
     await _preferences.remove(_terminalSplitModeKey);
     await _preferences.remove(RemoteTransferQueueStore.storageKey);

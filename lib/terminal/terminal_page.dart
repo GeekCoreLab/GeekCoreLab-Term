@@ -27,11 +27,15 @@ import 'package:geekcore_term/terminal/ssh_remote_monitor_bar.dart';
 import 'package:geekcore_term/terminal/ssh_remote_monitor_cache.dart';
 import 'package:geekcore_term/terminal/network_diagnostics_dialog.dart';
 import 'package:geekcore_term/terminal/command_snippet_dialog.dart';
+import 'package:geekcore_term/terminal/command_macro_dialog.dart';
 import 'package:geekcore_term/terminal/session_store.dart';
 import 'package:geekcore_term/terminal/terminal_search_dialog.dart';
 import 'package:geekcore_term/terminal/terminal_transcript.dart';
+import 'package:geekcore_term/terminal/terminal_assistant.dart';
+import 'package:geekcore_term/terminal/terminal_assistant_panel.dart';
 import 'package:geekcore_term/terminal/terminal_input_targets.dart';
 import 'package:geekcore_term/terminal/terminal_shortcuts.dart';
+import 'package:geekcore_term/terminal/terminal_macro.dart';
 import 'package:geekcore_term/terminal/websocket_ssh_socket.dart';
 import 'package:geekcore_term/settings/app_settings.dart';
 import 'package:geekcore_term/settings/settings_page.dart';
@@ -215,6 +219,153 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
     } catch (error) {
       _showMessage('读取命令片段失败：$error', isError: true);
     }
+  }
+
+  Future<void> _openTerminalMacroManager() async {
+    try {
+      await _recordsReady;
+      final macros = await _sessionStore.loadTerminalMacros();
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => TerminalMacroManagerDialog(
+          initialMacros: macros,
+          canRun: _activeTab?.isConnected == true,
+          onSave: _sessionStore.saveTerminalMacros,
+          onRun: _reviewAndRunTerminalMacro,
+        ),
+      );
+    } catch (error) {
+      _showMessage('读取命令宏失败：$error', isError: true);
+    }
+  }
+
+  Future<void> _reviewAndRunTerminalMacro(TerminalMacro macro) async {
+    final source = _activeTab;
+    if (source == null || source.isClosed || !source.isConnected) {
+      _showMessage('请先连接一个终端会话', isError: true);
+      return;
+    }
+    final targetIds = terminalInputTargetIds(
+      sourceTabId: source.id,
+      connectedTabIds: _tabs
+          .where((tab) => tab.isConnected && !tab.isClosed)
+          .map((tab) => tab.id),
+      splitTabIds: _splitTabIds,
+      selectedTabIds: _multiExecTabIds,
+      broadcastSplitInput:
+          _broadcastSplitInput && _splitMode != TerminalSplitMode.none,
+    );
+    final targets = [
+      for (final tab in _tabs)
+        if (targetIds.contains(tab.id) && tab.isConnected && !tab.isClosed)
+          _TerminalMacroTarget.capture(tab),
+    ];
+    if (targets.isEmpty) {
+      _showMessage('没有可执行宏的已连接终端', isError: true);
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => TerminalMacroExecutionReviewDialog(
+        macro: macro,
+        targetNames: targets.map((target) => target.displayName).toList(),
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+    if (targets.any((target) => !_isMacroTargetCurrent(target))) {
+      _showMessage('目标会话已断开或重连；未发送宏命令', isError: true);
+      return;
+    }
+
+    var abortRequested = false;
+    _TerminalMacroRunFailure? abortFailure;
+    final writes = <Future<void>>[];
+    for (final target in targets) {
+      final tab = target.tab;
+      final operation = tab.inputWriteQueue.then((_) async {
+        try {
+          await executeTerminalMacroCommands(
+            macro: macro,
+            canContinue: (completedCommands) {
+              if (abortRequested) return false;
+              if (!_isMacroTargetCurrent(target)) {
+                abortRequested = true;
+                abortFailure = _TerminalMacroRunFailure(
+                  target.displayName,
+                  completedCommands,
+                  '会话已断开或重连',
+                );
+                return false;
+              }
+              return true;
+            },
+            write: (input) => _writeMacroInput(target, input),
+          );
+        } catch (error) {
+          if (!abortRequested) {
+            abortRequested = true;
+            final completedCommands = switch (error) {
+              TerminalMacroStoppedException(:final completedCommands) =>
+                completedCommands,
+              TerminalMacroWriteException(:final completedCommands) =>
+                completedCommands,
+              _ => 0,
+            };
+            final cause = error is TerminalMacroWriteException
+                ? error.cause
+                : error;
+            abortFailure = _TerminalMacroRunFailure(
+              target.displayName,
+              completedCommands,
+              cause.toString(),
+            );
+          }
+        }
+      });
+      tab.inputWriteQueue = operation.catchError((Object _) {});
+      writes.add(operation);
+    }
+    await Future.wait(writes);
+    final failure = abortFailure;
+    if (failure != null) {
+      _showMessage('宏已中止：$failure', isError: true);
+    } else {
+      _showMessage(
+        '已向 ${targets.length} 个终端发送“${macro.name}”的 ${macro.commands.length} 条命令',
+      );
+    }
+  }
+
+  bool _isMacroTargetCurrent(_TerminalMacroTarget target) {
+    final tab = target.tab;
+    return _tabs.contains(tab) &&
+        !tab.isClosed &&
+        !tab.starting &&
+        !tab.restarting &&
+        tab.isConnected &&
+        tab.sessionId == target.sessionId &&
+        identical(tab.sshClient, target.sshClient) &&
+        identical(tab.sshSession, target.sshSession);
+  }
+
+  Future<void> _writeMacroInput(
+    _TerminalMacroTarget target,
+    Uint8List input,
+  ) async {
+    if (!_isMacroTargetCurrent(target)) {
+      throw StateError('会话已断开或重连');
+    }
+    final sshSession = target.sshSession;
+    if (sshSession != null) {
+      await sshSession.stdin.addStream(Stream<Uint8List>.value(input));
+      await sshSession.flush();
+      return;
+    }
+    final sessionId = target.sessionId;
+    if (sessionId == null) throw StateError('终端会话已关闭');
+    await writeTerminalInput(sessionId: sessionId, data: input);
   }
 
   Future<bool> _confirmBroadcastPaste(
@@ -427,6 +578,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   void _writeTerminalOutput(_TerminalTab tab, String value) {
     tab.terminal.write(value);
+    if (!tab.isClosed) tab.assistant.observe(value);
     final result = tab.transcript.append(value);
     if (result == TranscriptAppendResult.limitReached && !tab.isClosed) {
       _showMessage('终端记录达到 10 MiB 上限，已停止记录', isError: true);
@@ -466,6 +618,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
         tab.terminalController.dispose();
         tab.scrollController.dispose();
         tab.remoteMonitorCache.dispose();
+        tab.assistant.dispose();
         await _disposeTab(tab);
       }
 
@@ -1083,6 +1236,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.terminalController.dispose();
       tab.scrollController.dispose();
       tab.remoteMonitorCache.dispose();
+      tab.assistant.dispose();
     });
     unawaited(_disposeTab(tab));
     if (nextTab != null) _focusTab(nextTab);
@@ -1974,6 +2128,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
 
   Future<void> _restartSession(_TerminalTab tab) async {
     if (tab.isClosed || tab.starting || tab.restarting) return;
+    tab.assistant.reset();
     tab.restarting = true;
     tab.starting = true;
     tab.status = '正在重新连接${tab.connection.displayName}';
@@ -2246,6 +2401,7 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
       tab.terminalController.dispose();
       tab.scrollController.dispose();
       tab.remoteMonitorCache.dispose();
+      tab.assistant.dispose();
       unawaited(_disposeTab(tab));
     }
     _tabs.clear();
@@ -2311,6 +2467,9 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                       case _CompactToolbarAction.snippets:
                         unawaited(_openCommandSnippetManager());
                         break;
+                      case _CompactToolbarAction.macros:
+                        unawaited(_openTerminalMacroManager());
+                        break;
                       case _CompactToolbarAction.search:
                         unawaited(_openTerminalSearch());
                         break;
@@ -2357,6 +2516,10 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                     const PopupMenuItem(
                       value: _CompactToolbarAction.snippets,
                       child: Text('命令片段…'),
+                    ),
+                    const PopupMenuItem(
+                      value: _CompactToolbarAction.macros,
+                      child: Text('命令宏…'),
                     ),
                     PopupMenuItem(
                       value: _CompactToolbarAction.search,
@@ -2461,6 +2624,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
                   icon: const Icon(Icons.terminal_outlined),
                 ),
                 IconButton(
+                  tooltip: '命令宏',
+                  onPressed: () => unawaited(_openTerminalMacroManager()),
+                  icon: const Icon(Icons.playlist_play_rounded),
+                ),
+                IconButton(
                   tooltip: '搜索终端输出 (Ctrl+F)',
                   onPressed: _tabs.isEmpty
                       ? null
@@ -2548,6 +2716,11 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
             _buildSessionSidebar(colors),
           if (_sidebarSection == _SidebarSection.files)
             _buildFileSidebar(activeTab, colors),
+          if (_sidebarSection == _SidebarSection.assistant)
+            TerminalAssistantPanel(
+              analyzer: activeTab?.assistant,
+              sessionTitle: activeTab?.title,
+            ),
           VerticalDivider(width: 1, thickness: 1, color: colors.outlineVariant),
           Expanded(
             child: Column(
@@ -2574,7 +2747,13 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
   }
 
   Widget _buildSidebarRail(ColorScheme colors) {
-    Widget destination(_SidebarSection section, IconData icon, String label) {
+    final activeTab = _activeTab;
+    Widget destination(
+      _SidebarSection section,
+      IconData icon,
+      String label, {
+      int badgeCount = 0,
+    }) {
       final selected = _sidebarSection == section;
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 3),
@@ -2591,10 +2770,14 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               child: SizedBox(
                 width: 38,
                 height: 38,
-                child: Icon(
-                  icon,
-                  size: 20,
-                  color: selected ? colors.primary : colors.onSurfaceVariant,
+                child: Badge(
+                  isLabelVisible: badgeCount > 0,
+                  label: Text(badgeCount > 9 ? '9+' : '$badgeCount'),
+                  child: Icon(
+                    icon,
+                    size: 20,
+                    color: selected ? colors.primary : colors.onSurfaceVariant,
+                  ),
                 ),
               ),
             ),
@@ -2616,6 +2799,22 @@ class _LocalTerminalPageState extends State<LocalTerminalPage> {
               Icons.folder_copy_outlined,
               '文件',
             ),
+            if (activeTab == null)
+              destination(
+                _SidebarSection.assistant,
+                Icons.tips_and_updates_outlined,
+                '终端助手',
+              )
+            else
+              ListenableBuilder(
+                listenable: activeTab.assistant,
+                builder: (context, _) => destination(
+                  _SidebarSection.assistant,
+                  Icons.tips_and_updates_outlined,
+                  '终端助手',
+                  badgeCount: activeTab.assistant.findings.length,
+                ),
+              ),
           ],
         ),
       ),
@@ -4131,7 +4330,7 @@ enum _NewSessionAction { local, serial, telnet, ssh, quickConnect, addSession }
 
 enum _SshConfigImportSource { defaultConfig, chooseFile }
 
-enum _SidebarSection { sessions, files }
+enum _SidebarSection { sessions, files, assistant }
 
 enum _RecordAction { save, rename, delete, removeRecent, moveGroup }
 
@@ -4155,6 +4354,7 @@ enum _CompactToolbarAction {
   monitor,
   networkDiagnostics,
   snippets,
+  macros,
   search,
   transcript,
   reconnect,
@@ -6283,6 +6483,36 @@ String _describeTunnel(SshTunnelHandle tunnel) => switch (tunnel.spec.type) {
   SshTunnelType.dynamic => 'SOCKS5 ${tunnel.boundHost}:${tunnel.boundPort}',
 };
 
+class _TerminalMacroTarget {
+  _TerminalMacroTarget.capture(this.tab)
+    : displayName = '${tab.title} · 标签 ${tab.id}',
+      sessionId = tab.sessionId,
+      sshClient = tab.sshClient,
+      sshSession = tab.sshSession;
+
+  final _TerminalTab tab;
+  final String displayName;
+  final PlatformInt64? sessionId;
+  final SSHClient? sshClient;
+  final SSHSession? sshSession;
+}
+
+class _TerminalMacroRunFailure {
+  const _TerminalMacroRunFailure(
+    this.targetName,
+    this.completedCommands,
+    this.reason,
+  );
+
+  final String targetName;
+  final int completedCommands;
+  final String reason;
+
+  @override
+  String toString() =>
+      '目标“$targetName”停止，已完成 $completedCommands 条命令：$reason。当前行可能已部分发送。';
+}
+
 class _TerminalTab {
   _TerminalTab({
     required this.id,
@@ -6301,6 +6531,7 @@ class _TerminalTab {
   final ScrollController scrollController;
   final BytesBuilder pendingInput = BytesBuilder(copy: false);
   final TerminalTranscript transcript = TerminalTranscript();
+  final TerminalAssistantAnalyzer assistant = TerminalAssistantAnalyzer();
   final SshRemoteMonitorCache remoteMonitorCache = SshRemoteMonitorCache();
   late final Terminal terminal;
 

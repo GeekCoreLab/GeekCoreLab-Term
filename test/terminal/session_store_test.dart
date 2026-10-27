@@ -7,6 +7,7 @@ import 'package:geekcore_term/terminal/session_store.dart';
 import 'package:geekcore_term/terminal/remote_file_transfer.dart';
 import 'package:geekcore_term/terminal/remote_transfer_queue.dart';
 import 'package:geekcore_term/terminal/remote_transfer_queue_store.dart';
+import 'package:geekcore_term/terminal/terminal_macro.dart';
 
 void main() {
   group('SessionRecord', () {
@@ -135,7 +136,80 @@ void main() {
     expect(decoded.command, original.command);
   });
 
-  test('SessionStore persists groups and command snippets', () async {
+  test('TerminalMacro validates command lines and round-trips', () {
+    final macro = TerminalMacro.fromScript(
+      id: 'macro-inspect',
+      name: '检查节点',
+      script: '\r\n  hostname\r\nuptime\r\n',
+    );
+
+    expect(macro.commands, ['  hostname', 'uptime']);
+    expect(TerminalMacro.fromJson(jsonEncode(macro.toJson())), macro);
+    expect(
+      () => TerminalMacro.fromScript(
+        id: 'empty-line',
+        name: '错误宏',
+        script: 'hostname\n\nuptime',
+      ),
+      throwsFormatException,
+    );
+    expect(
+      () => TerminalMacro.fromScript(
+        id: 'control',
+        name: '错误宏',
+        script: 'hostname\u0000',
+      ),
+      throwsFormatException,
+    );
+    expect(
+      () => TerminalMacro.fromScript(
+        id: 'too-many',
+        name: '错误宏',
+        script: List.filled(TerminalMacro.maxCommands + 1, 'true').join('\n'),
+      ),
+      throwsFormatException,
+    );
+    expect(
+      () => TerminalMacro.fromScript(
+        id: 'too-large-utf8',
+        name: '错误宏',
+        script: "echo ${List.filled(6000, '中').join()}",
+      ),
+      throwsFormatException,
+    );
+  });
+
+  test(
+    'macro executor sends UTF-8 commands with Enter and stops between lines',
+    () async {
+      final macro = TerminalMacro.fromScript(
+        id: 'macro-cn',
+        name: '中文提示',
+        script: 'printf 中文\nwhoami',
+      );
+      final sent = <String>[];
+
+      await expectLater(
+        executeTerminalMacroCommands(
+          macro: macro,
+          canContinue: (completed) => completed == 0,
+          write: (input) async {
+            sent.add(utf8.decode(input));
+          },
+        ),
+        throwsA(
+          isA<TerminalMacroStoppedException>().having(
+            (error) => error.completedCommands,
+            'completedCommands',
+            1,
+          ),
+        ),
+      );
+      expect(sent, ['printf 中文\r']);
+    },
+  );
+
+  test('SessionStore persists groups, snippets, and macros', () async {
     SharedPreferencesAsyncPlatform.instance =
         InMemorySharedPreferencesAsync.empty();
     addTearDown(() => SharedPreferencesAsyncPlatform.instance = null);
@@ -145,12 +219,21 @@ void main() {
       name: '检查磁盘',
       command: 'df -h && df -i',
     );
+    final macro = TerminalMacro.fromScript(
+      id: 'macro-health',
+      name: '健康检查',
+      script: 'hostname\nuptime\ndf -h /',
+    );
 
     await store.saveGroups(const ['Production', 'Lab']);
     await store.saveCommandSnippets(const [snippet]);
+    await store.saveTerminalMacros([macro]);
 
     expect(await store.loadGroups(), ['Production', 'Lab']);
     expect(await store.loadCommandSnippets(), [snippet]);
+    expect(await store.loadTerminalMacros(), [macro]);
+    await store.clear();
+    expect(await store.loadTerminalMacros(), isEmpty);
   });
 
   test('SessionStore restores and clears the terminal split layout', () async {
